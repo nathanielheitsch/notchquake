@@ -1,0 +1,192 @@
+# AGENTS.md — Rust Quake-Notch Terminal
+
+Development notes for agents working in this repo (`rust-notch-terminal`,
+shipped as `BNT.app`). macOS-only, arm64. This is a **standalone Rust app**,
+not part of `boring.notch` — the plan lives in the sibling worktree at
+`../emdash/worktrees/boring.notch-*/issue-quake-terminal-k605g/docs/rust-notch-terminal-plan.md`.
+
+## Build / run / verify
+
+```bash
+cargo build                                    # the gate — there is no LSP
+./scripts/launch.sh                            # build + kill stale + relaunch BNT.app
+# BNT.app is a signed bundle at ./BNT.app; launch it with `open -n BNT.app`
+```
+
+`launch.sh` kills any running instance first (a stale binary reuses the
+running process via `open`), rebuilds, copies the binary into `BNT.app`,
+and relaunches. **Always kill before relaunch** or you test a stale binary.
+
+The app writes debug files to `/tmp/bnt-*.txt` (notch geometry, shape, grid,
+key/click/any event dumps). Remove these before shipping. `launch.sh` does
+`rm -f /tmp/bnt-*.txt` itself.
+
+## Window architecture (the single most important fact)
+
+The notch panel is a **non-activating `NSPanel` at `kCGWindowLayer == 27`**,
+NOT a normal layer-0 window. Consequences, all verified:
+
+- **It cannot take key focus** while another app is frontmost, so the
+  Option+Space hotkey is registered system-wide with the Carbon Event Manager
+  (`RegisterEventHotKey` in `src/hotkey.rs`), which delivers a dedicated
+  hotkey event to this app on the main run loop with **no Accessibility /
+  Input Monitoring grant** and without being frontmost. (The old
+  `NSEvent::addGlobalMonitorForEvents` path could NOT see key events — Apple
+  gates global key monitoring behind an accessibility trust our adhoc-signed
+  dev bundle never gets, so it silently received zero callbacks. Carbon sees
+  only this chord, never other keystrokes.) To type into the open terminal,
+  a human must click inside the grid first to claim key focus (the local
+  `KeyDown` monitor then routes keystrokes to the PTY).
+- **Clicks** are handled two ways that do NOT double-fire: a real click ON the
+  opaque silhouette goes to the view's `mouseDown:` override (the window
+  server routes it to the panel, which sits above the menu bar); a click on
+  a transparent region — or a synthetic/test click delivered to the
+  frontmost app — is observed by the global `LeftMouseDown` monitor and
+  hit-tested via `NSEvent::mouseLocation()`. Both paths call the shared
+  `select_at_screen_point` (toggle when closed, switch PTY tab when open).
+
+## Observation: use `computer_use_get_desktop_state`, NOT window tools
+
+The pi-computer-use extension **is installed and works** for observing this
+app, but only one of its tools reaches the panel:
+
+| Tool | Reaches the panel? | Why |
+| --- | --- | --- |
+| `computer_use_get_desktop_state` | ✅ YES | Full composited desktop capture. Shows the panel exactly as the user sees it. Use this. |
+| `computer_use_list_windows` | ❌ NO | Returns **0 windows** for the BNT pid — only lists layer-0 top-level windows; the panel is layer 27. |
+| `computer_use_get_window_state` | ❌ NO | Needs a layer-0 window + AX tree; the panel has no AX tree (`ax_window_unresolved`). |
+| `computer_use_bring_to_front` | ❌ NO | Refuses a non-activating panel. |
+| `computer_use_zoom` | ❌ NO | Requires a prior `get_window_state` snapshot, which can't target the panel. |
+| `computer_use_hotkey` / `computer_use_click` (scope=desktop) | ✅ works | Option+Space fires the Carbon hotkey (verified: toggles open/close); a click on the pill/tab fires `mouseDown:` or the global monitor (verified: opens + switches tabs). Note: synthetic clicks in the menu-bar strip (y<24pt) are intercepted by the menu bar and only reach the global-monitor fallback, not `mouseDown:` — real clicks hit the panel directly. |
+
+For **alpha/pixel measurement** of the panel's own pixels (transparency vs
+painted, silhouette taper), the complementary tool is the shell:
+
+```bash
+swift scripts/bntw.swift   # print BNT window id + layer (CGWindowListCopyWindowInfo)
+screencapture -x -o -l <id> out.png   # window-local capture WITH alpha
+magick out.png -resize 640x620! s.png && magick s.png RGBA:- | python3 -c '…'  # sample pixels
+```
+
+`screencapture -x -o -l` is the only way to test transparency — a full-screen
+capture composites the desktop behind any alpha-0 region, so it CANNOT
+distinguish "transparent" from "painted with the wallpaper colour". Use the
+window capture for alpha, the desktop capture for the composited result.
+
+## What's built and verified (2026-10-09)
+
+| Gate | Status | Evidence |
+| --- | --- | --- |
+| `cargo build` (arm64) | ✅ | clean |
+| Panel top-center, above menu bar, layer 27 | ✅ | id, bounds (535,0) 640×620 |
+| Closed pill ~33pt at startup | ✅ | shape dump h=33.5 w=189 |
+| Expand/collapse round-trip via `toggle()` | ✅ | 33.5 → 420 → 33 |
+| Rounded silhouette, bottom taper ~20pt/side | ✅ | bottom row 599 vs 639 wide |
+| Live shell grid | ✅ | 22×68, 84 lit cells |
+| Fira Code ligatures `->` `=>` `!=` | ✅ | glyph names prove `calt` applied |
+| Tab bar (iTerm style): 3 tabs + `+` button, selected lighter, dividers | ✅ | window-local alpha capture (open h=420): selected x 33–216, unselected 218–607, painted through y=420 (flush with chin line), straight tab top at y=404 with corners curving in from 399, `+` at x≈588–608 |
+| Click tab → switch PTY | ✅ verified | `mouseDown:` on the open panel selects the tab under the cursor; synthetic click on the middle tab moved selection from tab 0 (sel 64–435) to tab 1 (sel 434–805) |
+| Option+Space global hotkey | ✅ verified | Carbon `RegisterEventHotKey` (no TCC grant); synthetic Option+Space toggles open then close |
+| Click closed pill → open | ✅ verified | synthetic click on the pill toggles open (via `mouseDown:` for real clicks / global monitor fallback) |
+
+## The tab-bar defect — root cause (fixed 2026-10-09)
+
+The outlined pills set the **fill** color to gray but never set the **stroke
+color**, so `stroke_path` painted black-on-black (CGContext's default stroke
+is opaque black). `begin_path` was not the problem. The iTerm restyle fills
+every tab (selected 0.22 gray, unselected 0.10) so no stroke color is needed
+for the tabs at all; the only stroke left is the 1px divider, which now sets
+`set_gray_stroke_color` explicitly. `trace_capsule` was replaced by
+`trace_tab_rect` (square bottom, rounded top corners).
+
+## The shipped tab strip
+
+iTerm-style: tabs are rounded-TOP-corner rectangles flush with the silhouette
+chin line (square bottom edge, rounded part facing up into the panel),
+selected tab lighter, unselected dimmed, 1px dividers between tabs, a `+`
+button at the right end (decorative — sessions are a fixed `TAB_COUNT`, so it
+is not a click target). Geometry lives in **`tab_strip(h, w)`**, the single
+source of truth shared by the renderer and `select_at_screen_point`, so draw
+and click hit-testing cannot drift. Tabs inset by `chin_radius(h) + TAB_INSET
+from the silhouette sides so they stay inside the clip at every animation
+height.
+
+## Lessons learned this session
+
+1. **`kCTFontFeatureSettingsAttribute` does NOT work as a text attribute for
+   ligature shaping.** CoreText/HarfBuzz applies `calt` from the *font*, not
+   the attributed string. The ligature test (`debug_ligature_check` in
+   `font.rs`) reports 2 glyphs for `->` either way because **Fira Code draws
+   `->` as two `.seq` half-glyphs that compose the arrow** — `glyph_count == 2`
+   is correct, the glyph *names* (`hyphen_start.seq`+`greater_hyphen_end.seq`)
+   prove the feature applied. Don't gate on glyph count; gate on glyph names.
+
+2. **Fira Code's GSUB has no named `calt`/`liga` feature tags** — its
+   ligatures live in the DFLT/latn script's default lookups, applied by
+   default. `hb-shape` confirms it. CoreText applies them by default too; the
+   `kCTFontFeatureSettingsAttribute` text-attribute approach is a dead end.
+
+3. **`CFRange { length: 0 }` is the INSERT range** for
+   `CFAttributedStringReplaceString`; using the text length there crashes
+   (out-of-range). Insert with length 0, then set attributes over the
+   inserted text's full range.
+
+4. **`CFMutableArray<CFString>::empty()` + `.append(&calt)`** is the clean
+   way to build the feature-settings array in objc2-core-foundation. Requires
+   the `CFArray` feature on `objc2-core-foundation`.
+
+5. **Non-activating panel + global event monitor** (corrected): the old
+   `addGlobalMonitorForEvents` monitor installed (`ok`) but received zero
+   key callbacks because the app lacked an accessibility trust (see lesson 10),
+   NOT because of synthetic events. The autoToggle NSTimer scaffolds that
+   worked around this are now gone — replaced by the Carbon hotkey +
+   `mouseDown:`, both verified with synthetic input.
+
+6. **Verification scaffolds were removed.** The `autoToggle` timers and
+   `auto_timer`/`auto_timer2` ivars are deleted; all `/tmp/bnt-*.txt` debug
+   writes are gone; `debug_ligature_check`/`measure` are gone. The hotkey +
+   click paths are now driven (and verified) with the computer-use tools.
+
+7. **The view is NOT flipped** (`setIsFlipped:` is unbound in objc2-app-kit),
+   so the drawing space is the window's own **y-up** space: the panel top
+   (menu bar) is at `y = PANEL_HEIGHT`, the chin at `y = PANEL_HEIGHT - h`.
+   `select_at_screen_point` must NOT invert the click point — the original
+   code did (`y = height - y_up`), which put tab clicks ~2× the strip height
+   off. Hit-test the strip as `y ∈ [PANEL_HEIGHT - h, PANEL_HEIGHT - h +
+   TAB_HEIGHT]` directly.
+
+8. **CGContext fill and stroke colors are separate state.** A `stroke_path`
+   with only `set_fill_color_with_color` set paints default-black. Always
+   `set_gray_stroke_color`/`set_stroke_color_with_color` before stroking.
+
+9. **`NSEvent.keyCode()` returns the macOS virtual key code**, not ASCII or
+   X11. Space is **49** (`0x31`), not 6 (which is Z). The old
+   `SPACE_KEY_CODE = 6` silently rejected every Option+Space.
+
+10. **`NSEvent::addGlobalMonitorForEvents` cannot see key events without an
+   accessibility trust** (Apple's own doc: key events "may only be monitored
+   if accessibility is enabled"). An adhoc-signed, no-entitlement dev bundle
+   gets neither Accessibility nor Input Monitoring, so the monitor installs
+   (non-nil) but receives **zero** callbacks — for real *and* synthetic
+   input. Mouse events are NOT gated this way, so the global `LeftMouseDown`
+   monitor works. The zero-permission fix for a global hotkey is Carbon
+   `RegisterEventHotKey` (`src/hotkey.rs`): it delivers a dedicated hotkey
+   event to the app on the main run loop, needs no grant, and works without
+   being frontmost. CGEventTap is the Input-Monitoring-gated alternative
+   (returns NULL loudly on denial).
+
+11. **A non-activating panel's view DOES receive `mouseDown:`** for real
+   clicks on its opaque regions — that is the reliable click path. The
+   global `LeftMouseDown` monitor is only the fallback for clicks that pass
+   through transparent regions or synthetic clicks delivered to the
+   frontmost app. `handle_click` must use `NSEvent::mouseLocation()` (absolute
+   screen point), NOT `window.frame.origin + locationInWindow()` — a global
+   event's `window` is nil, so the old code early-returned and swallowed
+   every click.
+## Repo / process rules
+
+- macOS-only, arm64. `cargo build` is the gate; no LSP.
+- `BNT.app/` is gitignored (built binary bundle — never commit). `/tmp/bnt-*.txt`
+  debug writes were all stripped at ship time; none remain in `src/`.
+- The plan doc (sibling worktree) is the spec; this AGENTS.md is the
+  machine-specific how-to.
