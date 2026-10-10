@@ -56,9 +56,16 @@ const INITIAL_TABS: usize = 3;
 const MAX_TABS: usize = 8;
 /// `tab_strip` hides the strip below this per-tab width.
 const MIN_TAB_W: CGFloat = 28.0;
-/// `×` close-affordance glyph radius and (generous) hit radius.
+/// `×` close-affordance glyph radius and (generous) hit radius, and its
+/// left inset from the tab's left edge (the × is LEFT-aligned in the tab).
 const CLOSE_R: CGFloat = 5.0;
 const CLOSE_HIT: CGFloat = 9.0;
+const CLOSE_INSET: CGFloat = 12.0;
+/// Point size of the tab title and of the right-aligned `⌘<n>` index hint.
+const TAB_LABEL_SIZE: CGFloat = 11.0;
+const TAB_HINT_SIZE: CGFloat = 10.0;
+/// Right inset of the `⌘<n>` hint from the tab's right edge.
+const TAB_HINT_INSET: CGFloat = 8.0;
 const TAB_HEIGHT: CGFloat = 28.0;
 
 /// Tab-strip palette, sRGB (user spec): inactive tab fill `0D0C0C`,
@@ -71,8 +78,6 @@ const LINE: (CGFloat, CGFloat, CGFloat) = rgb(0x3E, 0x3D, 0x3D);
 const TEXT_ACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0xFB, 0xFA, 0xFC);
 const TEXT_INACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0x82, 0x83, 0x83);
 
-/// Point size of the tab labels.
-const TAB_LABEL_SIZE: CGFloat = 11.0;
 const TAB_INSET: CGFloat = 8.0;
 const TAB_RADIUS: CGFloat = 6.0;
 const TAB_PLUS_W: CGFloat = 20.0;
@@ -108,6 +113,7 @@ pub struct NotchViewIvars {
     selected: Cell<Option<usize>>,
     hovered: Cell<Option<usize>>,
     label_font: OnceCell<CFRetained<CTFont>>,
+    hint_font: OnceCell<CFRetained<CTFont>>,
     tracking: OnceCell<Retained<NSTrackingArea>>,
     // Wheel-scroll state: `scroll` is the whole lines already applied to the
     // selected session's display_offset; `scroll_pts` carries the leftover
@@ -418,20 +424,6 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 ctx,
                 CGRect::new(CGPoint::new(x, chin_y), CGSize::new(tab_w, TAB_HEIGHT)),
             );
-            // The `×` close affordance, drawn ONLY on the hovered tab.
-            if hovered == Some(index) {
-                let (cx, cy) = close_center(x, chin_y, tab_w);
-                CGContext::begin_path(ctx);
-                CGContext::move_to_point(ctx, cx - CLOSE_R, cy - CLOSE_R);
-                CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy + CLOSE_R);
-                CGContext::move_to_point(ctx, cx - CLOSE_R, cy + CLOSE_R);
-                CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy - CLOSE_R);
-                // Stroke color is separate state from fill — set it BEFORE
-                // `stroke_path` or the default opaque black is invisible.
-                CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(TEXT_ACTIVE)));
-                CGContext::set_line_width(ctx, 1.5);
-                CGContext::stroke_path(ctx);
-            }
         }
         // Separators between tabs + the active tab's side borders, one
         // stroke pass in LINE color.
@@ -480,15 +472,42 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
             ),
         );
 
-        // The tab labels: the OSC title the shell set (`vim`, `git`, …),
-        // falling back to `⌘<n>` (the tab's 1-based index). Active label
-        // TEXT_ACTIVE, inactive TEXT_INACTIVE. Centered, ellipsis-truncated.
+        // The tab labels: the shell's OSC title, truncated so the right-aligned
+        // `⌘<n>` hint always stays visible. Active TEXT_ACTIVE, inactive
+        // TEXT_INACTIVE; ellipsis-truncated when too wide.
         let label_font = ivars.label_font.get_or_init(|| monospace(TAB_LABEL_SIZE));
+        let hint_font = ivars.hint_font.get_or_init(|| monospace(TAB_HINT_SIZE));
+        // Reserve the hint's width (⌘ + up to 2 digits) plus its inset so the
+        // title never paints over it.
+        let hint_w = TAB_HINT_INSET + 3.0 * (TAB_HINT_SIZE * 0.6);
         for index in 0..count {
             let x = left + index as CGFloat * tab_w;
-            let label = format!("\u{2318}{}", index + 1);
+            let label = sessions.get(index)
+                .map(|s| s.title())
+                .unwrap_or_else(|| format!("Tab {}", index + 1));
             let color = if Some(index) == selected { TEXT_ACTIVE } else { TEXT_INACTIVE };
-            draw_tab_label(ctx, Some(label_font), &label, x, chin_y, tab_w, color);
+            draw_tab_label(ctx, Some(label_font), &label, x, chin_y, tab_w - hint_w, color);
+            let hint = format!("\u{2318}{}", index + 1);
+            draw_tab_hint(ctx, Some(hint_font), &hint, x, chin_y, tab_w, color);
+        }
+        // The `×` close affordance: shown on the ACTIVE tab always, and on any
+        // hovered tab. LEFT-aligned in the tab (reference style). Drawn AFTER
+        // the labels so a long title cannot overpaint it.
+        for index in 0..count {
+            if Some(index) == selected || hovered == Some(index) {
+                let x = left + index as CGFloat * tab_w;
+                let (cx, cy) = close_center(x, chin_y);
+                CGContext::begin_path(ctx);
+                CGContext::move_to_point(ctx, cx - CLOSE_R, cy - CLOSE_R);
+                CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy + CLOSE_R);
+                CGContext::move_to_point(ctx, cx - CLOSE_R, cy + CLOSE_R);
+                CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy - CLOSE_R);
+                // Stroke color is separate state from fill — set it BEFORE
+                // `stroke_path` or the default opaque black is invisible.
+                CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(TEXT_ACTIVE)));
+                CGContext::set_line_width(ctx, 1.5);
+                CGContext::stroke_path(ctx);
+            }
         }
       }
       _ => {}
@@ -534,11 +553,11 @@ fn tab_strip(h: CGFloat, w: CGFloat, count: usize) -> Option<(CGFloat, CGFloat)>
     Some((left, tab_w))
 }
 
-/// Center of the `×` close affordance for the tab at `(x, chin_y, tab_w)`.
-/// Single source of truth for the renderer and the click hit-test (the
-/// `min` keeps the × inside narrow tabs).
-fn close_center(x: CGFloat, chin_y: CGFloat, tab_w: CGFloat) -> (CGFloat, CGFloat) {
-    ((x + tab_w - 12.0).min(x + tab_w / 2.0 + 4.0), chin_y + TAB_HEIGHT - 12.0)
+/// The `×` close affordance center — LEFT-aligned in the tab (reference
+/// style), vertically centered. Single source of truth for the renderer and
+/// the click hit-test.
+fn close_center(x: CGFloat, chin_y: CGFloat) -> (CGFloat, CGFloat) {
+    (x + CLOSE_INSET, chin_y + TAB_HEIGHT / 2.0)
 }
 
 /// The header bar height while open: the measured notch height (the panel
@@ -646,6 +665,42 @@ fn draw_tab_label(
     CGContext::restore_g_state(ctx);
 }
 
+/// Draw the right-aligned `⌘<n>` index hint in the tab `(x, y, w)`, inset
+/// from the tab's right edge (reference style). Same shaping path as
+/// `draw_tab_label`; the only difference is the horizontal anchor.
+fn draw_tab_hint(
+    ctx: Option<&CGContext>,
+    font: Option<&CTFont>,
+    hint: &str,
+    x: CGFloat,
+    y: CGFloat,
+    w: CGFloat,
+    color: (CGFloat, CGFloat, CGFloat),
+) {
+    if hint.is_empty() || w <= 0.0 {
+        return
+    }
+    let font = font.expect("a hint font");
+    let text = CFString::from_str(hint);
+    let line = unsafe { shaped_line(font, &text) };
+    let line_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    let drawn_width = if line_width as CGFloat > w {
+        w
+    } else {
+        line_width as CGFloat
+    };
+    let ascent = unsafe { font.ascent() };
+    let descent = unsafe { font.descent() };
+    let baseline = y + (TAB_HEIGHT - (ascent + descent)) / 2.0 + ascent;
+    let cx = x + w - drawn_width - TAB_HINT_INSET;
+    CGContext::save_g_state(ctx);
+    CGContext::translate_ctm(ctx, cx, baseline);
+    CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(color)));
+    CGContext::set_text_position(ctx, 0.0, 0.0);
+    unsafe { line.draw(ctx.expect("a current context")) };
+    CGContext::restore_g_state(ctx);
+}
+
 /// A `CGColor` from the tab-strip palette (sRGB, opaque).
 fn rgb_color(rgb: (CGFloat, CGFloat, CGFloat)) -> CFRetained<CGColor> {
     let (r, g, b) = rgb;
@@ -700,16 +755,31 @@ fn key_bytes(event: &NSEvent) -> Vec<u8> {
     let alt = flags.contains(NSEventModifierFlags::Option);
     let ctrl = flags.contains(NSEventModifierFlags::Control);
 
-    // Control chords the shell understands directly.
-    if ctrl && keyCode >= 1 && keyCode <= 26 {
-        return vec![keyCode as u8 - 1]
+    // Control chords: derive from the CHARACTER, not the keyCode — keyCode
+    // numbers are NOT letters (keyCode 4 is H, 2 is D, 13 is W, 10 is Q), so
+    // the old `keyCode - 1` mapping sent Ctrl-D for every H. Ctrl+letter is
+    // the letter's byte with bit 6 set (h -> 0x08, a -> 0x01).
+    if ctrl {
+        match event.characters() {
+          Some(chars) => {
+              let text = chars.to_string();
+              match text.as_bytes().first() {
+                Some(b) if *b >= 0x40 && *b < 0x7f => return vec![*b & 0x1f],
+                _ => {}
+              }
+          }
+          _ => {}
+        }
     }
+
+    // Special keys by keyCode (these ARE keyCode-space, not letters).
+    // 53=Esc 8=Backspace 13=Return 3=Enter 26=Tab.
     match keyCode {
         53 => return vec![0x1b],
+        8 => return vec![0x7f],
         13 => return vec![0x0d],
-        10 => return vec![0x0d],
-        2 => return vec![0x08],
-        4 => return vec![0x04],
+        3 => return vec![0x0d],
+        26 => return vec![0x09],
         _ => {}
     }
 
@@ -748,6 +818,7 @@ impl NotchView {
                 selected: Cell::new(None),
                 hovered: Cell::new(None),
                 label_font: OnceCell::new(),
+                hint_font: OnceCell::new(),
                 tracking: OnceCell::new(),
                 scroll: Cell::new(0),
                 scroll_pts: Cell::new(0.0),
@@ -1049,8 +1120,8 @@ impl NotchView {
             for index in 0..count {
                 let x0 = left + index as CGFloat * tab_w;
                 if x >= x0 && x <= x0 + tab_w {
-                    let (cx, cy) = close_center(x0, chin_y, tab_w);
-                    let on_close = ivars.hovered.get() == Some(index)
+                    let (cx, cy) = close_center(x0, chin_y);
+                    let on_close = (ivars.hovered.get() == Some(index) || ivars.selected.get() == Some(index))
                         && (x - cx).abs() <= CLOSE_HIT && (y - cy).abs() <= CLOSE_HIT;
                     if on_close {
                         self.close_tab(index);
