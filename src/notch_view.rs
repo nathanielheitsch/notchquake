@@ -21,7 +21,8 @@ use objc2::MainThreadOnly;
 use objc2::runtime::AnyObject;
 use objc2::AnyThread;
 use objc2_app_kit::{NSGraphicsContext, NSView, NSEvent, NSEventModifierFlags, NSTrackingArea, NSTrackingAreaOptions};
-use objc2_core_text::{CTFont, CTLine, CTLineTruncationType, kCTFontAttributeName};
+use objc2_core_text::{CTFont, CTLine, CTLineTruncationType, kCTFontAttributeName, kCTForegroundColorFromContextAttributeName};
+use objc2_core_foundation::kCFBooleanTrue;
 use objc2_core_foundation::{
     CFAbsoluteTimeGetCurrent,
     CGFloat,
@@ -719,7 +720,16 @@ unsafe fn shaped_line(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
             CFRange { location: 0, length: text.length() },
             Some(kCTFontAttributeName),
             Some(&**font),
-        )
+        );
+        // `CTLineDraw` defaults to BLACK unless the string opts in to the
+        // CGContext fill colour — same trap as `render.rs::run`; without it
+        // tab titles/hints paint black-on-black and are invisible.
+        CFMutableAttributedString::set_attribute(
+            Some(&*attr),
+            CFRange { location: 0, length: text.length() },
+            Some(kCTForegroundColorFromContextAttributeName),
+            Some(&*kCFBooleanTrue.expect("a boolean")),
+        );
     };
     unsafe { CTLine::with_attributed_string(&**attr) }
 }
