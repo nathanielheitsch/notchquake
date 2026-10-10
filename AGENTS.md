@@ -270,6 +270,19 @@ height.
     sets `None`; the spawn branch in `draw` sets `Some(count-1)` — otherwise
     `draw_grid` matches `_ => {}` and the terminal renders blank on open.
 
+20. **NSEvent keyCodes are NOT letters.** The old `keyCode - 1` Ctrl mapping
+    and the `2 => BS / 4 => EOT / 10 => CR` arms broke plain typing: keyCode
+    4 is **H** (sent Ctrl-D = EOT, killing the line), 2 is D (sent BS), 13 is
+    W (sent CR = early submit). Fix: Ctrl chords derive from
+    `event.characters()` (`b & 0x1f`), and keyCode arms are reserved for
+    actual special keys (53=Esc 8=Backspace 13=Return 3=Enter 26=Tab). Plain
+    printable chars already fall through via `characters()`.
+
+21. **Draw order in the tab strip = z-order.** Fills → LINE separators/borders
+    → labels+hint → `×` LAST, so a long shell title can never overpaint the
+    `×` or the right-aligned `⌘<n>` hint (title width is truncated by
+    `tab_w - hint_w`).
+
 ## Repo / process rules
 
 - macOS-only, arm64. `cargo build` is the gate; no LSP.
