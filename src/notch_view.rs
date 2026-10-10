@@ -811,6 +811,23 @@ impl NotchView {
         }
     }
 
+    /// Re-pin the panel to the notch display's top-centre. A display change
+    /// (monitor unplugged, resolution changed) moves the desktop but the
+    /// window was placed once at startup, so it ends up off-centre. Called
+    /// from the screen-change monitor.
+    pub fn reposition(&self) {
+        let mtm = MainThreadMarker::new().expect("main thread");
+        let panel = self.as_super().window().expect("a view always lives in a window");
+        match crate::window::notch_screen(mtm) {
+          Some(screen) => {
+            panel.setFrameOrigin(crate::window::panel_origin(screen.frame()));
+            let (w, h) = crate::window::notch_size(&screen);
+            self.set_notch((w, h));
+          }
+          _ => {}
+        }
+    }
+
     /// Open the panel (idempotent: already-open stays open).
     pub fn expand(&self) {
         self.set_target(OPEN_HEIGHT);
@@ -857,3 +874,4 @@ impl NotchView {
         self.mark_dirty();
     }
 }
+

@@ -37,6 +37,7 @@ use objc2_app_kit::{
     NSEventMask,
     NSEventType,
     NSEventModifierFlags,
+    NSEventSubtype,
     NSScreen,
 };
 use objc2_foundation::{
@@ -176,14 +177,25 @@ define_class!(
                 NSEventMask::LeftMouseDown,
                 &click_block,
             );
-            // Scroll wheel: a global monitor catches the wheel over the panel
-            // (the panel never owns the gesture). Points accumulate into whole
-            // lines inside `scroll_wheel`.
+            // Scroll wheel + display change: ONE global monitor on the
+            // ScrollWheel mask. macOS keeps only ONE global monitor per event
+            // type — registering a second one for the same mask silently drops
+            // the first, which is why the wheel stopped working once the
+            // display-change monitor was added. A display change (monitor
+            // unplugged / resolution changed) arrives as a ScrollWheel event
+            // with subtype ScreenChanged carrying a bogus deltaY, so dispatch
+            // on the subtype inside this single handler: reposition the panel,
+            // never scroll.
             let view_for_wheel = view.clone();
             let wheel_block = RcBlock::new(
                 move |event: NonNull<NSEvent>| {
                     if MainThreadMarker::new().is_some() {
-                        view_for_wheel.scroll_wheel(unsafe { event.as_ref() }.deltaY());
+                        let event_ref = unsafe { event.as_ref() };
+                        if event_ref.subtype() == NSEventSubtype::ScreenChanged {
+                            view_for_wheel.reposition();
+                        } else {
+                            view_for_wheel.scroll_wheel(event_ref.deltaY());
+                        }
                     }
                 },
             );
