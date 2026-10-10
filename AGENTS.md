@@ -89,6 +89,10 @@ window capture for alpha, the desktop capture for the composited result.
 | Click closed pill → open | ✅ verified | synthetic click on the pill toggles open (via `mouseDown:` for real clicks / global monitor fallback) |
 | Scroll wheel → history | ✅ wired | ONE global `ScrollWheel` monitor → `scroll_wheel()`; alacritty `Scroll::Delta`, `BNT_SCROLLBACK` (default 10000). Wheel events proven to reach the handler (40× dy=-1 logged). Grid visibly moves only when the session has scrollback history — a fresh login shell has none, so `display_offset` clamps to 0. |
 | Click outside panel → collapse | ✅ built | `click_at_screen_point` collapses an open panel on an outside click; idempotent `expand`/`collapse` so both click paths land once. |
+| Header bar (notch height, open state) | ✅ verified | desktop capture: grid text starts at y≈50pt = notch 33 + GRID_TOP_PAD 22; the notch-height block above it is reserved (empty for now, buttons later). `row_rect`/`draw_grid` take a `header` param; `grid_dims` reserves the same inset. |
+| Dynamic tabs: `+` spawns | ✅ verified | synthetic click on the `+` grew the strip from 3 to 4 tabs (labels reflowed, tab_w shrank). `sessions` is a live `Cell<Vec<Session>>`; `tab_strip(h,w,count)` is the single source of truth for renderer + hover + click. |
+| Tab close via `×` on hover | ⚠️ built, not driver-verifiable | hover needs a REAL mouse move (NSTrackingArea `mouseMoved:` never fires for synthetic pointer moves — same synthetic-event limitation as keystrokes). `×` drawn only on `hovered` tab; click on it → `close_tab` (selects next, collapses on last). |
+| Shell exit self-destruct | ⚠️ built, not driver-verifiable | `Event::Exit` (post-drain) sets `Arc<AtomicBool>` dead flag; `tick` → `reap_dead_sessions()` tears down via `Msg::Shutdown` (reader thread returns → `Pty::Drop` SIGHUPs the child). Needs a real `exit` keystroke to exercise. |
 
 ## The tab-bar defect — root cause (fixed 2026-10-09)
 
@@ -241,6 +245,30 @@ height.
     never `scroll_wheel`. The panel was placed once at startup, so an
     unplug/resolution change left it off-centre. Verified: desktop 1920×1243
     pts, panel bounds x=640 w=640 → center 960 = exact screen center.
+
+17. **Dynamic tabs (2026-10-10).** `sessions` is a live `Cell<Vec<Session>>` with
+    `spawned: Cell<bool>` (so closing the last tab doesn't auto-resurrect) and
+    `selected: Cell<Option<usize>>`. `tab_strip(h, w, count)` takes the live
+    count — renderer, hover, and click all pass it, and the `+` rect and the
+    `×` rect derive from its outputs in BOTH draw and hit-test. `tab_count`
+    mirrors `sessions.len()` for the hover/click path. `Cell<Vec<T>>::update`
+    does NOT compile (needs `T: Copy`); use the move-out/move-back idiom
+    (`ivars.sessions.replace(vec![])` … `replace(v)`) with short panic-free
+    pairs. `Mut<T>` is unavailable in this toolchain.
+
+18. **Shell-exit teardown is `Msg::Shutdown`, not a raw kill.** `Session::destroy()`
+    sends `Msg::Shutdown` → `drain_recv_channel` returns false → the reader
+    thread returns → `EventLoop`/`Pty` drop → `Pty::Drop` SIGHUPs the child and
+    unregisters the SIGCHLD hook. Dropping the `JoinHandle` alone detaches the
+    thread and kills nothing. The dead signal is `Event::Exit` (sent by
+    `Term::exit()` AFTER the `drain_on_exit` final read, so the last output
+    lands in the grid first) — NOT `ChildExit` (pre-drain) and never `Wakeup`
+    (fires continuously while alive). Main thread reaps in `tick` via
+    `reap_dead_sessions()`.
+
+19. **First-open must own the selection.** `selected` starts `None` and collapse
+    sets `None`; the spawn branch in `draw` sets `Some(count-1)` — otherwise
+    `draw_grid` matches `_ => {}` and the terminal renders blank on open.
 
 ## Repo / process rules
 
