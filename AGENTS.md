@@ -291,6 +291,20 @@ height.
     (invisible on the dark panel). This bit twice: the grid, then the tab
     labels/hints.
 
+23. **Compare against the guidance image with a real PNG decoder, not a
+    vision model.** Inline vision descriptions hallucinate freely (they
+    "saw" text that pixel data proves absent). The only trustworthy check is
+    a filter-correct PNG decode (`/tmp/png.py` handles per-scanline filter
+    bytes — a naive `zlib.decompress` without unfiltering returns garbage)
+    plus numeric region checks: per-tab color counts, glyph x-runs, edge
+    columns. Verify one settled frame, not motion frames.
+
+24. **The `×` gutter must be reserved in the title band.** A long shell
+    title centered in the full tab width starts at the tab's left edge and
+    overpaints the left-aligned `×`. The active/hovered tab's label band
+    starts at `TAB_CLOSE_W` (`CLOSE_INSET + CLOSE_R`) from the tab's left;
+    other tabs keep the full width.
+
 ## Repo / process rules
 
 - macOS-only, arm64. `cargo build` is the gate; no LSP.
