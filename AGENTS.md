@@ -87,7 +87,7 @@ window capture for alpha, the desktop capture for the composited result.
 | Click tab → switch PTY | ✅ verified | `mouseDown:` on the open panel selects the tab under the cursor; synthetic click on the middle tab moved selection from tab 0 (sel 64–435) to tab 1 (sel 434–805) |
 | Option+Space global hotkey | ✅ verified | Carbon `RegisterEventHotKey` (no TCC grant); synthetic Option+Space toggles open then close |
 | Click closed pill → open | ✅ verified | synthetic click on the pill toggles open (via `mouseDown:` for real clicks / global monitor fallback) |
-| Scroll wheel → history | ✅ built | global `ScrollWheel` monitor → `scroll_wheel()`; alacritty `Scroll::Delta`, `BNT_SCROLLBACK` (default 10000). Not yet exercised with a real wheel gesture. |
+| Scroll wheel → history | ✅ wired | ONE global `ScrollWheel` monitor → `scroll_wheel()`; alacritty `Scroll::Delta`, `BNT_SCROLLBACK` (default 10000). Wheel events proven to reach the handler (40× dy=-1 logged). Grid visibly moves only when the session has scrollback history — a fresh login shell has none, so `display_offset` clamps to 0. |
 | Click outside panel → collapse | ✅ built | `click_at_screen_point` collapses an open panel on an outside click; idempotent `expand`/`collapse` so both click paths land once. |
 
 ## The tab-bar defect — root cause (fixed 2026-10-09)
@@ -227,6 +227,20 @@ height.
     corner bulged the wrong way. Symptom: bottom-right corner looked clipped
     / inverted while the left was correct. Verify with a window-local alpha
     capture: the bottom row must inset the SAME amount on both sides.
+
+15. **`addGlobalMonitorForEventsMatchingMask` keeps only ONE handler per event
+    type.** Registering a second global monitor on the same mask (e.g. two
+    `ScrollWheel` monitors — one for the wheel, one for display changes)
+    silently DROPS the first; the wheel stops working. Combine into one
+    monitor and dispatch on `event.subtype()` inside the handler.
+
+16. **A display change (monitor unplugged / resolution changed) arrives as a
+    `ScrollWheel` event with subtype `ScreenChanged`** carrying a bogus
+    `deltaY`. Handle it in the single ScrollWheel monitor: call `reposition()`
+    (re-pin the panel to the notch display's top-centre + refresh `set_notch`),
+    never `scroll_wheel`. The panel was placed once at startup, so an
+    unplug/resolution change left it off-centre. Verified: desktop 1920×1243
+    pts, panel bounds x=640 w=640 → center 960 = exact screen center.
 
 ## Repo / process rules
 
