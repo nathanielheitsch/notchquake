@@ -44,13 +44,21 @@ use core::ffi::c_double;
 use crate::animation::Spring;
 use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, DEFAULT_SCROLLBACK_LINES, NOTCH_WIDTH, OPEN_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH};
 use crate::font::{FONT_SIZE, monospace, cell_metrics};
-use crate::render::{draw_grid, GRID_PAD};
+use crate::render::{draw_grid, GRID_PAD, GRID_TOP_PAD};
 use crate::terminal::Session;
 
 /// Tab-bar geometry: an iTerm-style strip hanging from the silhouette's
 /// bottom edge — tabs are rounded-top-corner rectangles flush with the chin
 /// line, separated by thin dividers, with a `+` button at the right end.
-const TAB_COUNT: usize = 3;
+/// Sessions spawned on the first open frame (after that, tabs are dynamic).
+const INITIAL_TABS: usize = 3;
+/// `+` cap so tabs stay clickable.
+const MAX_TABS: usize = 8;
+/// `tab_strip` hides the strip below this per-tab width.
+const MIN_TAB_W: CGFloat = 28.0;
+/// `×` close-affordance glyph radius and (generous) hit radius.
+const CLOSE_R: CGFloat = 5.0;
+const CLOSE_HIT: CGFloat = 9.0;
 const TAB_HEIGHT: CGFloat = 28.0;
 
 /// Point size of the tab labels.
@@ -75,8 +83,19 @@ pub struct NotchViewIvars {
     last_time: Cell<f64>,
     font: OnceCell<CFRetained<CTFont>>,
     cell: OnceCell<(CGFloat, CGFloat)>,
-    sessions: OnceCell<Vec<Session>>,
-    selected: Cell<usize>,
+    // Live sessions. `Cell<Vec<Session>>` because mutation happens through
+    // `&self`: take the vec out with `take_sessions`, mutate, put it back
+    // with `put_sessions` (`Cell::update` needs `T: Copy`, which a Vec is
+    // not). Keep every take/put pair short and panic-free — a panic between
+    // the two `replace`s would drop the sessions and orphan their PTYs.
+    sessions: Cell<Vec<Session>>,
+    /// True once the initial batch spawned, so "reopen after all tabs
+    /// closed" spawns ONE fresh tab instead of resurrecting the initial set.
+    spawned: Cell<bool>,
+    /// Mirror of `sessions.len()` so the 60Hz mouse/hover path never moves
+    /// the whole `Vec<Session>`; written on every session mutation.
+    tab_count: Cell<usize>,
+    selected: Cell<Option<usize>>,
     hovered: Cell<Option<usize>>,
     label_font: OnceCell<CFRetained<CTFont>>,
     tracking: OnceCell<Retained<NSTrackingArea>>,
@@ -206,6 +225,9 @@ define_class!(
         #[unsafe(method(tick))]
         fn tick(&self) {
             let ivars = self.ivars();
+            // Reap dead sessions (child shell exited) unconditionally: a
+            // dead session while closed still needs teardown so its PTY dies.
+            self.reap_dead_sessions();
             // Redraw while the spring is animating OR while the panel is open,
             // so PTY output (processed on the reader thread) is painted. The
             // spring-only redraw left the grid frozen once the open animation
@@ -303,14 +325,44 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     // Everything below stays inside the silhouette.
     CGContext::clip(ctx);
 
+    // Take the session vec once for the whole frame (put it back at the
+    // end, before `restore_g_state`): the grid pass, spawn-on-open rule and
+    // tab labels all read it, and a second take/put pair would be more
+    // panic surface.
+    let mut sessions = take_sessions(ivars);
+
     // The terminal grid, once the panel is open. Sessions spawn on the
     // first open frame; the grid keeps its FIXED size (computed from the
-    // OPEN height), so the reveal is a pure clip wipe — no PTY resize.
+    // OPEN height minus the header), so the reveal is a pure clip wipe —
+    // no PTY resize. After the last tab is closed (`spawned` set),
+    // reopening spawns ONE fresh tab.
     if h > CLOSED_HEIGHT + 1.0 {
         let (font, cell) = ensure_font(ivars);
-        let sessions = ivars.sessions.get_or_init(|| spawn_sessions(cell));
+        let header = header_height(ivars);
+        if sessions.is_empty() {
+            let count = if ivars.spawned.get() { 1 } else { INITIAL_TABS };
+            ivars.spawned.set(true);
+            let (rows, columns, scrollback) = grid_dims(cell, header);
+            sessions = (0..count).map(|_| Session::new(rows, columns, cell.0, cell.1, scrollback)).collect();
+            // Select the new tab — `selected` starts as None and collapse
+            // sets it None, so a fresh spawn must always own the selection
+            // or `draw_grid` matches `_ => {}` and the terminal renders blank.
+            ivars.selected.set(Some(count - 1));
+        }
+        // The header bar: a filled block hugging the menu-bar edge, height
+        // = the measured notch height, so the grid can never slide under
+        // the notch. Empty for now (buttons later). Drawn before the grid
+        // so the grid cannot overpaint it, inside the silhouette clip.
+        CGContext::set_fill_color_with_color(ctx, Some(&CGColor::new_generic_gray(0.06, 1.0)));
+        CGContext::fill_rect(
+            ctx,
+            CGRect::new(
+                CGPoint::new((PANEL_WIDTH - w) / 2.0, PANEL_HEIGHT - header),
+                CGSize::new(w, header),
+            ),
+        );
         let selected = ivars.selected.get();
-        match sessions.get(selected) {
+        match selected.and_then(|i| sessions.get(i)) {
           Some(session) => {
             let grid = session.snapshot();
             draw_grid(
@@ -321,6 +373,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 cell.0,
                 cell.1,
                 h,
+                header,
             )
           }
           _ => {}
@@ -333,23 +386,42 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     // stroke color is ever needed (the old outlined pills painted black on
     // black because only the fill color was set, never the stroke color).
     let chin_y = PANEL_HEIGHT - h;
-    match tab_strip(h, w) {
+    // `count` is the LIVE session count (the vec was just taken above, so
+    // it cannot lag the `tab_count` mirror mid-frame); hover and click use
+    // the mirror. All three pass the same count to `tab_strip` — the single
+    // source of truth for strip geometry, the `+` rect and the `×` rect.
+    let count = sessions.len();
+    match tab_strip(h, w, count) {
       Some((left, tab_w)) => {
         let selected = ivars.selected.get();
         let hovered = ivars.hovered.get();
-        for index in 0..TAB_COUNT {
+        for index in 0..count {
             let x = left + index as CGFloat * tab_w;
-            let gray = if index == selected { 0.18 } else if hovered == Some(index) { 0.14 } else { 0.08 };
+            let gray = if Some(index) == selected { 0.18 } else if hovered == Some(index) { 0.14 } else { 0.08 };
             CGContext::set_fill_color_with_color(
                 ctx,
                 Some(&CGColor::new_generic_gray(gray, 1.0)),
             );
             trace_tab_rect(ctx, x, chin_y, tab_w, TAB_HEIGHT, TAB_RADIUS);
             CGContext::fill_path(ctx);
+            // The `×` close affordance, drawn ONLY on the hovered tab.
+            if hovered == Some(index) {
+                let (cx, cy) = close_center(x, chin_y, tab_w);
+                CGContext::begin_path(ctx);
+                CGContext::move_to_point(ctx, cx - CLOSE_R, cy - CLOSE_R);
+                CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy + CLOSE_R);
+                CGContext::move_to_point(ctx, cx - CLOSE_R, cy + CLOSE_R);
+                CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy - CLOSE_R);
+                // Stroke color is separate state from fill — set it BEFORE
+                // `stroke_path` or the default opaque black is invisible.
+                CGContext::set_gray_stroke_color(ctx, 0.85, 1.0);
+                CGContext::set_line_width(ctx, 1.5);
+                CGContext::stroke_path(ctx);
+            }
         }
         // Dividers between tabs.
         CGContext::begin_path(ctx);
-        for index in 1..TAB_COUNT {
+        for index in 1..count {
             let x = left + index as CGFloat * tab_w;
             CGContext::move_to_point(ctx, x, chin_y);
             CGContext::add_line_to_point(ctx, x, chin_y + TAB_HEIGHT - TAB_RADIUS);
@@ -357,9 +429,10 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         CGContext::set_gray_stroke_color(ctx, 0.35, 1.0);
         CGContext::set_line_width(ctx, 1.0);
         CGContext::stroke_path(ctx);
-        // The `+` button at the right end (decorative: sessions are a fixed
-        // TAB_COUNT, so it is not a click target).
-        let px = left + TAB_COUNT as CGFloat * tab_w;
+        // The `+` button at the right end: a real click target (spawns a
+        // session, see `spawn_tab`). Its rect derives from `tab_strip`'s
+        // outputs — same math as the hit-test in `click_at_screen_point`.
+        let px = left + count as CGFloat * tab_w;
         CGContext::set_fill_color_with_color(
             ctx,
             Some(&CGColor::new_generic_gray(0.1, 1.0)),
@@ -391,15 +464,17 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         // falling back to the shell basename (`zsh`). Centered in the tab,
         // ellipsis-truncated when wider than the tab.
         let label_font = ivars.label_font.get_or_init(|| monospace(TAB_LABEL_SIZE));
-        for index in 0..TAB_COUNT {
+        for index in 0..count {
             let x = left + index as CGFloat * tab_w;
-            let label = ivars.sessions.get().and_then(|s| s.get(index))
-                .map(|s| s.title()).unwrap_or_else(|| format!("Tab {}", index + 1));
+            let label = sessions.get(index).map(|s| s.title())
+                .unwrap_or_else(|| format!("Tab {}", index + 1));
             draw_tab_label(ctx, Some(label_font), &label, x, chin_y, tab_w);
         }
       }
       _ => {}
     }
+
+    put_sessions(ivars, sessions);
 
     CGContext::restore_g_state(ctx);
 }
@@ -424,18 +499,46 @@ fn chin_radius(h: CGFloat) -> CGFloat {
 /// The tab strip's left edge and per-tab width at silhouette size `(h, w)`;
 /// `None` when the strip is not drawn. Single source of truth shared by the
 /// renderer and the click hit-test so they cannot drift.
-fn tab_strip(h: CGFloat, w: CGFloat) -> Option<(CGFloat, CGFloat)> {
-    if h <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
+fn tab_strip(h: CGFloat, w: CGFloat, count: usize) -> Option<(CGFloat, CGFloat)> {
+    if h <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT || count == 0 {
         return None
     }
     let inset = chin_radius(h) + TAB_INSET;
     let left = (PANEL_WIDTH - w) / 2.0 + inset;
     let right = (PANEL_WIDTH + w) / 2.0 - inset;
     let span = right - left - TAB_PLUS_W;
-    if span <= 0.0 {
+    let tab_w = span / count as CGFloat;
+    if span <= 0.0 || tab_w < MIN_TAB_W {
         return None
     }
-    Some((left, span / TAB_COUNT as CGFloat))
+    Some((left, tab_w))
+}
+
+/// Center of the `×` close affordance for the tab at `(x, chin_y, tab_w)`.
+/// Single source of truth for the renderer and the click hit-test (the
+/// `min` keeps the × inside narrow tabs).
+fn close_center(x: CGFloat, chin_y: CGFloat, tab_w: CGFloat) -> (CGFloat, CGFloat) {
+    ((x + tab_w - 12.0).min(x + tab_w / 2.0 + 4.0), chin_y + TAB_HEIGHT - 12.0)
+}
+
+/// The header bar height while open: the measured notch height (the panel
+/// top hugs the notch). Refreshed by `reposition` via `set_notch`.
+fn header_height(ivars: &NotchViewIvars) -> CGFloat {
+    let (_, n) = ivars.notch.get();
+    if n < 1.0 { CLOSED_HEIGHT } else { n }
+}
+
+/// Move the session vec out of its `Cell` (leaves `vec![]` behind); pair
+/// with `put_sessions` in a short, panic-free span.
+fn take_sessions(ivars: &NotchViewIvars) -> Vec<Session> {
+    ivars.sessions.replace(vec![])
+}
+
+/// Move the session vec back into its `Cell` and refresh the `tab_count`
+/// mirror so every `tab_strip(h, w, count)` call site agrees.
+fn put_sessions(ivars: &NotchViewIvars, sessions: Vec<Session>) {
+    ivars.tab_count.set(sessions.len());
+    ivars.sessions.replace(sessions);
 }
 
 /// An iTerm tab path: square bottom flush with `y`, rounded top corners at
@@ -546,23 +649,21 @@ fn ensure_font(ivars: &NotchViewIvars) -> (CFRetained<CTFont>, (CGFloat, CGFloat
     (font.clone(), cell.clone())
 }
 
-/// Spawn the three login-shell PTY sessions at the fixed grid size.
-fn spawn_sessions(cell: (CGFloat, CGFloat)) -> Vec<Session> {
+/// The (rows, columns, scrollback) every `Session` must be built with at
+/// `cell` metrics and `header` reservation — the single formula shared by
+/// every spawn path (initial batch in `draw`, `spawn_tab`) so grid sizes
+/// cannot drift. Must stay in sync with `row_rect`'s header reservation.
+fn grid_dims(cell: (CGFloat, CGFloat), header: CGFloat) -> (usize, usize, usize) {
     let (cell_width, cell_height) = cell;
     let usable = PANEL_WIDTH - 2.0 * GRID_PAD;
     let columns = ((usable / cell_width).floor() as usize).max(1);
-    let rows = (((OPEN_HEIGHT - TAB_HEIGHT - 2.0 * TAB_INSET) / cell_height).floor() as usize).max(1);
+    let rows = (((OPEN_HEIGHT - header - GRID_TOP_PAD - TAB_HEIGHT - 2.0 * TAB_INSET)
+                 / cell_height).floor() as usize).max(1);
     // Scrollback cutoff, configurable via BNT_SCROLLBACK (lines of history
     // kept; 0 disables scrolling). Default matches alacritty's 10000.
     let scrollback = std::env::var("BNT_SCROLLBACK").ok()
         .and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_SCROLLBACK_LINES);
-    (0..TAB_COUNT).map(|_| Session::new(
-        rows,
-        columns,
-        cell_width,
-        cell_height,
-        scrollback,
-    )).collect()
+    (rows, columns, scrollback)
 }
 
 /// Translate an `NSEvent` keydown into PTY bytes.
@@ -614,8 +715,10 @@ impl NotchView {
                 last_time: Cell::new(0.0),
                 font: OnceCell::new(),
                 cell: OnceCell::new(),
-                sessions: OnceCell::new(),
-                selected: Cell::new(0),
+                sessions: Cell::new(vec![]),
+                spawned: Cell::new(false),
+                tab_count: Cell::new(0),
+                selected: Cell::new(None),
                 hovered: Cell::new(None),
                 label_font: OnceCell::new(),
                 tracking: OnceCell::new(),
@@ -678,21 +781,128 @@ impl NotchView {
         self.ivars().height.get()
     }
 
-    /// Route a keystroke event to the selected session's PTY.
+    /// Route a keystroke event to the selected session's PTY (a no-op when
+    /// no tab is selected).
     pub fn handle_key(&self, event: &NSEvent) {
-        let sessions = self.ivars().sessions.get();
-        if sessions.is_none() {
-            return
-        }
         let bytes = key_bytes(event);
         if bytes.is_empty() {
             return
         }
-        let selected = self.ivars().selected.get();
-        match sessions.expect("sessions").get(selected) {
+        let ivars = self.ivars();
+        let sessions = take_sessions(ivars);
+        let selected = ivars.selected.get();
+        match selected.and_then(|i| sessions.get(i)) {
           Some(session) => session.send_input(bytes),
           _ => {}
+        }
+        put_sessions(ivars, sessions);
     }
+
+    /// Spawn a new tab (a fresh login-shell session) at the shared grid
+    /// size, capped at `MAX_TABS`. Only while open.
+    pub fn spawn_tab(&self) {
+        let ivars = self.ivars();
+        if ivars.height.get() <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
+            return
+        }
+        let mut sessions = take_sessions(ivars);
+        if sessions.len() >= MAX_TABS {
+            put_sessions(ivars, sessions);
+            return
+        }
+        let cell = ivars.cell.get().expect("a cell metric exists once open");
+        let (rows, columns, scrollback) = grid_dims(*cell, header_height(ivars));
+        ivars.hovered.set(None); // session indices are about to shift
+        sessions.push(Session::new(rows, columns, cell.0, cell.1, scrollback));
+        put_sessions(ivars, sessions);
+        self.mark_dirty();
+    }
+
+    /// Destroy the tab at `index` (kills its PTY via `Msg::Shutdown`),
+    /// select the tab that followed it (or the last one), and collapse the
+    /// panel when the last tab closes.
+    pub fn close_tab(&self, index: usize) {
+        let ivars = self.ivars();
+        let mut sessions = take_sessions(ivars);
+        if index >= sessions.len() {
+            put_sessions(ivars, sessions);
+            return
+        }
+        let doomed = sessions.remove(index);
+        doomed.destroy();
+        let empty = sessions.is_empty();
+        let len = sessions.len();
+        put_sessions(ivars, sessions);
+        ivars.hovered.set(None);
+        if empty {
+            ivars.selected.set(None);
+            self.mark_dirty();
+            self.collapse();
+        } else {
+            // Selection fix-up: closing the SELECTED tab selects the tab
+            // that followed it (`min(index, len-1)` after removal); closing
+            // one LEFT of the selection shifts the index down so the same
+            // tab stays selected; closing one RIGHT leaves it alone.
+            match ivars.selected.get() {
+              Some(sel) if index == sel => {
+                  ivars.selected.set(Some(if index < len { index } else { len - 1 }));
+              }
+              Some(sel) if index < sel => ivars.selected.set(Some(sel - 1)),
+              _ => {}
+            }
+            self.mark_dirty();
+        }
+    }
+
+    /// Tear down every session whose child shell has exited (one pass for
+    /// all of them), with the same selection fix-up as `close_tab`. Called
+    /// unconditionally from `tick` — a dead session while closed still
+    /// needs teardown so its PTY dies.
+    pub fn reap_dead_sessions(&self) {
+        let ivars = self.ivars();
+        let sessions = take_sessions(ivars);
+        if !sessions.iter().any(|s| s.dead()) {
+            put_sessions(ivars, sessions);
+            return
+        }
+        let mut survivors: Vec<Session> = vec![];
+        let mut first_removed: Option<usize> = None;
+        let mut removed_before_sel = 0;
+        let sel_at_entry = ivars.selected.get().unwrap_or(usize::MAX);
+        for (index, s) in sessions.into_iter().enumerate() {
+            if s.dead() {
+                s.destroy();
+                if first_removed.is_none() { first_removed = Some(index); }
+                if index < sel_at_entry { removed_before_sel += 1; }
+            } else {
+                survivors.push(s);
+            }
+        }
+        put_sessions(ivars, survivors);
+        ivars.hovered.set(None);
+        if ivars.tab_count.get() == 0 {
+            ivars.selected.set(None);
+            self.mark_dirty();
+            self.collapse();
+        } else {
+            // Same remap as `close_tab`: dead tabs LEFT of the selection
+            // shift it down by one (the same tab stays selected); a
+            // selection at/past a removed tab moves to the tab that
+            // followed the first removal, clamped to the end.
+            match ivars.selected.get() {
+              Some(sel) => {
+                  let shifted = sel - removed_before_sel;
+                  let target = if shifted >= ivars.tab_count.get() {
+                      first_removed.unwrap_or(0).min(ivars.tab_count.get() - 1)
+                  } else {
+                      shifted
+                  };
+                  if target != sel { ivars.selected.set(Some(target)); }
+              }
+              _ => {}
+            }
+            self.mark_dirty();
+        }
     }
 
     /// Handle a click observed by the GLOBAL mouse monitor. A non-activating
@@ -732,13 +942,13 @@ impl NotchView {
             return
         }
         let w = ivars.width.get();
-        let new = match tab_strip(h, w) {
+        let new = match tab_strip(h, w, ivars.tab_count.get()) {
           Some((left, tab_w)) => {
             let chin_y = PANEL_HEIGHT - h;
             if py < chin_y || py > chin_y + TAB_HEIGHT {
                 None
             } else {
-                (0..TAB_COUNT).find(|&i| {
+                (0..ivars.tab_count.get()).find(|&i| {
                     let x0 = left + i as CGFloat * tab_w;
                     px >= x0 && px <= x0 + tab_w
                 })
@@ -792,17 +1002,35 @@ impl NotchView {
         }
 
         let w = ivars.width.get();
-        match tab_strip(h, w) {
+        // `count` mirrors `sessions.len()` (see invariant comment on
+        // `tab_count`); the `+` and `×` rects derive from `tab_strip`'s
+        // outputs — same math as the renderer in `draw`.
+        let count = ivars.tab_count.get();
+        match tab_strip(h, w, count) {
           Some((left, tab_w)) => {
             let chin_y = PANEL_HEIGHT - h;
             if y < chin_y || y > chin_y + TAB_HEIGHT {
                 return
             }
-            for index in 0..TAB_COUNT {
+            // 1) The `+` button — spawn a new session/tab.
+            let px = left + count as CGFloat * tab_w;
+            if x >= px && x <= px + TAB_PLUS_W {
+                self.spawn_tab();
+                return
+            }
+            // 2) A tab: the `×` first (only on the hovered tab), else select.
+            for index in 0..count {
                 let x0 = left + index as CGFloat * tab_w;
                 if x >= x0 && x <= x0 + tab_w {
-                    ivars.selected.set(index);
-                    self.mark_dirty();
+                    let (cx, cy) = close_center(x0, chin_y, tab_w);
+                    let on_close = ivars.hovered.get() == Some(index)
+                        && (x - cx).abs() <= CLOSE_HIT && (y - cy).abs() <= CLOSE_HIT;
+                    if on_close {
+                        self.close_tab(index);
+                    } else {
+                        ivars.selected.set(Some(index));
+                        self.mark_dirty();
+                    }
                     return
                 }
             }
@@ -839,11 +1067,12 @@ impl NotchView {
         let ivars = self.ivars();
         ivars.scroll.set(0);
         ivars.scroll_pts.set(0.0);
-        if let Some(sessions) = ivars.sessions.get() {
-            for session in sessions {
-                session.scroll_display(0);
-            }
+        ivars.selected.set(None);
+        let sessions = take_sessions(ivars);
+        for session in &sessions {
+            session.scroll_display(0);
         }
+        put_sessions(ivars, sessions);
         self.set_target(CLOSED_HEIGHT);
     }
 
@@ -865,12 +1094,12 @@ impl NotchView {
         }
         ivars.scroll_pts.set(ivars.scroll_pts.get() - lines as f64 * cell_height);
         ivars.scroll.set(ivars.scroll.get() + lines);
-        if let Some(sessions) = ivars.sessions.get() {
-            match sessions.get(ivars.selected.get()) {
-              Some(session) => session.scroll_display(lines),
-              _ => {}
-            }
+        let sessions = take_sessions(ivars);
+        match ivars.selected.get().and_then(|i| sessions.get(i)) {
+          Some(session) => session.scroll_display(lines),
+          _ => {}
         }
+        put_sessions(ivars, sessions);
         self.mark_dirty();
     }
 }

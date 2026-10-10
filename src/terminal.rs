@@ -18,6 +18,8 @@ use libc::passwd;
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::thread::JoinHandle;
 
@@ -44,6 +46,10 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiR
 pub struct TitleListener {
     title: Arc<std::sync::Mutex<Option<String>>>,
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
+    /// Set when the child shell exits. Shared (via `Clone`) with the copies
+    /// held by `Term` and the reader thread's `EventLoop`, so the main thread
+    /// can observe the exit through any clone (`Session::dead()`).
+    dead: Arc<AtomicBool>,
 }
 
 impl TitleListener {
@@ -51,6 +57,7 @@ impl TitleListener {
         Self {
             title: Arc::new(std::sync::Mutex::new(None)),
             sender: Arc::new(std::sync::Mutex::new(None)),
+            dead: Arc::new(AtomicBool::new(false)),
         }
     }
     /// Wire the PTY writer channel once the `EventLoop` exists. Called after
@@ -88,6 +95,16 @@ impl EventListener for TitleListener {
                         let _ = sender.send(Msg::Input(Cow::from(text.into_bytes())));
                     }
                 }
+            }
+            // The child shell exited. `Event::Exit` (sent by `Term::exit()`
+            // AFTER the `drain_on_exit` final pty_read) is the death signal;
+            // gating on it instead of `ChildExit` (which the event loop
+            // sends BEFORE the drain, `event_loop.rs:263-267`) lets the
+            // session's last bytes land in the grid before the reap. Never
+            // treat `Wakeup` as death — it fires continuously while a
+            // session lives.
+            Event::Exit => {
+                self.dead.store(true, Ordering::SeqCst);
             }
             _ => {}
         }
@@ -238,6 +255,21 @@ impl Session {
             return None
         }
         Some((grid.cursor.point.line.0 as usize, grid.cursor.point.column.0))
+    }
+
+    /// Whether the child shell has exited (`Event::ChildExit` /
+    /// `Event::Exit` landed on the shared listener flag).
+    pub fn dead(&self) -> bool {
+        self.listener.dead.load(Ordering::SeqCst)
+    }
+
+    /// Ask the reader thread to exit: `Msg::Shutdown` makes
+    /// `drain_recv_channel` return false, the event loop breaks, and the
+    /// `EventLoop` (which owns the `Pty`) drops inside the thread —
+    /// `Pty`'s `Drop` impl SIGHUPs the child and waits for it. Harmless on
+    /// an already-dead session.
+    pub fn destroy(&self) {
+        let _ = self.sender.send(Msg::Shutdown);
     }
 
     /// The tab label for this session: the OSC title the shell set (iTerm/

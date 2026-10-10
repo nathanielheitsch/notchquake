@@ -64,6 +64,7 @@ pub fn draw_grid(
     cell_width: CGFloat,
     cell_height: CGFloat,
     height: CGFloat,
+    header: CGFloat,
 ) {
     let ctx_opt = Some(ctx);
     let cols = if grid.is_empty() { 0 } else { grid[0].len() };
@@ -76,7 +77,7 @@ pub fn draw_grid(
 
     // Background pass: only runs whose bg differs from the silhouette black.
     for (row, cells) in grid.iter().enumerate() {
-        if let Some((top, h)) = row_rect(row, cell_height, height) {
+        if let Some((top, h)) = row_rect(row, cell_height, height, header) {
             let mut col = 0;
             while col < used_cols {
                 let bg = cells[col].background;
@@ -103,7 +104,7 @@ pub fn draw_grid(
 
     // Text pass: one CTLine per same-foreground run, drawn upright.
     for (row, cells) in grid.iter().enumerate() {
-        if let Some((top, _)) = row_rect(row, cell_height, height) {
+        if let Some((top, _)) = row_rect(row, cell_height, height, header) {
             let baseline = top + ascent;
             let mut col = 0;
             while col < used_cols {
@@ -135,7 +136,7 @@ pub fn draw_grid(
     // Cursor pass.
     if let Some((line, column)) = cursor {
         if column < used_cols && line < grid.len() {
-            if let Some((top, h)) = row_rect(line, cell_height, height) {
+            if let Some((top, h)) = row_rect(line, cell_height, height, header) {
                 CGContext::set_fill_color_with_color(
                     ctx_opt,
                     Some(&CGColor::new_srgb(0.75, 0.75, 0.75, CURSOR_ALPHA)),
@@ -157,8 +158,8 @@ pub fn draw_grid(
 /// The (bottom, height) of grid row `row` in the y-up layer space: the grid
 /// hangs from the panel top, and rows below the silhouette bottom
 /// (`PANEL_HEIGHT - height`) are skipped.
-fn row_rect(row: usize, cell_height: CGFloat, height: CGFloat) -> Option<(CGFloat, CGFloat)> {
-    let bottom = PANEL_HEIGHT - GRID_TOP_PAD - (row as CGFloat + 1.0) * cell_height;
+fn row_rect(row: usize, cell_height: CGFloat, height: CGFloat, header: CGFloat) -> Option<(CGFloat, CGFloat)> {
+    let bottom = PANEL_HEIGHT - GRID_TOP_PAD - header - (row as CGFloat + 1.0) * cell_height;
     if bottom < PANEL_HEIGHT - height {
         return None
     }
