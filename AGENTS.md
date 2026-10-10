@@ -87,6 +87,8 @@ window capture for alpha, the desktop capture for the composited result.
 | Click tab → switch PTY | ✅ verified | `mouseDown:` on the open panel selects the tab under the cursor; synthetic click on the middle tab moved selection from tab 0 (sel 64–435) to tab 1 (sel 434–805) |
 | Option+Space global hotkey | ✅ verified | Carbon `RegisterEventHotKey` (no TCC grant); synthetic Option+Space toggles open then close |
 | Click closed pill → open | ✅ verified | synthetic click on the pill toggles open (via `mouseDown:` for real clicks / global monitor fallback) |
+| Scroll wheel → history | ✅ built | global `ScrollWheel` monitor → `scroll_wheel()`; alacritty `Scroll::Delta`, `BNT_SCROLLBACK` (default 10000). Not yet exercised with a real wheel gesture. |
+| Click outside panel → collapse | ✅ built | `click_at_screen_point` collapses an open panel on an outside click; idempotent `expand`/`collapse` so both click paths land once. |
 
 ## The tab-bar defect — root cause (fixed 2026-10-09)
 
