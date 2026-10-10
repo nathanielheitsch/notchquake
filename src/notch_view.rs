@@ -61,6 +61,16 @@ const CLOSE_R: CGFloat = 5.0;
 const CLOSE_HIT: CGFloat = 9.0;
 const TAB_HEIGHT: CGFloat = 28.0;
 
+/// Tab-strip palette, sRGB (user spec): inactive tab fill `0D0C0C`,
+/// inactive label `828383`, separator lines `3E3D3D`, active label `FBFAFC`.
+const fn rgb(r: u8, g: u8, b: u8) -> (CGFloat, CGFloat, CGFloat) {
+    (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
+}
+const TAB_FILL: (CGFloat, CGFloat, CGFloat) = rgb(0x0D, 0x0C, 0x0C);
+const LINE: (CGFloat, CGFloat, CGFloat) = rgb(0x3E, 0x3D, 0x3D);
+const TEXT_ACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0xFB, 0xFA, 0xFC);
+const TEXT_INACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0x82, 0x83, 0x83);
+
 /// Point size of the tab labels.
 const TAB_LABEL_SIZE: CGFloat = 11.0;
 const TAB_INSET: CGFloat = 8.0;
@@ -353,7 +363,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         // = the measured notch height, so the grid can never slide under
         // the notch. Empty for now (buttons later). Drawn before the grid
         // so the grid cannot overpaint it, inside the silhouette clip.
-        CGContext::set_fill_color_with_color(ctx, Some(&CGColor::new_generic_gray(0.06, 1.0)));
+        CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TAB_FILL)));
         CGContext::fill_rect(
             ctx,
             CGRect::new(
@@ -361,6 +371,13 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 CGSize::new(w, header),
             ),
         );
+        // Separator between the header box and the terminal, LINE color.
+        CGContext::begin_path(ctx);
+        CGContext::move_to_point(ctx, (PANEL_WIDTH - w) / 2.0, PANEL_HEIGHT - header);
+        CGContext::add_line_to_point(ctx, (PANEL_WIDTH + w) / 2.0, PANEL_HEIGHT - header);
+        CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(LINE)));
+        CGContext::set_line_width(ctx, 1.0);
+        CGContext::stroke_path(ctx);
         let selected = ivars.selected.get();
         match selected.and_then(|i| sessions.get(i)) {
           Some(session) => {
@@ -380,11 +397,10 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         }
     }
 
-    // The tab strip: iTerm-style tabs hanging from the silhouette's bottom
-    // edge (rounded top corners, square bottom flush with the chin line).
-    // Every tab is FILLED — selected lighter, unselected dimmed — so no
-    // stroke color is ever needed (the old outlined pills painted black on
-    // black because only the fill color was set, never the stroke color).
+    // The tab strip hanging from the silhouette's bottom edge — SQUARE
+    // rectangles flush with the chin line, all filled TAB_FILL. Only the
+    // ACTIVE tab gets 1px side borders (LINE color, left and right edges
+    // only — never top or bottom); separators between tabs are LINE too.
     let chin_y = PANEL_HEIGHT - h;
     // `count` is the LIVE session count (the vec was just taken above, so
     // it cannot lag the `tab_count` mirror mid-frame); hover and click use
@@ -397,13 +413,11 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         let hovered = ivars.hovered.get();
         for index in 0..count {
             let x = left + index as CGFloat * tab_w;
-            let gray = if Some(index) == selected { 0.18 } else if hovered == Some(index) { 0.14 } else { 0.08 };
-            CGContext::set_fill_color_with_color(
+            CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TAB_FILL)));
+            CGContext::fill_rect(
                 ctx,
-                Some(&CGColor::new_generic_gray(gray, 1.0)),
+                CGRect::new(CGPoint::new(x, chin_y), CGSize::new(tab_w, TAB_HEIGHT)),
             );
-            trace_tab_rect(ctx, x, chin_y, tab_w, TAB_HEIGHT, TAB_RADIUS);
-            CGContext::fill_path(ctx);
             // The `×` close affordance, drawn ONLY on the hovered tab.
             if hovered == Some(index) {
                 let (cx, cy) = close_center(x, chin_y, tab_w);
@@ -414,37 +428,43 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy - CLOSE_R);
                 // Stroke color is separate state from fill — set it BEFORE
                 // `stroke_path` or the default opaque black is invisible.
-                CGContext::set_gray_stroke_color(ctx, 0.85, 1.0);
+                CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(TEXT_ACTIVE)));
                 CGContext::set_line_width(ctx, 1.5);
                 CGContext::stroke_path(ctx);
             }
         }
-        // Dividers between tabs.
+        // Separators between tabs + the active tab's side borders, one
+        // stroke pass in LINE color.
         CGContext::begin_path(ctx);
         for index in 1..count {
             let x = left + index as CGFloat * tab_w;
             CGContext::move_to_point(ctx, x, chin_y);
-            CGContext::add_line_to_point(ctx, x, chin_y + TAB_HEIGHT - TAB_RADIUS);
+            CGContext::add_line_to_point(ctx, x, chin_y + TAB_HEIGHT);
         }
-        CGContext::set_gray_stroke_color(ctx, 0.35, 1.0);
+        if let Some(sel) = selected {
+            if sel < count {
+                let x = left + sel as CGFloat * tab_w;
+                for bx in [x, x + tab_w] {
+                    CGContext::move_to_point(ctx, bx, chin_y);
+                    CGContext::add_line_to_point(ctx, bx, chin_y + TAB_HEIGHT);
+                }
+            }
+        }
+        CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(LINE)));
         CGContext::set_line_width(ctx, 1.0);
         CGContext::stroke_path(ctx);
         // The `+` button at the right end: a real click target (spawns a
         // session, see `spawn_tab`). Its rect derives from `tab_strip`'s
         // outputs — same math as the hit-test in `click_at_screen_point`.
         let px = left + count as CGFloat * tab_w;
-        CGContext::set_fill_color_with_color(
+        CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TAB_FILL)));
+        CGContext::fill_rect(
             ctx,
-            Some(&CGColor::new_generic_gray(0.1, 1.0)),
+            CGRect::new(CGPoint::new(px, chin_y), CGSize::new(TAB_PLUS_W, TAB_HEIGHT)),
         );
-        trace_tab_rect(ctx, px, chin_y, TAB_PLUS_W, TAB_HEIGHT, TAB_RADIUS);
-        CGContext::fill_path(ctx);
         let cx = px + TAB_PLUS_W / 2.0;
         let cy = chin_y + TAB_HEIGHT * 0.55;
-        CGContext::set_fill_color_with_color(
-            ctx,
-            Some(&CGColor::new_generic_gray(0.8, 1.0)),
-        );
+        CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TEXT_ACTIVE)));
         CGContext::fill_rect(
             ctx,
             CGRect::new(
@@ -461,14 +481,14 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         );
 
         // The tab labels: the OSC title the shell set (`vim`, `git`, …),
-        // falling back to the shell basename (`zsh`). Centered in the tab,
-        // ellipsis-truncated when wider than the tab.
+        // falling back to `⌘<n>` (the tab's 1-based index). Active label
+        // TEXT_ACTIVE, inactive TEXT_INACTIVE. Centered, ellipsis-truncated.
         let label_font = ivars.label_font.get_or_init(|| monospace(TAB_LABEL_SIZE));
         for index in 0..count {
             let x = left + index as CGFloat * tab_w;
-            let label = sessions.get(index).map(|s| s.title())
-                .unwrap_or_else(|| format!("Tab {}", index + 1));
-            draw_tab_label(ctx, Some(label_font), &label, x, chin_y, tab_w);
+            let label = format!("\u{2318}{}", index + 1);
+            let color = if Some(index) == selected { TEXT_ACTIVE } else { TEXT_INACTIVE };
+            draw_tab_label(ctx, Some(label_font), &label, x, chin_y, tab_w, color);
         }
       }
       _ => {}
@@ -590,6 +610,7 @@ fn draw_tab_label(
     x: CGFloat,
     y: CGFloat,
     w: CGFloat,
+    color: (CGFloat, CGFloat, CGFloat),
 ) {
     if label.is_empty() || w <= 0.0 {
         return
@@ -619,10 +640,16 @@ fn draw_tab_label(
 
     CGContext::save_g_state(ctx);
     CGContext::translate_ctm(ctx, cx, baseline);
-    CGContext::set_fill_color_with_color(ctx, Some(&CGColor::new_generic_gray(0.85, 1.0)));
+    CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(color)));
     CGContext::set_text_position(ctx, 0.0, 0.0);
     unsafe { line.draw(ctx.expect("a current context")) };
     CGContext::restore_g_state(ctx);
+}
+
+/// A `CGColor` from the tab-strip palette (sRGB, opaque).
+fn rgb_color(rgb: (CGFloat, CGFloat, CGFloat)) -> CFRetained<CGColor> {
+    let (r, g, b) = rgb;
+    CGColor::new_srgb(r, g, b, 1.0)
 }
 
 /// A `CTLine` for `text` shaped by `font`, with the font attribute set over
