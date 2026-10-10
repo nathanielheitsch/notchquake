@@ -283,6 +283,14 @@ height.
     `×` or the right-aligned `⌘<n>` hint (title width is truncated by
     `tab_w - hint_w`).
 
+22. **`CTLineDraw` defaults to BLACK unless the attributed string opts into
+    the CGContext fill color.** Any shaper must set
+    `kCTForegroundColorFromContextAttributeName = YES` over the full range
+    (see `render.rs::run` and `notch_view.rs::shaped_line`); without it
+    `set_fill_color_*` has no effect on the text and it paints black-on-black
+    (invisible on the dark panel). This bit twice: the grid, then the tab
+    labels/hints.
+
 ## Repo / process rules
 
 - macOS-only, arm64. `cargo build` is the gate; no LSP.
