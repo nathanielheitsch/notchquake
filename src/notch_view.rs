@@ -258,7 +258,7 @@ fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat) {
         ctx,
         max_x - bottom * (1.0 - KAPPA),
         min_y,
-        max_x - bottom,
+        max_x,
         min_y + bottom * (1.0 - KAPPA),
         max_x,
         min_y + bottom,
@@ -629,6 +629,15 @@ impl NotchView {
         self.ivars().width_spring.retarget(if target > CLOSED_HEIGHT + 1.0 { PANEL_WIDTH } else { self.ivars().notch.get().0 });
         self.ivars().last_time.set(0.0);
         self.mark_dirty();
+        // Claim key-window focus when opening, so a hotkey-open needs no
+        // follow-up click before typing. `canBecomeKeyWindow -> true` makes
+        // this legal for a NonactivatingPanel; we never activate the app, so
+        // the previous frontmost app stays visually frontmost.
+        if target > CLOSED_HEIGHT + 1.0 {
+            if let Some(window) = self.as_super().window() {
+                window.makeKeyWindow();
+            }
+        }
     }
 
     /// Toggles between the closed and open silhouette heights.

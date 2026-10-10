@@ -14,8 +14,14 @@
 //! decreasing with the row index; each row is drawn upright.
 
 use objc2_core_graphics::{CGContext, CGColor};
-use objc2_core_text::{CTFont, CTLine, kCTFontAttributeName};
+use objc2_core_text::{
+    CTFont,
+    CTLine,
+    kCTFontAttributeName,
+    kCTForegroundColorFromContextAttributeName,
+};
 use objc2_core_foundation::{
+    CFBoolean,
     CFMutableAttributedString,
     CFRange,
     CFString,
@@ -25,6 +31,7 @@ use objc2_core_foundation::{
     CGSize,
     CGFloat,
 };
+use objc2_core_foundation::kCFBooleanTrue;
 
 use std::ptr::null;
 
@@ -175,8 +182,6 @@ unsafe fn run(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
     let attr = CFMutableAttributedString::new(None, 0).expect("an attributed string");
     let insert = CFRange { location: 0, length: 0 };
     unsafe { CFMutableAttributedString::replace_string(Some(&*attr), insert, Some(text)) };
-    // Set the font over the FULL inserted range (UTF-16 units), not the
-    // length-0 insert range — `set_attribute` on a length-0 range is a no-op.
     let full = CFRange { location: 0, length: text.length() };
     unsafe {
         CFMutableAttributedString::set_attribute(
@@ -185,6 +190,14 @@ unsafe fn run(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
             Some(kCTFontAttributeName),
             Some(&**font),
         );
-    }
+        // `CTLineDraw` defaults to BLACK unless the string opts in to the
+        // CGContext fill colour. Without this the grid paints black-on-black.
+        CFMutableAttributedString::set_attribute(
+            Some(&*attr),
+            full,
+            Some(kCTForegroundColorFromContextAttributeName),
+            Some(&*kCFBooleanTrue.expect("a boolean")),
+        );
+    };
     CTLine::with_attributed_string(&**attr)
 }

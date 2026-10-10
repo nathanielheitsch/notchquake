@@ -203,6 +203,29 @@ height.
    screen point), NOT `window.frame.origin + locationInWindow()` — a global
    event's `window` is nil, so the old code early-returned and swallowed
    every click.
+
+12. **`CTLineDraw` paints BLACK unless the attributed string opts in.** Setting
+    only the CGContext fill color does nothing for a `CTLine` — CoreText uses
+    the string's own `kCTForegroundColorAttributeName`, defaulting to black
+    (black-on-black = invisible). Set
+    `kCTForegroundColorFromContextAttributeName = YES` (a `CFBoolean`, via
+    `kCFBooleanTrue`) over the full range so the line reads the per-run
+    `set_fill_color` the caller sets. The tab labels looked fine because they
+    happened to be drawn where black-on-black was still legible against the
+    dim tab fill; the grid was not.
+13. **Claim key focus on open, not just on click.** `set_target` calls
+    `window.makeKeyWindow()` when opening, so a hotkey-open lets the local
+    key monitor fire immediately — no follow-up click needed before typing.
+    Legal because `canBecomeKeyWindow -> true`; the app is never activated,
+    so the previous frontmost app stays visually frontmost.
+
+14. **`trace_silhouette` chin arcs must use the SAME control-point convention
+    as the tab rects.** The right chin corner's second control point was
+    `max_x - bottom` (should be `max_x`), inverting the arc so the bottom-right
+    corner bulged the wrong way. Symptom: bottom-right corner looked clipped
+    / inverted while the left was correct. Verify with a window-local alpha
+    capture: the bottom row must inset the SAME amount on both sides.
+
 ## Repo / process rules
 
 - macOS-only, arm64. `cargo build` is the gate; no LSP.
