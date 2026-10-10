@@ -28,12 +28,15 @@ use objc2_core_foundation::{
 
 use std::ptr::null;
 
-use crate::consts::{PANEL_HEIGHT, PANEL_WIDTH, TOP_CORNER_RADIUS};
+use crate::consts::{PANEL_HEIGHT, PANEL_WIDTH};
 use crate::terminal::CellSnapshot;
 
 /// Horizontal padding of the grid inside the silhouette (each side).
 pub const GRID_PAD: CGFloat = 8.0;
 
+/// Vertical padding at the top of the grid: row 0 must clear the silhouette's
+/// rounded top corners and top edge, whose taper reaches ~20pt down each side.
+pub const GRID_TOP_PAD: CGFloat = 22.0;
 /// The default terminal background: cells painted this color are skipped
 /// (the silhouette fill is already black).
 const DEFAULT_BG: (CGFloat, CGFloat, CGFloat) = (0.0, 0.0, 0.0);
@@ -57,8 +60,8 @@ pub fn draw_grid(
 ) {
     let ctx_opt = Some(ctx);
     let cols = if grid.is_empty() { 0 } else { grid[0].len() };
-    let x0 = TOP_CORNER_RADIUS + GRID_PAD;
-    let usable = PANEL_WIDTH - 2.0 * (TOP_CORNER_RADIUS + GRID_PAD);
+    let x0 = GRID_PAD;
+    let usable = PANEL_WIDTH - 2.0 * GRID_PAD;
     let used_cols = if cell_width > 0.0 { (usable / cell_width).floor() as usize } else { cols };
     let used_cols = if used_cols < cols { used_cols } else { cols };
 
@@ -110,7 +113,6 @@ pub fn draw_grid(
                 let run_text: String = cells[start..col + 1].iter().map(|cell| cell.character).collect();
                 let text = CFString::from_str(&run_text);
                 let line = unsafe { run(font, &text) };
-
                 CGContext::save_g_state(ctx_opt);
                 CGContext::translate_ctm(ctx_opt, x0 + start as CGFloat * cell_width, baseline);
                 CGContext::set_fill_color_with_color(ctx_opt, Some(&srgb(fg)));
@@ -149,7 +151,7 @@ pub fn draw_grid(
 /// hangs from the panel top, and rows below the silhouette bottom
 /// (`PANEL_HEIGHT - height`) are skipped.
 fn row_rect(row: usize, cell_height: CGFloat, height: CGFloat) -> Option<(CGFloat, CGFloat)> {
-    let bottom = PANEL_HEIGHT - (row as CGFloat + 1.0) * cell_height;
+    let bottom = PANEL_HEIGHT - GRID_TOP_PAD - (row as CGFloat + 1.0) * cell_height;
     if bottom < PANEL_HEIGHT - height {
         return None
     }
@@ -162,16 +164,27 @@ fn srgb(rgb: (CGFloat, CGFloat, CGFloat)) -> CFRetained<CGColor> {
     CGColor::new_srgb(r, g, b, 1.0)
 }
 
-/// A `CTLine` for `text` shaped by `font`.
+/// A `CTLine` for `text` shaped by `font`, with the font attribute set over
+/// the FULL string range (a zero-length range is the INSERT range for
+/// `replace_string`, NOT the range of the inserted text — using it for
+/// `set_attribute` is a no-op, so the font never attaches and `CTLineDraw`
+/// falls back to the default font/colour). With the font attached,
+/// `CTLineDraw` reads the text colour from the CGContext fill colour the
+/// caller sets per-run.
 unsafe fn run(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
     let attr = CFMutableAttributedString::new(None, 0).expect("an attributed string");
-    let range = CFRange { location: 0, length: 0 };
-    unsafe { CFMutableAttributedString::replace_string(Some(&*attr), range, Some(text)) };
-    CFMutableAttributedString::set_attribute(
-        Some(&*attr),
-        range,
-        Some(kCTFontAttributeName),
-        Some(&**font),
-    );
+    let insert = CFRange { location: 0, length: 0 };
+    unsafe { CFMutableAttributedString::replace_string(Some(&*attr), insert, Some(text)) };
+    // Set the font over the FULL inserted range (UTF-16 units), not the
+    // length-0 insert range — `set_attribute` on a length-0 range is a no-op.
+    let full = CFRange { location: 0, length: text.length() };
+    unsafe {
+        CFMutableAttributedString::set_attribute(
+            Some(&*attr),
+            full,
+            Some(kCTFontAttributeName),
+            Some(&**font),
+        );
+    }
     CTLine::with_attributed_string(&**attr)
 }

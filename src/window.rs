@@ -2,7 +2,17 @@
 //! top-centre of the main screen, just above the menu bar.
 //!
 //! The window is NEVER resized — the silhouette inside it animates instead.
+//!
+//! `NotchPanel` is an `NSPanel` subclass whose only job is to override
+//! `canBecomeKeyWindow -> true`. A `NonactivatingPanel`-styled `NSPanel`
+//! defaults `canBecomeKey` to `false`, which makes `makeKey()` a no-op — so
+//! the panel never becomes the key window, the local `NSEvent` key monitor
+//! never fires, and you cannot type into the terminal. Forcing key-eligibility
+//! on (the Spotlight/Maccy/SaneClip pattern) lets a click make the panel key
+//! WITHOUT activating the app, so the previous frontmost app keeps focus.
+//! `canBecomeMainWindow -> false` prevents us from ever taking over main.
 
+use objc2::{ClassType, define_class, DefinedClass, msg_send};
 use objc2::rc::Retained;
 use objc2::MainThreadOnly;
 use objc2_app_kit::{
@@ -10,7 +20,37 @@ use objc2_app_kit::{
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
-use objc2_foundation::{MainThreadMarker, NSEdgeInsets, NSPoint, NSRect, NSSize};
+use objc2_foundation::{MainThreadMarker, NSEdgeInsets, NSObjectProtocol, NSPoint, NSRect, NSSize};
+
+define_class!(
+    // SAFETY:
+    // - The superclass `NSPanel` is a normal `NSObject` subclass; we override
+    //   only no-arg bool getters, which have no subclassing requirements.
+    #[unsafe(super(NSPanel))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NotchPanel"]
+    pub struct NotchPanel;
+
+    // SAFETY: `NSObjectProtocol` has no safety requirements.
+    unsafe impl NSObjectProtocol for NotchPanel {}
+
+    impl NotchPanel {
+        // SAFETY: `canBecomeKeyWindow` is `@property(readonly) BOOL` — a
+        // no-arg `BOOL`-return method. Overriding it to return YES is the
+        // documented way to make a non-activating panel key-eligible.
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key_window(&self) -> bool {
+            true
+        }
+
+        // SAFETY: `canBecomeMainWindow` is the matching main-window getter;
+        // keep it NO so the notch panel never takes over main.
+        #[unsafe(method(canBecomeMainWindow))]
+        fn can_become_main_window(&self) -> bool {
+            false
+        }
+    }
+);
 
 /// The screen's visible frame (excludes the menu-bar strip).
 fn visible_frame(screen: &NSScreen) -> NSRect {
@@ -67,21 +107,18 @@ pub fn panel_origin(screen: NSRect) -> NSPoint {
 /// its content view.
 pub fn create_panel(mtm: MainThreadMarker) -> (Retained<NSPanel>, Retained<NSView>) {
     let origin = notch_screen_origin(mtm);
-    let panel = unsafe {
-        NSPanel::initWithContentRect_styleMask_backing_defer(
-            NSPanel::alloc(mtm),
-            NSRect::new(
-                origin,
-                NSSize::new(PANEL_WIDTH, PANEL_HEIGHT),
-            ),
-            NSWindowStyleMask::Borderless
-                | NSWindowStyleMask::NonactivatingPanel
-                | NSWindowStyleMask::UtilityWindow
-                | NSWindowStyleMask::HUDWindow,
-            NSBackingStoreType::Buffered,
-            false,
-        )
+    let this = NotchPanel::alloc(mtm).set_ivars(());
+    // Call the inherited `NSPanel` designated initialiser via the superclass
+    // (`msg_send![super(this), ...]`). `set_ivars(())` advances
+    // `Allocated<NotchPanel>` to the `PartialInit<NotchPanel>` the super-init
+    // family requires (NotchPanel has no ivars). The inherent
+    // `NSPanel::initWithContentRect:...` can't take `Allocated<NotchPanel>`,
+    // so we dispatch through super. Returns `Retained<NotchPanel>`; upcast to
+    // `Retained<NSPanel>` for the caller.
+    let panel: Retained<NotchPanel> = unsafe {
+        msg_send![super(this), initWithContentRect: NSRect::new(origin, NSSize::new(PANEL_WIDTH, PANEL_HEIGHT)) styleMask: NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel | NSWindowStyleMask::UtilityWindow | NSWindowStyleMask::HUDWindow backing: NSBackingStoreType::Buffered defer: false]
     };
+    let panel: Retained<NSPanel> = panel.into_super();
 
     unsafe {
         panel.setFloatingPanel(true);
@@ -90,7 +127,7 @@ pub fn create_panel(mtm: MainThreadMarker) -> (Retained<NSPanel>, Retained<NSVie
         panel.setHasShadow(false);
         panel.setMovable(false);
         panel.setReleasedWhenClosed(false);
-        panel.setBecomesKeyOnlyIfNeeded(true);
+        panel.setBecomesKeyOnlyIfNeeded(false);
         panel.setWorksWhenModal(true);
         panel.setAlphaValue(1.0);
         panel.setCollectionBehavior(

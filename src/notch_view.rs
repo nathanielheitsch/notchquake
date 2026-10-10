@@ -18,8 +18,10 @@ use objc2::DefinedClass;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::MainThreadOnly;
-use objc2_app_kit::{NSGraphicsContext, NSView, NSWindow, NSEvent, NSEventModifierFlags};
-use objc2_core_text::CTFont;
+use objc2::runtime::AnyObject;
+use objc2::AnyThread;
+use objc2_app_kit::{NSGraphicsContext, NSView, NSEvent, NSEventModifierFlags, NSTrackingArea, NSTrackingAreaOptions};
+use objc2_core_text::{CTFont, CTLine, CTLineTruncationType, kCTFontAttributeName};
 use objc2_core_foundation::{
     CFAbsoluteTimeGetCurrent,
     CGFloat,
@@ -29,12 +31,18 @@ use objc2_core_foundation::{
     CGSize,
 };
 use objc2_core_graphics::{CGColor, CGContext};
-use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect};
+use objc2_core_foundation::{
+    CFMutableAttributedString,
+    CFRange,
+    CFString,
+};
+use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_foundation::NSString;
 use std::cell::Cell;
 use std::cell::OnceCell;
+use core::ffi::c_double;
 use crate::animation::Spring;
-use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, NOTCH_WIDTH, OPEN_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH, TOP_CORNER_RADIUS};
+use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, NOTCH_WIDTH, OPEN_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH};
 use crate::font::{FONT_SIZE, monospace, cell_metrics};
 use crate::render::{draw_grid, GRID_PAD};
 use crate::terminal::Session;
@@ -43,7 +51,10 @@ use crate::terminal::Session;
 /// bottom edge — tabs are rounded-top-corner rectangles flush with the chin
 /// line, separated by thin dividers, with a `+` button at the right end.
 const TAB_COUNT: usize = 3;
-const TAB_HEIGHT: CGFloat = 22.0;
+const TAB_HEIGHT: CGFloat = 28.0;
+
+/// Point size of the tab labels.
+const TAB_LABEL_SIZE: CGFloat = 11.0;
 const TAB_INSET: CGFloat = 8.0;
 const TAB_RADIUS: CGFloat = 6.0;
 const TAB_PLUS_W: CGFloat = 20.0;
@@ -66,6 +77,9 @@ pub struct NotchViewIvars {
     cell: OnceCell<(CGFloat, CGFloat)>,
     sessions: OnceCell<Vec<Session>>,
     selected: Cell<usize>,
+    hovered: Cell<Option<usize>>,
+    label_font: OnceCell<CFRetained<CTFont>>,
+    tracking: OnceCell<Retained<NSTrackingArea>>,
 }
 
 define_class!(
@@ -118,12 +132,34 @@ define_class!(
             if !ivars.spring.settled() {
                 self.mark_dirty();
             }
+
+            // The hover tracking area, installed once over the whole panel.
+            // `ActiveInKeyWindow` ties hover to key focus, which the panel
+            // takes on click (see Item 1).
+            if ivars.tracking.get().is_none() {
+                let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PANEL_WIDTH, PANEL_HEIGHT));
+                let opts = NSTrackingAreaOptions::MouseEnteredAndExited
+                    .union(NSTrackingAreaOptions::MouseMoved)
+                    .union(NSTrackingAreaOptions::ActiveInKeyWindow)
+                    .union(NSTrackingAreaOptions::InVisibleRect);
+                let area = unsafe {
+                    NSTrackingArea::initWithRect_options_owner_userInfo(
+                        NSTrackingArea::alloc(),
+                        rect,
+                        opts,
+                        Some(self.as_super() as &AnyObject),
+                        None,
+                    )
+                };
+                self.as_super().addTrackingArea(&area);
+                let _ = ivars.tracking.set(area);
+            }
         }
 
-        // A click on the panel's drawn region. A non-activating panel never
-        // becomes key, but its views still receive `mouseDown:` for clicks that
-        // land on the opaque silhouette — so this is the reliable path for
-        // clicking the closed pill (toggle) and the open tab strip (select).
+        // A click on the panel's drawn region. The panel becomes the key
+        // window on click (Item 1), so its views receive `mouseDown:` for
+        // clicks on the opaque silhouette — the reliable path for clicking
+        // the closed pill (toggle) and the open tab strip (select).
         // `locationInWindow` is already in this view's y-up panel-local space
         // (the view fills the panel), so convert to a screen point and reuse
         // the shared hit-test.
@@ -139,27 +175,56 @@ define_class!(
             self.select_at_screen_point(&screen);
         }
 
+        // Hover: the panel becomes the key window on click (see Item 1), and
+        // the tracking area installed in `drawRect:` carries
+        // `ActiveInKeyWindow`, so these fire while the panel is key. They only
+        // record which tab the cursor is over; the repaint is a palette change.
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, event: &NSEvent) {
+            self.update_hover(event);
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            self.update_hover(event);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            let ivars = self.ivars();
+            if ivars.hovered.get().is_some() {
+                ivars.hovered.set(None);
+                self.mark_dirty();
+            }
+        }
+
         #[unsafe(method(tick))]
         fn tick(&self) {
-            if self.ivars().spring.settled() {
-                return;
-            }
-            self.mark_dirty();
-            if let Some(window) = self.as_super().window() {
-                window.update();
-                window.displayIfNeeded();
+            let ivars = self.ivars();
+            // Redraw while the spring is animating OR while the panel is open,
+            // so PTY output (processed on the reader thread) is painted. The
+            // spring-only redraw left the grid frozen once the open animation
+            // settled — the terminal never updated even as the shell wrote its
+            // prompt. A terminal is meant to redraw continuously while open.
+            let open = ivars.height.get() > CLOSED_HEIGHT + 1.0;
+            if !ivars.spring.settled() || open {
+                self.mark_dirty();
+                if let Some(window) = self.as_super().window() {
+                    window.update();
+                    window.displayIfNeeded();
+                }
             }
         }
     }
 );
 
 /// The silhouette path, traced in a top-left-origin rect `(0, 0, PANEL_WIDTH,
-/// h)`: two square-ish corners at the menu bar, then the chin corners which
-/// also inset the bottom edge by `BOTTOM_CORNER_RADIUS` on both sides.
+/// h)`: square top corners at the menu bar (a straight top edge, since the
+/// panel sits flush under the notch), then the chin corners rounded at
+/// `BOTTOM_CORNER_RADIUS`, which also inset the bottom edge on both sides.
 fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat) {
     // AppKit clamps corner radii to the rect; do the same so the closed pill
-    // (h < top + bottom) stays a proper pill instead of self-intersecting.
-    let top = TOP_CORNER_RADIUS * silhouette_scale(h);
+    // (h < 2 * bottom) stays a proper pill instead of self-intersecting.
     let bottom = chin_radius(h);
 
     // y-up space: the silhouette hangs from the panel top, so the menu-bar
@@ -169,11 +234,11 @@ fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat) {
     let (max_x, max_y) = ((PANEL_WIDTH + w) / 2.0, PANEL_HEIGHT);
 
 
-    // Rounded rect: `top` radius at the menu-bar edge (`max_y`), `bottom`
-    // radius at the chin (`min_y`). Traced counter-clockwise from the left
-    // edge, with proper quarter-circle control points (kappa = 0.5523).
+    // Square top corners: a straight top edge at the menu bar (`max_y`),
+    // quarter-circle arcs only at the chin (`min_y`). Traced counter-clockwise
+    // from the left edge, with proper quarter-circle control points (kappa).
     CGContext::begin_path(ctx);
-    CGContext::move_to_point(ctx, min_x, max_y - top);
+    CGContext::move_to_point(ctx, min_x, max_y);
     // Left side down to the chin corner.
     CGContext::add_line_to_point(ctx, min_x, min_y + bottom);
     // Chin left corner.
@@ -198,30 +263,10 @@ fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat) {
         max_x,
         min_y + bottom,
     );
-    // Right side up to the menu-bar corner.
-    CGContext::add_line_to_point(ctx, max_x, max_y - top);
-    // Menu-bar right corner.
-    CGContext::add_curve_to_point(
-        ctx,
-        max_x,
-        max_y - top * (1.0 - KAPPA),
-        max_x - top * (1.0 - KAPPA),
-        max_y,
-        max_x - top,
-        max_y,
-    );
-    // Menu-bar top edge.
-    CGContext::add_line_to_point(ctx, min_x + top, max_y);
-    // Menu-bar left corner.
-    CGContext::add_curve_to_point(
-        ctx,
-        min_x + top * (1.0 - KAPPA),
-        max_y,
-        min_x,
-        max_y - top * (1.0 - KAPPA),
-        min_x,
-        max_y - top,
-    );
+    // Right side up to the square top-right corner.
+    CGContext::add_line_to_point(ctx, max_x, max_y);
+    // Straight top edge along the menu bar.
+    CGContext::add_line_to_point(ctx, min_x, max_y);
     CGContext::close_path(ctx);
 }
 
@@ -286,9 +331,10 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     match tab_strip(h, w) {
       Some((left, tab_w)) => {
         let selected = ivars.selected.get();
+        let hovered = ivars.hovered.get();
         for index in 0..TAB_COUNT {
             let x = left + index as CGFloat * tab_w;
-            let gray = if index == selected { 0.22 } else { 0.1 };
+            let gray = if index == selected { 0.18 } else if hovered == Some(index) { 0.14 } else { 0.08 };
             CGContext::set_fill_color_with_color(
                 ctx,
                 Some(&CGColor::new_generic_gray(gray, 1.0)),
@@ -335,6 +381,17 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 CGSize::new(1.5, 10.0),
             ),
         );
+
+        // The tab labels: the OSC title the shell set (`vim`, `git`, …),
+        // falling back to the shell basename (`zsh`). Centered in the tab,
+        // ellipsis-truncated when wider than the tab.
+        let label_font = ivars.label_font.get_or_init(|| monospace(TAB_LABEL_SIZE));
+        for index in 0..TAB_COUNT {
+            let x = left + index as CGFloat * tab_w;
+            let label = ivars.sessions.get().and_then(|s| s.get(index))
+                .map(|s| s.title()).unwrap_or_else(|| format!("Tab {}", index + 1));
+            draw_tab_label(ctx, Some(label_font), &label, x, chin_y, tab_w);
+        }
       }
       _ => {}
     }
@@ -343,10 +400,11 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
 }
 
 /// The silhouette scale factor that keeps the closed pill a proper pill
-/// (AppKit clamps corner radii to the rect; we must match it).
+/// (AppKit clamps corner radii to the rect; we must match it). The top
+/// corners are square, so only the two chin corners clamp: `2 * BOTTOM`.
 fn silhouette_scale(h: CGFloat) -> CGFloat {
-    if h < TOP_CORNER_RADIUS + BOTTOM_CORNER_RADIUS {
-        h / (TOP_CORNER_RADIUS + BOTTOM_CORNER_RADIUS)
+    if h < 2.0 * BOTTOM_CORNER_RADIUS {
+        h / (2.0 * BOTTOM_CORNER_RADIUS)
     } else {
         1.0
     }
@@ -411,6 +469,71 @@ fn trace_tab_rect(
     CGContext::close_path(ctx);
 }
 
+/// Draw one tab label centered in the tab `(x, y, w)`, cut off at the tab
+/// width when it does not fit. The line is shaped from a
+/// `CFMutableAttributedString` whose font attribute covers the FULL string
+/// range (a zero-length range is the INSERT range for
+/// `CFMutableAttributedString::replace_string`, not the range of the inserted
+/// text — see AGENTS.md lesson 3).
+fn draw_tab_label(
+    ctx: Option<&CGContext>,
+    font: Option<&CTFont>,
+    label: &str,
+    x: CGFloat,
+    y: CGFloat,
+    w: CGFloat,
+) {
+    if label.is_empty() || w <= 0.0 {
+        return
+    }
+    let font = font.expect("a label font");
+    let text = CFString::from_str(label);
+    let line = unsafe { shaped_line(font, &text) };
+
+    let line_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    let line = if line_width as CGFloat > w {
+        match unsafe { line.truncated_line(w as c_double, CTLineTruncationType::End, None) } {
+          Some(truncated) => truncated,
+          _ => return,
+        }
+    } else {
+        line
+    };
+
+    // Measure the line we will actually draw (a truncated line is narrower
+    // than the original), so the label centers on its own width.
+    let drawn_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) } as CGFloat;
+
+    let ascent = unsafe { font.ascent() };
+    let descent = unsafe { font.descent() };
+    let baseline = y + (TAB_HEIGHT - (ascent + descent)) / 2.0 + ascent;
+    let cx = x + (w - drawn_width) / 2.0;
+
+    CGContext::save_g_state(ctx);
+    CGContext::translate_ctm(ctx, cx, baseline);
+    CGContext::set_fill_color_with_color(ctx, Some(&CGColor::new_generic_gray(0.85, 1.0)));
+    CGContext::set_text_position(ctx, 0.0, 0.0);
+    unsafe { line.draw(ctx.expect("a current context")) };
+    CGContext::restore_g_state(ctx);
+}
+
+/// A `CTLine` for `text` shaped by `font`, with the font attribute set over
+/// the whole string range.
+unsafe fn shaped_line(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
+    let attr = CFMutableAttributedString::new(None, 0).expect("an attributed string");
+    let insert = CFRange { location: 0, length: 0 };
+    unsafe { CFMutableAttributedString::replace_string(Some(&*attr), insert, Some(text)) };
+    unsafe {
+        CFMutableAttributedString::set_attribute(
+            Some(&*attr),
+            CFRange { location: 0, length: text.length() },
+            Some(kCTFontAttributeName),
+            Some(&**font),
+        )
+    };
+    unsafe { CTLine::with_attributed_string(&**attr) }
+}
+
 /// The (font, (cell width, cell height)) pair, created once.
 fn ensure_font(ivars: &NotchViewIvars) -> (CFRetained<CTFont>, (CGFloat, CGFloat)) {
     let font = ivars.font.get_or_init(|| monospace(FONT_SIZE));
@@ -421,7 +544,7 @@ fn ensure_font(ivars: &NotchViewIvars) -> (CFRetained<CTFont>, (CGFloat, CGFloat
 /// Spawn the three login-shell PTY sessions at the fixed grid size.
 fn spawn_sessions(cell: (CGFloat, CGFloat)) -> Vec<Session> {
     let (cell_width, cell_height) = cell;
-    let usable = PANEL_WIDTH - 2.0 * (TOP_CORNER_RADIUS + GRID_PAD);
+    let usable = PANEL_WIDTH - 2.0 * GRID_PAD;
     let columns = ((usable / cell_width).floor() as usize).max(1);
     let rows = (((OPEN_HEIGHT - TAB_HEIGHT - 2.0 * TAB_INSET) / cell_height).floor() as usize).max(1);
     (0..TAB_COUNT).map(|_| Session::new(
@@ -483,6 +606,9 @@ impl NotchView {
                 cell: OnceCell::new(),
                 sessions: OnceCell::new(),
                 selected: Cell::new(0),
+                hovered: Cell::new(None),
+                label_font: OnceCell::new(),
+                tracking: OnceCell::new(),
             },
         );
         // SAFETY: `NSObject`'s `init` signature is correct.
@@ -557,6 +683,45 @@ impl NotchView {
     pub fn handle_click(&self, _event: &NSEvent) {
         let screen = NSEvent::mouseLocation();
         self.select_at_screen_point(&screen);
+    }
+
+    /// Record which tab the cursor is over (a hover palette change, no
+    /// selection change). `locationInWindow` is already in this view's y-up
+    /// panel-local space (the view fills the panel), so use it directly.
+    pub fn update_hover(&self, event: &NSEvent) {
+        // The panel must exist for a view-local point to mean anything; the
+        // frame itself is not needed (the view fills the panel).
+        match self.as_super().window() {
+          Some(_) => {}
+          None => return,
+        }
+        let loc = event.locationInWindow();
+        let px = loc.x;
+        let py = loc.y;
+        let ivars = self.ivars();
+        let h = ivars.height.get();
+        if h <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
+            return
+        }
+        let w = ivars.width.get();
+        let new = match tab_strip(h, w) {
+          Some((left, tab_w)) => {
+            let chin_y = PANEL_HEIGHT - h;
+            if py < chin_y || py > chin_y + TAB_HEIGHT {
+                None
+            } else {
+                (0..TAB_COUNT).find(|&i| {
+                    let x0 = left + i as CGFloat * tab_w;
+                    px >= x0 && px <= x0 + tab_w
+                })
+            }
+          }
+          None => None
+        };
+        if ivars.hovered.get() != new {
+            ivars.hovered.set(new);
+            self.mark_dirty();
+        }
     }
 
     /// Hit-test an AppKit screen point against the panel silhouette and tab

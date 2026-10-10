@@ -82,8 +82,7 @@ window capture for alpha, the desktop capture for the composited result.
 | Closed pill ~33pt at startup | ✅ | shape dump h=33.5 w=189 |
 | Expand/collapse round-trip via `toggle()` | ✅ | 33.5 → 420 → 33 |
 | Rounded silhouette, bottom taper ~20pt/side | ✅ | bottom row 599 vs 639 wide |
-| Live shell grid | ✅ | 22×68, 84 lit cells |
-| Fira Code ligatures `->` `=>` `!=` | ✅ | glyph names prove `calt` applied |
+| Live shell grid (text visible) | ✅ verified | window-local alpha capture (open h=420): 704 light text pixels; row 0 reads `Waiting for another flutter command to release the startup lock…` |
 | Tab bar (iTerm style): 3 tabs + `+` button, selected lighter, dividers | ✅ | window-local alpha capture (open h=420): selected x 33–216, unselected 218–607, painted through y=420 (flush with chin line), straight tab top at y=404 with corners curving in from 399, `+` at x≈588–608 |
 | Click tab → switch PTY | ✅ verified | `mouseDown:` on the open panel selects the tab under the cursor; synthetic click on the middle tab moved selection from tab 0 (sel 64–435) to tab 1 (sel 434–805) |
 | Option+Space global hotkey | ✅ verified | Carbon `RegisterEventHotKey` (no TCC grant); synthetic Option+Space toggles open then close |
@@ -98,6 +97,27 @@ every tab (selected 0.22 gray, unselected 0.10) so no stroke color is needed
 for the tabs at all; the only stroke left is the 1px divider, which now sets
 `set_gray_stroke_color` explicitly. `trace_capsule` was replaced by
 `trace_tab_rect` (square bottom, rounded top corners).
+
+## The grid-freeze + top-clip bugs (fixed 2026-10-09)
+
+Two more bugs made the terminal look empty even though the grid was populated:
+
+1. **`tick` only redrew while the spring was animating.** Once the open
+   animation settled, `drawRect:` was never called again, so PTY output
+   (processed on the reader thread) was never painted — the grid stayed
+   frozen at whatever it held on the last animation frame. Fix: `tick`
+   marks the view dirty and calls `update`/`displayIfNeeded` whenever the
+   spring is flying **OR** the panel is open (`height > CLOSED_HEIGHT`). A
+   terminal redraws continuously while open; the 60Hz pump is the frame
+   driver.
+2. **Row 0 was clipped by the silhouette top.** The grid hung flush against
+   the panel top (`y = PANEL_HEIGHT`), so the first row's cap-height sat above
+   the top edge and inside the rounded-corner taper. Fix: `GRID_TOP_PAD`
+   (22pt) vertical inset in `row_rect` so row 0 clears the top edge and taper.
+
+Also fixed en route: PTY control responses (DSR/DA queries from the shell
+prompt) are now routed back to the PTY via `PtyWrite`, so the shell stops
+waiting on unanswered terminal queries.
 
 ## The shipped tab strip
 

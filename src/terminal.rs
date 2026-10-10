@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::thread::JoinHandle;
 
-use alacritty_terminal::event::{VoidListener, WindowSize};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
@@ -31,6 +31,68 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::{Colors};
 use alacritty_terminal::tty::{new as pty_new, Options, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiRgb};
+
+/// A minimal `EventListener` that keeps only the OSC (`ESC ] 0 ; …`) title of
+// the session, so the tab strip can label each PTY with what is running in
+// it. Crucially, it also routes `Event::PtyWrite` (the terminal's responses
+// to shell queries like `ESC [ 6 n` cursor-position reports) back into the
+// PTY by sending them as `Msg::Input`. Without this, the shell blocks
+// forever waiting for a response and never draws its prompt (the grid stays
+// blank even though the shell sets a title). `Arc<Mutex<...>>` is
+// `Send + Sync`, satisfying the `Send + 'static` bound `EventLoop` requires.
+#[derive(Clone)]
+pub struct TitleListener {
+    title: Arc<std::sync::Mutex<Option<String>>>,
+    sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
+}
+
+impl TitleListener {
+    pub fn new() -> Self {
+        Self {
+            title: Arc::new(std::sync::Mutex::new(None)),
+            sender: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+    /// Wire the PTY writer channel once the `EventLoop` exists. Called after
+    /// `EventLoop::new`; later `PtyWrite` events are forwarded through it.
+    pub fn set_sender(&self, sender: EventLoopSender) {
+        if let Ok(mut g) = self.sender.lock() {
+            *g = Some(sender);
+        }
+    }
+
+    pub fn title(&self) -> Option<String> {
+        self.title.lock().ok().and_then(|g| g.clone())
+    }
+}
+
+impl EventListener for TitleListener {
+    fn send_event(&self, event: Event) {
+        match event {
+            Event::Title(t) => {
+                if let Ok(mut g) = self.title.lock() {
+                    *g = Some(t);
+                }
+            }
+            Event::ResetTitle => {
+                if let Ok(mut g) = self.title.lock() {
+                    *g = None;
+                }
+            }
+            // Route terminal responses (DSR/DA cursor-position reports, etc.)
+            // back to the PTY so the shell's startup queries are answered and
+            // the prompt actually renders.
+            Event::PtyWrite(text) => {
+                if let Ok(g) = self.sender.lock() {
+                    if let Some(sender) = g.as_ref() {
+                        let _ = sender.send(Msg::Input(Cow::from(text.into_bytes())));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Grid dimensions for the notch terminal.
 ///
@@ -66,9 +128,11 @@ pub struct CellSnapshot {
 /// A live session: the terminal state machine, the input channel to the PTY,
 /// and the PTY reader thread.
 pub struct Session {
-    terminal: Arc<FairMutex<Term<VoidListener>>>,
+    terminal: Arc<FairMutex<Term<TitleListener>>>,
+    listener: TitleListener,
+    shell: String,
     sender: EventLoopSender,
-    reader: JoinHandle<(EventLoop<Pty, VoidListener>, State)>,
+    reader: JoinHandle<(EventLoop<Pty, TitleListener>, State)>,
     rows: usize,
     columns: usize,
 }
@@ -77,9 +141,10 @@ impl Session {
     /// Spawn the PTY once and start the PTY reader thread.
     pub fn new(rows: usize, columns: usize, cell_width: f64, cell_height: f64) -> Self {
         let shell = login_shell().expect("the current user has a login shell");
+        let listener = TitleListener::new();
 
         let options = Options {
-            shell: Some(Shell::new(shell, ["-l", "-i"].map(|arg| arg.to_string()).to_vec())),
+            shell: Some(Shell::new(shell.clone(), ["-l", "-i"].map(|arg| arg.to_string()).to_vec())),
             working_directory: None,
             drain_on_exit: true,
             env: HashMap::new(),
@@ -97,14 +162,21 @@ impl Session {
         let terminal = Arc::new(FairMutex::new(Term::new(
             Config::default(),
             &NotchSize { screen_lines: rows, columns },
-            VoidListener,
+            listener.clone(),
         )));
 
-        let loop_ = EventLoop::new(terminal.clone(), VoidListener, pty, true, false)
+        let loop_ = EventLoop::new(terminal.clone(), listener.clone(), pty, true, false)
             .expect("the PTY event loop could not be created");
+
+        // Wire the PTY writer so terminal responses (cursor-position reports,
+        // device-status/attribute replies) are routed back to the shell. The
+        // EventLoop owns the channel; hand the listener a clone of it.
+        listener.set_sender(loop_.channel());
 
         Session {
             terminal,
+            listener,
+            shell,
             sender: loop_.channel(),
             reader: loop_.spawn(),
             rows,
@@ -121,13 +193,13 @@ impl Session {
     ///
     /// Rows are returned top to bottom; each row has exactly `columns` cells.
     pub fn snapshot(&self) -> Vec<Vec<CellSnapshot>> {
-        let terminal = self.terminal.lock();
-        let grid = terminal.grid();
-        let offset = grid.display_offset();
-        let colors = terminal.colors();
+    let terminal = self.terminal.lock();
+    let grid = terminal.grid();
+    let offset = grid.display_offset();
+    let colors = terminal.colors();
 
-        let rows = (0..self.rows).map(|line| {
-            (0..self.columns).map(|column| {
+    let rows = (0..self.rows).map(|line| {
+        (0..self.columns).map(|column| {
                 let cell = &grid[Line((offset + line) as i32)][Column(column)];
                 let inverse = cell.flags.intersects(Flags::INVERSE);
                 let (fg, bg) = (resolve(colors, cell.fg), resolve(colors, cell.bg));
@@ -151,6 +223,18 @@ impl Session {
             return None
         }
         Some((grid.cursor.point.line.0 as usize, grid.cursor.point.column.0))
+    }
+
+    /// The tab label for this session: the OSC title the shell set (iTerm/
+    /// zsh precmd style), falling back to the shell's basename (`zsh`).
+    pub fn title(&self) -> String {
+        if let Some(t) = self.listener.title() {
+            if !t.trim().is_empty() {
+                return t
+            }
+        }
+        std::path::Path::new(&self.shell).file_name().and_then(|n| n.to_str())
+            .map(|s| s.to_string()).unwrap_or_else(|| "shell".to_string())
     }
 }
 

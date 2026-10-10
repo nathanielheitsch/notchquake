@@ -190,13 +190,13 @@ define_class!(
                     true,
                 )
             };
-            let _ = ivars.monitors.set((None, local_monitor, click_monitor));
             let _ = ivars.tick_timer.set(tick_timer);
+            let _ = ivars.monitors.set((None, local_monitor, click_monitor));
             // Take over from any other app and activate. Required because
             // Cargo builds an unbundled binary (no .app bundle / no launch
             // request).
             let app = NSApplication::sharedApplication(mtm);
-            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
         }

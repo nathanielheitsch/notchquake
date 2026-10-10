@@ -26,12 +26,11 @@ pub const NOTCH_WIDTH: CGFloat = 212.0;
 /// Silhouette height when open.
 pub const OPEN_HEIGHT: CGFloat = MAX_TERMINAL_HEIGHT;
 
-/// Corner radius of the two corners touching the menu bar.
-pub const TOP_CORNER_RADIUS: CGFloat = 19.0;
-
 /// Corner radius of the two hanging "chin" corners, which also inset the
-/// bottom edge by this amount on both sides.
-pub const BOTTOM_CORNER_RADIUS: CGFloat = 24.0;
+/// bottom edge by this amount on both sides. The top corners touching the
+/// menu bar are square (the panel sits flush under the notch), and 10pt is
+/// the standard macOS window radius.
+pub const BOTTOM_CORNER_RADIUS: CGFloat = 10.0;
 
 /// Spring response, in seconds (Apple `Animation.spring` semantics).
 pub const SPRING_RESPONSE: f64 = 0.35;
