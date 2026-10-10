@@ -73,7 +73,11 @@ pub fn draw_grid(
     let used_cols = if cell_width > 0.0 { (usable / cell_width).floor() as usize } else { cols };
     let used_cols = if used_cols < cols { used_cols } else { cols };
 
-    let ascent = unsafe { font.ascent() };
+    // y-up space: the baseline sits `descent` ABOVE the row rect's bottom
+    // edge, so glyph ink fills [bottom, bottom + ascent + descent] = the cell.
+    // `top + ascent` is the y-DOWN formula and floats the text ~8.6pt above
+    // its background block (ascent 12.92 vs descent 4.31 at 14pt Fira Code).
+    let descent = unsafe { font.descent() };
 
     // Background pass: only runs whose bg differs from the silhouette black.
     for (row, cells) in grid.iter().enumerate() {
@@ -105,7 +109,7 @@ pub fn draw_grid(
     // Text pass: one CTLine per same-foreground run, drawn upright.
     for (row, cells) in grid.iter().enumerate() {
         if let Some((top, _)) = row_rect(row, cell_height, height, header) {
-            let baseline = top + ascent;
+            let baseline = top + descent;
             let mut col = 0;
             while col < used_cols {
                 if cells[col].character == ' ' {
