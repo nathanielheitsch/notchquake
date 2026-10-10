@@ -23,7 +23,7 @@ use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
-use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
@@ -138,8 +138,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// Spawn the PTY once and start the PTY reader thread.
-    pub fn new(rows: usize, columns: usize, cell_width: f64, cell_height: f64) -> Self {
+    /// Spawn the PTY once and start the PTY reader thread. `scrollback` is
+    /// the history cutoff in lines (0 disables scrolling history).
+    pub fn new(rows: usize, columns: usize, cell_width: f64, cell_height: f64, scrollback: usize) -> Self {
         let shell = login_shell().expect("the current user has a login shell");
         let listener = TitleListener::new();
 
@@ -159,8 +160,13 @@ impl Session {
 
         let pty = pty_new(&options, window_size, 1).expect("the PTY could not be spawned");
 
+        // The scrollback cutoff: alacritty's `Config.scrolling_history` is the
+        // history size in lines; the grid keeps total = screen + history.
+        let mut config = Config::default();
+        config.scrolling_history = scrollback;
+
         let terminal = Arc::new(FairMutex::new(Term::new(
-            Config::default(),
+            config,
             &NotchSize { screen_lines: rows, columns },
             listener.clone(),
         )));
@@ -187,6 +193,15 @@ impl Session {
     /// Write user input (a keystroke, pasted text, …) to the PTY.
     pub fn send_input(&self, bytes: Vec<u8>) {
         let _ = self.sender.send(Msg::Input(Cow::from(bytes)));
+    }
+
+    /// Scroll the display through the scrollback history. `lines` > 0 shows
+    /// older content (scroll up), < 0 returns toward the live viewport. The
+    /// grid clamps to the history size, so the cutoff is the `scrollback`
+    /// passed to `new`.
+    pub fn scroll_display(&self, lines: i32) {
+        let mut terminal = self.terminal.lock();
+        terminal.scroll_display(Scroll::Delta(lines));
     }
 
     /// Copy the visible grid out under one short lock.

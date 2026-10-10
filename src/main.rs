@@ -63,7 +63,7 @@ use crate::window::create_panel;
 struct AppDelegateIvars {
     panel: OnceCell<Retained<NSPanel>>,
     view: OnceCell<Retained<NotchView>>,
-    monitors: OnceCell<(Monitor, Monitor, Monitor)>,
+    monitors: OnceCell<(Monitor, Monitor, Monitor, Monitor)>,
     tick_timer: OnceCell<Retained<NSTimer>>,
 }
 
@@ -176,6 +176,21 @@ define_class!(
                 NSEventMask::LeftMouseDown,
                 &click_block,
             );
+            // Scroll wheel: a global monitor catches the wheel over the panel
+            // (the panel never owns the gesture). Points accumulate into whole
+            // lines inside `scroll_wheel`.
+            let view_for_wheel = view.clone();
+            let wheel_block = RcBlock::new(
+                move |event: NonNull<NSEvent>| {
+                    if MainThreadMarker::new().is_some() {
+                        view_for_wheel.scroll_wheel(unsafe { event.as_ref() }.deltaY());
+                    }
+                },
+            );
+            let wheel_monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
+                NSEventMask::ScrollWheel,
+                &wheel_block,
+            );
 
             // dirty from an ivar change, so a repeating timer drives the
             // animation passes. `tick` no-ops once the spring settles.
@@ -191,7 +206,7 @@ define_class!(
                 )
             };
             let _ = ivars.tick_timer.set(tick_timer);
-            let _ = ivars.monitors.set((None, local_monitor, click_monitor));
+            let _ = ivars.monitors.set((None, local_monitor, click_monitor, wheel_monitor));
             // Take over from any other app and activate. Required because
             // Cargo builds an unbundled binary (no .app bundle / no launch
             // request).

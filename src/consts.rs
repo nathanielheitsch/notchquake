@@ -23,6 +23,12 @@ pub const CLOSED_HEIGHT: CGFloat = 33.0;
 /// Fallback closed width (overridden by the measured notch width).
 pub const NOTCH_WIDTH: CGFloat = 212.0;
 
+/// Scrollback history in lines when `BNT_SCROLLBACK` is unset. 10000 matches
+/// alacritty's own default (`Config.scrolling_history`); iTerm2's default is
+/// 500, tmux-style terminals commonly use 2000-10000. Override with
+/// `BNT_SCROLLBACK=500 …` at launch.
+pub const DEFAULT_SCROLLBACK_LINES: usize = 10000;
+
 /// Silhouette height when open.
 pub const OPEN_HEIGHT: CGFloat = MAX_TERMINAL_HEIGHT;
 

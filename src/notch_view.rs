@@ -42,7 +42,7 @@ use std::cell::Cell;
 use std::cell::OnceCell;
 use core::ffi::c_double;
 use crate::animation::Spring;
-use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, NOTCH_WIDTH, OPEN_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH};
+use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, DEFAULT_SCROLLBACK_LINES, NOTCH_WIDTH, OPEN_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH};
 use crate::font::{FONT_SIZE, monospace, cell_metrics};
 use crate::render::{draw_grid, GRID_PAD};
 use crate::terminal::Session;
@@ -80,6 +80,11 @@ pub struct NotchViewIvars {
     hovered: Cell<Option<usize>>,
     label_font: OnceCell<CFRetained<CTFont>>,
     tracking: OnceCell<Retained<NSTrackingArea>>,
+    // Wheel-scroll state: `scroll` is the whole lines already applied to the
+    // selected session's display_offset; `scroll_pts` carries the leftover
+    // fractional wheel points between events. Reset on collapse.
+    scroll: Cell<i32>,
+    scroll_pts: Cell<f64>,
 }
 
 define_class!(
@@ -172,7 +177,7 @@ define_class!(
             let frame = panel.frame();
             let loc = event.locationInWindow();
             let screen = NSPoint::new(frame.origin.x + loc.x, frame.origin.y + loc.y);
-            self.select_at_screen_point(&screen);
+            self.click_at_screen_point(&screen);
         }
 
         // Hover: the panel becomes the key window on click (see Item 1), and
@@ -547,11 +552,16 @@ fn spawn_sessions(cell: (CGFloat, CGFloat)) -> Vec<Session> {
     let usable = PANEL_WIDTH - 2.0 * GRID_PAD;
     let columns = ((usable / cell_width).floor() as usize).max(1);
     let rows = (((OPEN_HEIGHT - TAB_HEIGHT - 2.0 * TAB_INSET) / cell_height).floor() as usize).max(1);
+    // Scrollback cutoff, configurable via BNT_SCROLLBACK (lines of history
+    // kept; 0 disables scrolling). Default matches alacritty's 10000.
+    let scrollback = std::env::var("BNT_SCROLLBACK").ok()
+        .and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_SCROLLBACK_LINES);
     (0..TAB_COUNT).map(|_| Session::new(
         rows,
         columns,
         cell_width,
         cell_height,
+        scrollback,
     )).collect()
 }
 
@@ -609,6 +619,8 @@ impl NotchView {
                 hovered: Cell::new(None),
                 label_font: OnceCell::new(),
                 tracking: OnceCell::new(),
+                scroll: Cell::new(0),
+                scroll_pts: Cell::new(0.0),
             },
         );
         // SAFETY: `NSObject`'s `init` signature is correct.
@@ -689,9 +701,16 @@ impl NotchView {
     /// the event has no owning window in our app. Use the absolute screen mouse
     /// location and hit-test. (Real clicks ON the panel go to `mouseDown:`
     /// instead; the two paths don't double-fire.)
+    /// Handle a click observed by the GLOBAL mouse monitor. A non-activating
+    /// panel never owns the click (it passes through to the window below, or
+    /// — for synthetic/test clicks — is delivered to the frontmost app), so
+    /// the event has no owning window in our app. Use the absolute screen mouse
+    /// location and hit-test. (Real clicks ON the panel also reach `mouseDown:`;
+    /// the handlers below are idempotent — they set an explicit target rather
+    /// than toggling — so a click seen by both paths lands once.)
     pub fn handle_click(&self, _event: &NSEvent) {
         let screen = NSEvent::mouseLocation();
-        self.select_at_screen_point(&screen);
+        self.click_at_screen_point(&screen);
     }
 
     /// Record which tab the cursor is over (a hover palette change, no
@@ -733,30 +752,45 @@ impl NotchView {
         }
     }
 
-    /// Hit-test an AppKit screen point against the panel silhouette and tab
-    /// bar. Shared by the click monitor and the debug self-check.
-    pub fn select_at_screen_point(&self, screen: &NSPoint) {
+    /// Handle a click at an AppKit screen point. Inside the panel: a closed
+    /// pill opens, an open panel selects the tab under the cursor. Outside the
+    /// panel (or inside its frame but off the silhouette): an OPEN panel
+    /// collapses — the user clicked elsewhere, so the terminal is dismissed.
+    /// `mouseDown:` only ever delivers points inside the panel, so it can
+    /// never collapse; the global monitor delivers the outside clicks.
+    pub fn click_at_screen_point(&self, screen: &NSPoint) {
         let panel = self.as_super().window().expect("a view always lives in a window");
         let panel_frame = panel.frame();
         let x = screen.x - panel_frame.origin.x;
-        let y_up = screen.y - panel_frame.origin.y;
-        if x < 0.0 || x > panel_frame.size.width || y_up < 0.0 || y_up > panel_frame.size.height {
-            return
-        }
-        // The view is NOT flipped, so the drawing space is the window's own
-        // y-up space: the panel top (menu bar) is at y = PANEL_HEIGHT.
-        let y = y_up;
+        let y = screen.y - panel_frame.origin.y;
         let ivars = self.ivars();
         let h = ivars.height.get();
+        let open = h > CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT;
+
+        // Outside the panel frame entirely: collapse if open, else ignore.
+        if x < 0.0 || x > panel_frame.size.width || y < 0.0 || y > panel_frame.size.height {
+            if open {
+                self.collapse();
+            }
+            return
+        }
+
+        // Inside the frame but off the silhouette (transparent margin): same
+        // dismissal.
         let top = PANEL_HEIGHT - h;
         if y < top || y > PANEL_HEIGHT {
+            if open {
+                self.collapse();
+            }
             return
         }
-        if h <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
-            // Closed panel: a click inside the pill toggles (same as the hotkey).
-            self.toggle();
+
+        if !open {
+            // Closed pill: a click inside it opens (same as the hotkey).
+            self.expand();
             return
         }
+
         let w = ivars.width.get();
         match tab_strip(h, w) {
           Some((left, tab_w)) => {
@@ -765,8 +799,8 @@ impl NotchView {
                 return
             }
             for index in 0..TAB_COUNT {
-                let x0i = left + index as CGFloat * tab_w;
-                if x >= x0i && x <= x0i + tab_w {
+                let x0 = left + index as CGFloat * tab_w;
+                if x >= x0 && x <= x0 + tab_w {
                     ivars.selected.set(index);
                     self.mark_dirty();
                     return
@@ -775,5 +809,51 @@ impl NotchView {
           }
           _ => {}
         }
+    }
+
+    /// Open the panel (idempotent: already-open stays open).
+    pub fn expand(&self) {
+        self.set_target(OPEN_HEIGHT);
+    }
+
+    /// Collapse the panel and reset the scroll position so reopening shows
+    /// the live viewport (idempotent: already-closed stays closed).
+    pub fn collapse(&self) {
+        let ivars = self.ivars();
+        ivars.scroll.set(0);
+        ivars.scroll_pts.set(0.0);
+        if let Some(sessions) = ivars.sessions.get() {
+            for session in sessions {
+                session.scroll_display(0);
+            }
+        }
+        self.set_target(CLOSED_HEIGHT);
+    }
+
+    /// Scroll the selected session's history by wheel points accumulated
+    /// across events (a single event's `deltaY` is rarely a whole line).
+    /// Apple's `deltaY` is positive for a DOWNWARD scroll gesture, which
+    /// reveals content BELOW the viewport (newer), so the line delta is
+    /// negated against alacritty's `Scroll::Delta(+n)` = show older.
+    pub fn scroll_wheel(&self, delta_y: CGFloat) {
+        let ivars = self.ivars();
+        if ivars.height.get() <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
+            return
+        }
+        let cell_height = ivars.cell.get().expect("a cell metric exists once open").1;
+        ivars.scroll_pts.set(ivars.scroll_pts.get() - delta_y);
+        let lines = (ivars.scroll_pts.get() / cell_height).trunc() as i32;
+        if lines == 0 {
+            return
+        }
+        ivars.scroll_pts.set(ivars.scroll_pts.get() - lines as f64 * cell_height);
+        ivars.scroll.set(ivars.scroll.get() + lines);
+        if let Some(sessions) = ivars.sessions.get() {
+            match sessions.get(ivars.selected.get()) {
+              Some(session) => session.scroll_display(lines),
+              _ => {}
+            }
+        }
+        self.mark_dirty();
     }
 }
