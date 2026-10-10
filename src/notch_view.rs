@@ -62,6 +62,10 @@ const MIN_TAB_W: CGFloat = 28.0;
 const CLOSE_R: CGFloat = 5.0;
 const CLOSE_HIT: CGFloat = 9.0;
 const CLOSE_INSET: CGFloat = 12.0;
+/// The `×` close-affordance footprint from the tab's left edge: its inset
+/// plus its radius. The title band starts after this so a long shell title
+/// can never collide with the `×`.
+const TAB_CLOSE_W: CGFloat = CLOSE_INSET + CLOSE_R;
 /// Point size of the tab title and of the right-aligned `⌘<n>` index hint.
 const TAB_LABEL_SIZE: CGFloat = 11.0;
 const TAB_HINT_SIZE: CGFloat = 10.0;
@@ -487,7 +491,10 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 .map(|s| s.title())
                 .unwrap_or_else(|| format!("Tab {}", index + 1));
             let color = if Some(index) == selected { TEXT_ACTIVE } else { TEXT_INACTIVE };
-            draw_tab_label(ctx, Some(label_font), &label, x, chin_y, tab_w - hint_w, color);
+            // The `×` is drawn on the active/hovered tab only, so only that
+            // tab loses its left gutter to it; the others keep the full width.
+            let gutter = if Some(index) == selected || hovered == Some(index) { TAB_CLOSE_W } else { 0.0 };
+            draw_tab_label(ctx, Some(label_font), &label, x + gutter, chin_y, tab_w - hint_w - gutter, color);
             let hint = format!("\u{2318}{}", index + 1);
             draw_tab_hint(ctx, Some(hint_font), &hint, x, chin_y, tab_w, color);
         }
@@ -498,6 +505,14 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
             if Some(index) == selected || hovered == Some(index) {
                 let x = left + index as CGFloat * tab_w;
                 let (cx, cy) = close_center(x, chin_y);
+                // The reference style puts the `×` inside a rounded dark
+                // square button (gray fill, ~2x glyph size).
+                let b = CLOSE_R + 4.0;
+                CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(LINE)));
+                CGContext::fill_rect(
+                    ctx,
+                    CGRect::new(CGPoint::new(cx - b, cy - b), CGSize::new(b * 2.0, b * 2.0)),
+                );
                 CGContext::begin_path(ctx);
                 CGContext::move_to_point(ctx, cx - CLOSE_R, cy - CLOSE_R);
                 CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy + CLOSE_R);
