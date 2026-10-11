@@ -135,7 +135,7 @@ define_class!(
             // zero callbacks. The Carbon path sees only this chord, never
             // other keystrokes.
             let view_ptr: *const crate::notch_view::NotchView = &*view;
-            let hotkey_ok = crate::hotkey::register_option_space(mtm, &*view);
+            let hotkey_ok = crate::hotkey::register_hotkeys(mtm, &*view);
             let _ = view_ptr;
             if !hotkey_ok {
                 eprintln!("notch-terminal: global Option+Space hotkey not registered");

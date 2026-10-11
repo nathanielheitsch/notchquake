@@ -109,15 +109,21 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+/// Carbon hotkey ids we register, dispatched by `hot_key_handler`.
+const HOTKEY_ID_TOGGLE: u32 = 1;
+/// iTerm's "new tab" chord (Cmd+T).
+const HOTKEY_ID_NEW_TAB: u32 = 2;
+
 /// The Carbon event handler. `userData` is the raw `NotchView *` we passed to
 /// `InstallEventHandler`. Carbon dispatches this on the main run loop, so
-/// the main-thread marker is available.
+/// the main-thread marker is available. Dispatches on the hotkey `id` so one
+/// handler serves every registered chord.
 unsafe extern "C" fn hot_key_handler(
     _caller: *mut std::ffi::c_void,
     event: *mut std::ffi::c_void,
     user_data: *mut std::ffi::c_void,
 ) -> u32 {
-    // Confirm this is the hot-key event we registered, then toggle.
+    // Confirm this is the hot-key event we registered, then dispatch on its id.
     let mut hot_id = EventHotKeyID { signature: 0, id: 0 };
     let status = unsafe {
         GetEventParameter(
@@ -139,17 +145,21 @@ unsafe extern "C" fn hot_key_handler(
         // is a valid, live `NotchView` on the main thread.
         let view: &NotchView = unsafe { &*(user_data as *const NotchView) };
         let _ = mtm;
-        view.toggle();
+        match hot_id.id {
+            HOTKEY_ID_TOGGLE => view.toggle(),
+            HOTKEY_ID_NEW_TAB => view.spawn_tab(),
+            _ => {},
+        }
     }
     0
 }
 
-/// Register the Option+Space global hotkey. The returned value is only
-/// non-zero on failure (matching the old monitor's `is_none()` check).
+/// Register the global hotkeys. The returned value is only non-zero on
+/// failure (matching the old monitor's `is_none()` check).
 ///
 /// `view` is retained by the caller for the process lifetime; we hand Carbon
 /// its raw pointer as the handler's `userData`.
-pub fn register_option_space(mtm: MainThreadMarker, view: &NotchView) -> bool {
+pub fn register_hotkeys(mtm: MainThreadMarker, view: &NotchView) -> bool {
     let _ = mtm;
     let target = unsafe { GetApplicationEventTarget() };
     if target.is_null() {
@@ -179,7 +189,7 @@ pub fn register_option_space(mtm: MainThreadMarker, view: &NotchView) -> bool {
     let modifiers = modifier_mask(true, false, false, false);
     let id = EventHotKeyID {
         signature: u32::from_be_bytes(*b"BNTh"),
-        id: 1,
+        id: HOTKEY_ID_TOGGLE,
     };
     let mut hot_ref: EventHotKeyRef = std::ptr::null_mut();
     let status = unsafe {
@@ -187,6 +197,21 @@ pub fn register_option_space(mtm: MainThreadMarker, view: &NotchView) -> bool {
     };
     if status != 0 {
         eprintln!("notch-terminal: RegisterEventHotKey failed: {status}");
+        return false;
+    }
+    // iTerm's "new tab": Cmd+T. kVK_ANSI_T is 0x11 (17) in Carbon's virtual-
+    // key table (Events.h) - NOT the letter's position. Same handler, other id.
+    let cmd_t = modifier_mask(false, true, false, false);
+    let new_tab_id = EventHotKeyID {
+        signature: u32::from_be_bytes(*b"BNTh"),
+        id: HOTKEY_ID_NEW_TAB,
+    };
+    let mut hot_ref2: EventHotKeyRef = std::ptr::null_mut();
+    let status = unsafe {
+        RegisterEventHotKey(0x11, cmd_t, new_tab_id, target, 0, &mut hot_ref2)
+    };
+    if status != 0 {
+        eprintln!("notch-terminal: RegisterEventHotKey (Cmd+T) failed: {status}");
         return false;
     }
     true

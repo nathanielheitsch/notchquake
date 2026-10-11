@@ -51,8 +51,9 @@ use crate::terminal::{OscSnapshot, Session};
 /// Tab-bar geometry: an iTerm-style strip hanging from the silhouette's
 /// bottom edge — tabs are rounded-top-corner rectangles flush with the chin
 /// line, separated by thin dividers, with a `+` button at the right end.
-/// Sessions spawned on the first open frame (after that, tabs are dynamic).
-const INITIAL_TABS: usize = 3;
+/// Sessions spawned on the first open frame. ONE tab, like a real user's
+/// first session; more tabs come from the `+` button or the Cmd+T hotkey.
+const INITIAL_TABS: usize = 1;
 /// `+` cap so tabs stay clickable.
 const MAX_TABS: usize = 8;
 /// `tab_strip` hides the strip below this per-tab width.
@@ -370,6 +371,9 @@ fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat) {
 
 /// Paints one frame: the black silhouette, then (once open) the terminal
 /// grid and the tab bar, all clipped to the silhouette.
+
+
+
 fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchViewIvars) {
     let h = if height < 1.0 {
         1.0
@@ -413,10 +417,17 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     // OPEN height minus the header), so the reveal is a pure clip wipe —
     // no PTY resize. After the last tab is closed (`spawned` set),
     // reopening spawns ONE fresh tab.
+    //
+    // Gate on the spring TARGET, not just the current height: closing the
+    // LAST tab empties `sessions` and starts a collapse, and the collapse
+    // animation passes through frames with h > CLOSED_HEIGHT. Without the
+    // target check, `draw` would respawn a tab on those frames and the
+    // panel would never actually collapse (the bug behind "closing the only
+    // tab leaves the panel open").
     if h > CLOSED_HEIGHT + 1.0 {
         let (font, cell) = ensure_font(ivars);
         let header = header_height(ivars);
-        if sessions.is_empty() {
+        if sessions.is_empty() && ivars.spring.target_value() > CLOSED_HEIGHT + 1.0 {
             let count = if ivars.spawned.get() { 1 } else { INITIAL_TABS };
             ivars.spawned.set(true);
             let (rows, columns, scrollback) = grid_dims(cell, header);

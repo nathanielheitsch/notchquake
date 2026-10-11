@@ -91,7 +91,7 @@ window capture for alpha, the desktop capture for the composited result.
 | Click outside panel → collapse | ✅ built | `click_at_screen_point` collapses an open panel on an outside click; idempotent `expand`/`collapse` so both click paths land once. |
 | Header bar (notch height, open state) | ✅ verified | desktop capture: grid text starts at y≈50pt = notch 33 + GRID_TOP_PAD 22; the notch-height block above it is reserved (empty for now, buttons later). `row_rect`/`draw_grid` take a `header` param; `grid_dims` reserves the same inset. |
 | Dynamic tabs: `+` spawns | ✅ verified | synthetic click on the `+` grew the strip from 3 to 4 tabs (labels reflowed, tab_w shrank). `sessions` is a live `Cell<Vec<Session>>`; `tab_strip(h,w,count)` is the single source of truth for renderer + hover + click. |
-| Tab close via `×` on hover | ⚠️ built, not driver-verifiable | hover needs a REAL mouse move (NSTrackingArea `mouseMoved:` never fires for synthetic pointer moves — same synthetic-event limitation as keystrokes). `×` drawn only on `hovered` tab; click on it → `close_tab` (selects next, collapses on last). |
+| Tab close via `×` (selected or hovered) | ✅ verified | click on the `×` of the SELECTED tab fires `close_tab` (the affordance is drawn on hovered OR selected, and the hit-test accepts either). Verified lifecycle: 1 tab → `+` → 2 → ⌘T → 3 → `×` → 2 tabs; closing the LAST tab collapses to the 33pt pill. Closing a live tab no longer hangs the app (see lesson 35). |
 | Shell exit self-destruct | ⚠️ built, not driver-verifiable | `Event::Exit` (post-drain) sets `Arc<AtomicBool>` dead flag; `tick` → `reap_dead_sessions()` tears down via `Msg::Shutdown` (reader thread returns → `Pty::Drop` SIGHUPs the child). Needs a real `exit` keystroke to exercise. |
 
 ## The tab-bar defect — root cause (fixed 2026-10-09)
@@ -422,6 +422,51 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     panel_y range before concluding a grid regression — and re-check the
     window id via `swift scripts/bntw.swift` first, since a relaunch changes
     it (a stale id silently captures nothing).
+
+35. **Closing a tab hung the whole app: `Session::Drop` joined the reader
+    thread on the MAIN thread.** `Session.reader` is a `JoinHandle` whose
+    payload owns `EventLoop` -> `TeePty` -> `Pty`, and `Pty::Drop` (alacritty)
+    sends `SIGHUP` then BLOCKS in `Child::wait()`. `JoinHandle::Drop` JOINS —
+    it runs that teardown on whichever thread drops it, and the `Session` vec
+    lives in the view, so that is the main thread inside `close_tab`. Stack
+    was `close_tab -> drop<Session> -> drop<JoinHandle> -> Pty::drop ->
+    Child::wait` with every `sample` stuck there. Fix: make `reader` an
+    `Option<JoinHandle>`, `take()` it in `Drop`, and `std::mem::forget` it —
+    NEVER drop it. Both teardown paths (`close_tab`, `reap_dead_sessions`)
+    already sent `Msg::Shutdown` BEFORE dropping, so the reader thread returns
+    on its own and tears the PTY down on ITS OWN thread. Forgetting the handle
+    is therefore non-blocking AND still correct teardown. (Two wrong turns to
+    avoid: `let _ = spawn(...)` and `let x = spawn(...)` both DROP the spawned
+    thread's handle = JOIN = block again; and `sample`'s "main-thread" block
+    also shows the detached thread's `Child::wait`, so a `sample` leaf is NOT
+    proof of a hang — trust the eprintln ordering instead.)
+
+36. **Closing the LAST tab left the panel open (never collapsed).** `draw`
+    spawns sessions whenever `sessions.is_empty()` and `h > CLOSED_HEIGHT + 1`,
+    but the COLLAPSE animation passes through frames with `h > CLOSED_HEIGHT`,
+    so `draw` respawned a tab mid-collapse and the panel never settled. Fix:
+    gate the spawn sub-branch on the spring TARGET too —
+    `ivars.spring.target_value() > CLOSED_HEIGHT + 1.0` — so a frame whose
+    target is CLOSED_HEIGHT does not respawn. Keep the outer `h > CLOSED_HEIGHT`
+    block intact (the grid must still paint during collapse); gate ONLY the
+    `sessions.is_empty()` spawn.
+
+37. **`INITIAL_TABS` is 1, not 3.** A real user opens one session; more tabs
+    come from the `+` button or the Cmd+T hotkey. `MAX_TABS` caps the strip.
+
+38. **Cmd+T spawns a tab via a SECOND Carbon hotkey, same handler.** `hotkey.rs`
+    registers two `RegisterEventHotKey` chords (Option+Space id=1 toggle, Cmd+T
+    id=2 new-tab) against ONE `InstallEventHandler`; the handler reads the
+    `EventHotKeyID` and dispatches on `id`. Cmd+T keyCode is `kVK_ANSI_T = 0x11`
+    (17) from Events.h — NOT the letter's position (lesson 20's table). Cmd+T is
+    inert while closed because `spawn_tab` no-ops when the panel is closed.
+
+39. **A layer-27 notch panel does NOT composite into `screencapture -l <id>`,**
+    so a window-local capture of the CLOSED pill reads "fully transparent" even
+    when the pill is painted correctly. The DESKTOP capture (`screencapture -x`
+    full screen, or `computer_use_get_desktop_state`) is the user-visible truth:
+    measure the dark run down the screen-center column (33pt = closed pill).
+    Do not conclude "panel blank" from a transparent `-l` capture alone.
 
 ## Repo / process rules
 

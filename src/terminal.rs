@@ -499,7 +499,9 @@ pub struct Session {
     master_fd: RawFd,
     child_pid: pid_t,
     sender: EventLoopSender,
-    reader: JoinHandle<(EventLoop<TeePty, TitleListener>, State)>,
+    /// `Option` so `Drop` can `take()` it and move the teardown onto a
+    /// detached thread (see `impl Drop for Session`).
+    reader: Option<JoinHandle<(EventLoop<TeePty, TitleListener>, State)>>,
     /// Oscillator state harvested by the tee (cwd, exit status, tint, program
     /// status, progress). Shared with the reader thread's parser, so every
     /// accessor locks briefly.
@@ -596,12 +598,43 @@ fn install_zsh_integration(shell: &str) -> Option<(String, String)> {
 }
 
 impl Drop for Session {
-    /// Remove the per-session zsh shim dir. The `ZDOTDIR` dir is private to
-    /// this session (its name carries the shim id), so nothing else reads it;
-    /// leaving it behind would accumulate one dir per tab in `/tmp`.
+    /// Remove the per-session zsh shim dir, and hand the PTY teardown to a
+    /// DETACHED thread.
+
+    /// The `reader` field is a `JoinHandle` whose payload owns the
+    /// `EventLoop` -> `TeePty` -> `Pty`, and `Pty::Drop` sends `SIGHUP` then
+    /// BLOCKS in `Child::wait()` until the shell exits. `JoinHandle::Drop`
+    /// JOINS: it runs that teardown on whichever thread drops it. Because the
+    /// `Session` vec lives in the view, that is the MAIN thread - so closing
+    /// a live tab froze the whole app (`close_tab -> drop<Session> ->
+    /// drop<JoinHandle> -> Pty::drop -> Child::wait()`, every sample stuck
+    /// there, panel never animating again).
+
+    /// Fix: NEVER drop the reader thread's `JoinHandle`. Dropping it JOINS,
+    /// i.e. blocks until the reader thread finishes, and that happens on
+    /// whichever thread drops the `Session` - the MAIN thread inside
+    /// `close_tab`, which froze the app. Both teardown paths (`close_tab` and
+    /// `reap_dead_sessions`) already sent `Msg::Shutdown` BEFORE dropping,
+    /// which makes the reader thread return on its own and drop the
+    /// `EventLoop` -> `TeePty` -> `Pty` (SIGHUP + `Child::wait`) on ITS OWN
+    /// thread. So `std::mem::forget` on the handle is both non-blocking and
+    /// still correct teardown. Covers BOTH teardown paths because both drop a
+    /// `Session`.
     fn drop(&mut self) {
         if let Some(dir) = self.shim_dir.as_ref() {
             let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(reader) = self.reader.take() {
+            // NEVER drop the reader thread's JoinHandle: dropping it JOINS,
+            // i.e. blocks until the reader thread finishes, and that happens
+            // on whichever thread drops the Session - the MAIN thread inside
+            // `close_tab`, which froze the app. Both teardown paths
+            // (`close_tab` and `reap_dead_sessions`) already sent
+            // `Msg::Shutdown` before dropping, so the reader thread returns
+            // on its own and drops the `EventLoop` -> `TeePty` -> `Pty`
+            // (SIGHUP + `Child::wait`) on ITS OWN thread. Leaking the handle
+            // is therefore both non-blocking and still correct teardown.
+            std::mem::forget(reader);
         }
     }
 }
@@ -684,7 +717,7 @@ impl Session {
             master_fd,
             child_pid,
             sender: loop_.channel(),
-            reader: loop_.spawn(),
+            reader: Some(loop_.spawn()),
             osc,
             shim_dir,
             rows,
