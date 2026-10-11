@@ -103,6 +103,12 @@ const TEXT_INACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0x96, 0x96, 0x96);
 /// The `⌘<n>` index hint, in iTerm's blue accent, on BOTH active and inactive
 /// tabs (it does not follow the label color).
 const HINT_ACCENT: (CGFloat, CGFloat, CGFloat) = rgb(0x43, 0x72, 0xE0);
+/// The "activity arrived while you were NOT looking at this tab" dot, in
+/// iTerm2's blue — measured off the user's iTerm screenshot as RGB (79,113,217)
+/// = `4F71D9`.
+const DOT_ACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0x4F, 0x71, 0xD9);
+/// Dot diameter: 18px in the 2× screenshot = 9pt.
+const DOT_D: CGFloat = 9.0;
 
 /// Extra inset beyond the silhouette's own chin radius. 0.0 means the strip
 /// spans the FULL silhouette width, and `tab_strip` therefore ignores
@@ -467,6 +473,30 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 ctx,
                 CGRect::new(CGPoint::new(x, chin_y), CGSize::new(tab_w, TAB_HEIGHT)),
             );
+            // The activity dot: this tab's command produced output while it
+            // was NOT the selected one (iTerm's "go look at that tab" marker).
+            // Drawn only when the `×` is NOT drawn for this tab — the `×`
+            // appears on selected/hovered tabs, so the two are mutually
+            // exclusive by construction and can never collide in the shared
+            // `TAB_CLOSE_W` gutter. The dot is a FILL (never a stroke: fill
+            // and stroke colour are separate CGContext state).
+            let looking = Some(index) == selected || hovered == Some(index);
+            let active = sessions.get(index).map(|s| s.has_activity()).unwrap_or(false);
+            if !looking && active {
+                // y-up space: vertically centered in the tab, and centered in
+                // the `×` gutter (`TAB_CLOSE_W` = 23pt) so it sits where the
+                // title band's reservation already leaves room.
+                let cx = x + TAB_CLOSE_W / 2.0;
+                let cy = chin_y + TAB_HEIGHT / 2.0;
+                CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(DOT_ACTIVE)));
+                CGContext::fill_ellipse_in_rect(
+                    ctx,
+                    CGRect::new(
+                        CGPoint::new(cx - DOT_D / 2.0, cy - DOT_D / 2.0),
+                        CGSize::new(DOT_D, DOT_D),
+                    ),
+                );
+            }
         }
         // Separators between tabs + the active tab's side borders, one
         // stroke pass in LINE color.
@@ -1020,9 +1050,9 @@ impl NotchView {
             // tab stays selected; closing one RIGHT leaves it alone.
             match ivars.selected.get() {
               Some(sel) if index == sel => {
-                  ivars.selected.set(Some(if index < len { index } else { len - 1 }));
+                  self.select_tab(if index < len { index } else { len - 1 });
               }
-              Some(sel) if index < sel => ivars.selected.set(Some(sel - 1)),
+              Some(sel) if index < sel => self.select_tab(sel - 1),
               _ => {}
             }
             self.mark_dirty();
@@ -1072,7 +1102,7 @@ impl NotchView {
                   } else {
                       shifted
                   };
-                  if target != sel { ivars.selected.set(Some(target)); }
+                  if target != sel { self.select_tab(target); }
               }
               _ => {}
             }
@@ -1203,8 +1233,7 @@ impl NotchView {
                     if on_close {
                         self.close_tab(index);
                     } else {
-                        ivars.selected.set(Some(index));
-                        self.mark_dirty();
+                        self.select_tab(index);
                     }
                     return
                 }
@@ -1212,6 +1241,22 @@ impl NotchView {
           }
           _ => {}
         }
+    }
+
+    /// Make the tab at `index` the selected one AND clear its activity flag:
+    /// a tab the user is looking at never keeps its blue dot (iTerm clears it
+    /// on select). Every selection change goes through here so the clear
+    /// cannot be forgotten by one call site.
+    pub fn select_tab(&self, index: usize) {
+        let ivars = self.ivars();
+        ivars.selected.set(Some(index));
+        let sessions = take_sessions(ivars);
+        match sessions.get(index) {
+          Some(session) => { let _ = session.take_activity(); }
+          _ => {}
+        }
+        put_sessions(ivars, sessions);
+        self.mark_dirty();
     }
 
     /// Re-pin the panel to the notch display's top-centre. A display change

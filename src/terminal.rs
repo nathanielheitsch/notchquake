@@ -15,8 +15,14 @@
 use libc::getpwuid;
 use libc::getuid;
 use libc::passwd;
+use libc::c_void;
+use libc::pid_t;
+use libc::proc_name;
+use libc::proc_pidpath;
+use libc::tcgetpgrp;
 
 use std::borrow::Cow;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -46,6 +52,11 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiR
 pub struct TitleListener {
     title: Arc<std::sync::Mutex<Option<String>>>,
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
+    /// Set when the shell re-sets its OSC title (`Event::Title`), i.e. a
+    /// command just finished, so the tab strip can mark a tab whose command
+    /// finished while the user was NOT looking at it (the blue activity dot).
+    /// Cleared when that tab is selected.
+    activity: Arc<AtomicBool>,
     /// Set when the child shell exits. Shared (via `Clone`) with the copies
     /// held by `Term` and the reader thread's `EventLoop`, so the main thread
     /// can observe the exit through any clone (`Session::dead()`).
@@ -58,6 +69,7 @@ impl TitleListener {
             title: Arc::new(std::sync::Mutex::new(None)),
             sender: Arc::new(std::sync::Mutex::new(None)),
             dead: Arc::new(AtomicBool::new(false)),
+            activity: Arc::new(AtomicBool::new(false)),
         }
     }
     /// Wire the PTY writer channel once the `EventLoop` exists. Called after
@@ -80,6 +92,16 @@ impl EventListener for TitleListener {
                 if let Ok(mut g) = self.title.lock() {
                     *g = Some(t);
                 }
+                // A title change means the shell just redrew its prompt —
+                // zsh's precmd sets the OSC title once per prompt, so this
+                // fires once per COMMAND, which is iTerm's "command finished
+                // while you weren't looking" rule (and the source of the
+                // `~ (-zsh)` / `π - projects (pi)` labels). NOT `Wakeup`: the
+                // event loop also sends `Wakeup` on every EMPTY poll cycle
+                // (`event_loop.rs`: `events.is_empty() && rx.peek().is_none()`
+                // → `send_event(Event::Wakeup)`), i.e. 60Hz while a session
+                // lives, which would light every idle tab's dot permanently.
+                self.activity.store(true, Ordering::SeqCst);
             }
             Event::ResetTitle => {
                 if let Ok(mut g) = self.title.lock() {
@@ -148,6 +170,11 @@ pub struct Session {
     terminal: Arc<FairMutex<Term<TitleListener>>>,
     listener: TitleListener,
     shell: String,
+    /// The PTY's master descriptor and its child pid, captured at spawn
+    /// before the `Pty` moves into the reader thread's `EventLoop` (which
+    /// the main thread cannot borrow). Both feed `foreground_program`.
+    master_fd: RawFd,
+    child_pid: pid_t,
     sender: EventLoopSender,
     reader: JoinHandle<(EventLoop<Pty, TitleListener>, State)>,
     rows: usize,
@@ -177,6 +204,14 @@ impl Session {
 
         let pty = pty_new(&options, window_size, 1).expect("the PTY could not be spawned");
 
+        // Grab the pty's raw handles BEFORE `pty` is moved into the event
+        // loop: the `EventLoop` owns the `Pty` inside the reader thread, so
+        // the main (render) thread could never reach them afterwards. The
+        // descriptors stay valid for the whole session lifetime — `Pty`'s
+        // `Drop` closes them, and a dead session is reaped.
+        let master_fd = pty.file().as_raw_fd();
+        let child_pid = pty.child().id() as pid_t;
+
         // The scrollback cutoff: alacritty's `Config.scrolling_history` is the
         // history size in lines; the grid keeps total = screen + history.
         let mut config = Config::default();
@@ -200,6 +235,8 @@ impl Session {
             terminal,
             listener,
             shell,
+            master_fd,
+            child_pid,
             sender: loop_.channel(),
             reader: loop_.spawn(),
             rows,
@@ -272,9 +309,22 @@ impl Session {
         let _ = self.sender.send(Msg::Shutdown);
     }
 
-    /// The tab label for this session: the OSC title the shell set (iTerm/
-    /// zsh precmd style), falling back to the shell's basename (`zsh`).
+    /// The tab label, in iTerm's `<directory> (<program>)` form (measured off
+    /// the user's iTerm screenshot: `~ (-zsh)`, `π - projects (pi)`). The
+    /// first half is the OSC title the shell sets; the parenthesised half is
+    /// the PTY's CURRENT foreground program, re-read every call, so the label
+    /// tracks k9s/cat/wget while they run — it is not a one-time decision.
     pub fn title(&self) -> String {
+        let base = self.base_title();
+        match self.foreground_program() {
+          Some(prog) if !prog.is_empty() && base != prog => format!("{base} ({prog})"),
+          _ => base
+        }
+    }
+
+    /// The OSC title alone (the first half of the label), falling back to the
+    /// shell's basename (`zsh`) when the shell never set one.
+    fn base_title(&self) -> String {
         if let Some(t) = self.listener.title() {
             if !t.trim().is_empty() {
                 return t
@@ -282,6 +332,71 @@ impl Session {
         }
         std::path::Path::new(&self.shell).file_name().and_then(|n| n.to_str())
             .map(|s| s.to_string()).unwrap_or_else(|| "shell".to_string())
+    }
+
+    /// The program currently in the PTY's foreground process group: one
+    /// `tcgetpgrp` syscall plus one string alloc, so it is cheap enough to
+    /// call every frame from the draw path. No threads, no polling timers.
+    pub fn foreground_program(&self) -> Option<String> {
+        // SAFETY: `master_fd` is the pty's own master descriptor, captured
+        // while the `Pty` was still alive; `tcgetpgrp` only reads kernel tty
+        // state and returns a pid (or <= 0 for "no foreground group", which
+        // falls back to the shell pid).
+        let fg = unsafe { tcgetpgrp(self.master_fd) };
+        let pid = if fg > 0 { fg } else { self.child_pid };
+        if pid <= 0 {
+            return None
+        }
+
+        // SAFETY: `proc_pidpath` writes a NUL-terminated path into the
+        // caller-owned buffer; 4096 >= PATH_MAX (1024 on macOS) so the path
+        // always fits and the bytes we read below are NUL-terminated.
+        let mut path = [0u8; 4096];
+        let written = unsafe {
+            proc_pidpath(pid, path.as_mut_ptr() as *mut c_void, path.len() as u32)
+        };
+        if written > 0 {
+            let bytes = &path[..written as usize];
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            let bytes = &bytes[..end];
+            let name = match bytes.iter().rposition(|b| *b == b'/') {
+              Some(slash) => &bytes[slash + 1..],
+              _ => bytes
+            };
+            match String::from_utf8(name.to_vec()).ok() {
+              Some(name) if !name.is_empty() => return Some(name),
+              _ => {}
+            }
+        }
+
+        // The executable path can be unavailable (a setuid/redacted process);
+        // the kproc short name still identifies the program.
+        // SAFETY: same buffer contract — 256 exceeds `MAXCOMLEN` (15 on
+        // macOS), so the NUL terminator is always inside the buffer.
+        let mut name_buf = [0u8; 256];
+        let written = unsafe { proc_name(pid, name_buf.as_mut_ptr() as *mut c_void, name_buf.len() as u32) };
+        if written > 0 {
+            let bytes = &name_buf[..written as usize];
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            match String::from_utf8(bytes[..end].to_vec()).ok() {
+              Some(string) if !string.is_empty() => return Some(string),
+              _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether a command has finished on this session since the last check
+    /// (the listener's `Event::Title` arm sets the flag; the render path only
+    /// peeks, so the dot persists across frames).
+    pub fn has_activity(&self) -> bool {
+        self.listener.activity.load(Ordering::SeqCst)
+    }
+
+    /// Read and CLEAR the activity flag: called when this tab becomes the
+    /// selected one, so a tab the user is looking at never keeps its dot.
+    pub fn take_activity(&self) -> bool {
+        self.listener.activity.swap(false, Ordering::SeqCst)
     }
 }
 
