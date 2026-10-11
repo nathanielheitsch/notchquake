@@ -46,7 +46,7 @@ use crate::animation::Spring;
 use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, DEFAULT_SCROLLBACK_LINES, NOTCH_WIDTH, OPEN_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH};
 use crate::font::{FONT_SIZE, monospace, cell_metrics, ui_font};
 use crate::render::{draw_grid, GRID_PAD, GRID_TOP_PAD};
-use crate::terminal::Session;
+use crate::terminal::{OscSnapshot, Session};
 
 /// Tab-bar geometry: an iTerm-style strip hanging from the silhouette's
 /// bottom edge — tabs are rounded-top-corner rectangles flush with the chin
@@ -109,6 +109,15 @@ const HINT_ACCENT: (CGFloat, CGFloat, CGFloat) = rgb(0x43, 0x72, 0xE0);
 const DOT_ACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0x4F, 0x71, 0xD9);
 /// Dot diameter: 18px in the 2× screenshot = 9pt.
 const DOT_D: CGFloat = 9.0;
+/// The `done` dot: OSC 7501 `state=done` on a non-selected tab (T2b).
+const DOT_DONE: (CGFloat, CGFloat, CGFloat) = rgb(0x30, 0xB4, 0x5F);
+/// The `error` dot: OSC 7501 `state=error` OR OSC 9;4 `st=2` (T2b/T2c). Also
+/// the tab-title tint for a nonzero `133;D` exit status (T2a).
+const DOT_ERROR: (CGFloat, CGFloat, CGFloat) = rgb(0xE0, 0x43, 0x43);
+/// How much of an OSC 6 tab tint is mixed into the tab fill (25%): enough to
+/// read as "this tab is coloured" without hiding the selected/inactive
+/// distinction (which is a 6/255 fill delta, far smaller than 25%).
+const TINT_MIX: CGFloat = 0.25;
 
 /// Extra inset beyond the silhouette's own chin radius. 0.0 means the strip
 /// spans the FULL silhouette width, and `tab_strip` therefore ignores
@@ -286,6 +295,10 @@ define_class!(
             // Reap dead sessions (child shell exited) unconditionally: a
             // dead session while closed still needs teardown so its PTY dies.
             self.reap_dead_sessions();
+            // Post notifications for bells / finished long commands on tabs
+            // the user is NOT looking at. Runs even while closed (every tab is
+            // then non-selected), so a background tab can still alert.
+            self.drain_notifications();
             // Redraw while the spring is animating OR while the panel is open,
             // so PTY output (processed on the reader thread) is painted. The
             // spring-only redraw left the grid frozen once the open animation
@@ -467,35 +480,44 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         let hovered = ivars.hovered.get();
         for index in 0..count {
             let x = left + index as CGFloat * tab_w;
-            let fill = if Some(index) == selected { TAB_FILL_ACTIVE } else { TAB_FILL };
+            // One OSC snapshot per tab, reused for the fill tint AND the dot,
+            // so both read a consistent state within the frame.
+            let osc = sessions.get(index).map(|s| s.osc()).unwrap_or_default();
+            let base = if Some(index) == selected { TAB_FILL_ACTIVE } else { TAB_FILL };
+            let fill = mix_tint(base, osc.tint);
             CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(fill)));
             CGContext::fill_rect(
                 ctx,
                 CGRect::new(CGPoint::new(x, chin_y), CGSize::new(tab_w, TAB_HEIGHT)),
             );
-            // The activity dot: this tab's command produced output while it
-            // was NOT the selected one (iTerm's "go look at that tab" marker).
-            // Drawn only when the `×` is NOT drawn for this tab — the `×`
-            // appears on selected/hovered tabs, so the two are mutually
-            // exclusive by construction and can never collide in the shared
-            // `TAB_CLOSE_W` gutter. The dot is a FILL (never a stroke: fill
-            // and stroke colour are separate CGContext state).
+            // The attention dot: this tab wants the user's eyes (iTerm's "go
+            // look at that tab" marker). Colour precedence, most urgent first:
+            // error (7501 `error` or 9;4 `st=2`) > done (7501 `done`) > blue
+            // activity (a command finished / 133;D). ONE dot only, so a tab
+            // with several states still shows a single marker. Drawn only when
+            // the `×` is NOT drawn for this tab — the `×` appears on
+            // selected/hovered tabs, so the two are mutually exclusive by
+            // construction and can never collide in the shared `TAB_CLOSE_W`
+            // gutter. The dot is a FILL (never a stroke: fill and stroke colour
+            // are separate CGContext state).
             let looking = Some(index) == selected || hovered == Some(index);
             let active = sessions.get(index).map(|s| s.has_activity()).unwrap_or(false);
-            if !looking && active {
-                // y-up space: vertically centered in the tab, and centered in
-                // the `×` gutter (`TAB_CLOSE_W` = 23pt) so it sits where the
-                // title band's reservation already leaves room.
-                let cx = x + TAB_CLOSE_W / 2.0;
-                let cy = chin_y + TAB_HEIGHT / 2.0;
-                CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(DOT_ACTIVE)));
-                CGContext::fill_ellipse_in_rect(
-                    ctx,
-                    CGRect::new(
-                        CGPoint::new(cx - DOT_D / 2.0, cy - DOT_D / 2.0),
-                        CGSize::new(DOT_D, DOT_D),
-                    ),
-                );
+            if !looking {
+                if let Some(color) = attention_dot(&osc, active) {
+                    // y-up space: vertically centered in the tab, and centered
+                    // in the `×` gutter (`TAB_CLOSE_W` = 23pt) so it sits where
+                    // the title band's reservation already leaves room.
+                    let cx = x + TAB_CLOSE_W / 2.0;
+                    let cy = chin_y + TAB_HEIGHT / 2.0;
+                    CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(color)));
+                    CGContext::fill_ellipse_in_rect(
+                        ctx,
+                        CGRect::new(
+                            CGPoint::new(cx - DOT_D / 2.0, cy - DOT_D / 2.0),
+                            CGSize::new(DOT_D, DOT_D),
+                        ),
+                    );
+                }
             }
         }
         // Separators between tabs + the active tab's side borders, one
@@ -555,7 +577,21 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
             let label = sessions.get(index)
                 .map(|s| s.title())
                 .unwrap_or_else(|| format!("Tab {}", index + 1));
-            let color = if Some(index) == selected { TEXT_ACTIVE } else { TEXT_INACTIVE };
+            // A nonzero `133;D` exit status tints the title red (T2a): the
+            // minimal render that reads at tab size — a red dot lives in the
+            // `×` gutter already used by attention, and a red label is
+            // unmistakable without a second affordance. Cleared on select,
+            // alongside the dot.
+            let failed = sessions.get(index)
+                .map(|s| s.osc().exit_status.map(|st| st != 0).unwrap_or(false))
+                .unwrap_or(false);
+            let color = if failed {
+                DOT_ERROR
+            } else if Some(index) == selected {
+                TEXT_ACTIVE
+            } else {
+                TEXT_INACTIVE
+            };
             // The title band is `x + TAB_CLOSE_W + TAB_TITLE_PAD .. x +
             // tab_w - TAB_HINT_W`. The `×` footprint and the hint reservation
             // are BOTH reserved on EVERY tab, whether or not that tab currently
@@ -636,6 +672,37 @@ fn tab_strip(h: CGFloat, w: CGFloat, count: usize) -> Option<(CGFloat, CGFloat)>
         return None
     }
     Some((left, tab_w))
+}
+
+/// Mix `tint` into `base` at [`TINT_MIX`] (T1b). `None` tint returns `base`
+/// unchanged, so an untinted tab is byte-identical to the pre-feature render.
+fn mix_tint(base: (CGFloat, CGFloat, CGFloat), tint: Option<(f64, f64, f64)>) -> (CGFloat, CGFloat, CGFloat) {
+    match tint {
+        None => base,
+        Some((r, g, b)) => (
+            base.0 * (1.0 - TINT_MIX) + r * TINT_MIX,
+            base.1 * (1.0 - TINT_MIX) + g * TINT_MIX,
+            base.2 * (1.0 - TINT_MIX) + b * TINT_MIX,
+        ),
+    }
+}
+
+/// The single attention dot color for a non-selected, non-hovered tab, or
+/// `None` when the tab wants nothing. Precedence: error > done > activity
+/// (T2a/T2b/T2c). `active` is the blue `133;D`/`Title` flag.
+fn attention_dot(osc: &OscSnapshot, active: bool) -> Option<(CGFloat, CGFloat, CGFloat)> {
+    let program_state = osc.program.as_ref().map(|(s, _, _)| s.as_str());
+    let progress_error = matches!(osc.progress, Some((2, _)));
+    if program_state == Some("error") || progress_error {
+        return Some(DOT_ERROR)
+    }
+    if program_state == Some("done") {
+        return Some(DOT_DONE)
+    }
+    if active {
+        return Some(DOT_ACTIVE)
+    }
+    None
 }
 
 /// The `×` close affordance center — LEFT-aligned in the tab (reference
@@ -1003,6 +1070,46 @@ impl NotchView {
         put_sessions(ivars, sessions);
     }
 
+    /// Post at most one notification per (a) raw bell and (b) finished
+    /// command, for every tab that is NOT the selected one. Runs on the 60Hz
+    /// `tick`; the `take_*` accessors consume the flags so each event fires
+    /// exactly once. A finished command notifies only when it ran >5s
+    /// (iTerm's rule), measured from the `133;C`/`133;D` gap (T1a/T2a).
+    ///
+    /// The flags are drained for EVERY tab, including the selected one — only
+    /// the notification is suppressed there. If we left the selected tab's
+    /// flags set, a bell or finish that happened while the user was looking
+    /// would fire a stale banner the moment they switched away.
+    pub fn drain_notifications(&self) {
+        let ivars = self.ivars();
+        let selected = ivars.selected.get();
+        let sessions = take_sessions(ivars);
+        for (index, session) in sessions.iter().enumerate() {
+            let looking = Some(index) == selected;
+            let bell = session.take_bell();
+            let finished = session.take_finished();
+            if looking {
+                continue
+            }
+            let name = session.base_title();
+            if bell {
+                crate::terminal::notify(&name, "Bell");
+            }
+            if let Some((status, secs)) = finished {
+                // iTerm's rule: only a command that ran >5s is worth a banner.
+                if secs > 5.0 {
+                    let message = if status == 0 {
+                        "Command completed".to_string()
+                    } else {
+                        format!("Exited with status {status}")
+                    };
+                    crate::terminal::notify(&name, &message);
+                }
+            }
+        }
+        put_sessions(ivars, sessions);
+    }
+
     /// Spawn a new tab (a fresh login-shell session) at the shared grid
     /// size, capped at `MAX_TABS`. Only while open.
     pub fn spawn_tab(&self) {
@@ -1252,7 +1359,7 @@ impl NotchView {
         ivars.selected.set(Some(index));
         let sessions = take_sessions(ivars);
         match sessions.get(index) {
-          Some(session) => { let _ = session.take_activity(); }
+          Some(session) => session.take_attention(),
           _ => {}
         }
         put_sessions(ivars, sessions);

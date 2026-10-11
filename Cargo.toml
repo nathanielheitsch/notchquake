@@ -14,3 +14,8 @@ objc2-core-text = "0.3.2"
 objc2-foundation = "0.3.2"
 block2 = "0.6.2"
 libc = "0.2.190"
+# `polling` is NOT re-exported by alacritty_terminal, but our PTY tee must
+# name `polling::{Event, PollMode, Poller}` to implement `EventedReadWrite`.
+# It is already compiled transitively (alacritty depends on polling 3.8), so
+# declaring it here unifies to the same 3.11.0 in Cargo.lock with no new code.
+polling = "3.11"
