@@ -344,6 +344,58 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     font** as the label: a mismatched-font token can be wider than `w`, and the
     call returns NULL then (which the code treats as "draw nothing"), silently
     blanking the title.
+29. **alacritty 0.26's `Term` silently DROPS unknown OSCs.** `Term` implements
+    `vte::ansi::Handler`, but its `osc_dispatch` only matches the codes it
+    knows (0/1/2 title, clipboard, colors, …) and `return`s for the rest —
+    logged at `debug!`, never surfaced. So OSC 133 (FinalTerm shell
+    integration), OSC 7 / 1337 (cwd), OSC 6 (tab color), OSC 9;4 (progress)
+    and OSC 7501 (program status) are invisible to the app no matter what the
+    shell emits. `grep`ping the vendored crate for them returns nothing.
+
+30. **Observe those sequences with a byte-transparent TEE, not a second read.**
+    `EventLoop` owns the PTY read loop in the reader thread and cannot be
+    borrowed from the main thread, and a `dup`'d master read STEALS bytes (the
+    kernel hands each byte to exactly one reader). The sound shape (shipped in
+    `TeePty`/`OscReader`): wrap `Pty`, and in `reader().read(buf)` perform the
+    SAME single `libc::read` on the SAME master fd the inner `Pty` would have
+    used, hand `buf[..n]` to a side `vte::ansi::Processor` (its `advance` is
+    infallible and the `Mutex<OscState>` lock is taken briefly, NEVER across
+    the read), then return `n` untouched. `EventLoop::pty_read` then feeds the
+    identical slice to the real `Term`, so both parsers stay byte-synced.
+    Guard it with a pipe round-trip test (`reader_is_byte_transparent_and_parses`)
+    — drop/duplicate/reorder of a single byte corrupts the grid.
+
+31. **`polling` must be a DIRECT dependency to implement `EventedReadWrite`.**
+    The trait's method signatures name `polling::{Event, PollMode, Poller}` and
+    alacritty does NOT re-export `polling` (it does re-export `vte`). Declaring
+    `polling = "3.11"` against alacritty's `3.8.0` is safe: Cargo resolves ONE
+    semver-compatible copy (verify in `Cargo.lock` — two copies would make the
+    `Poller` types distinct and `register()` would silently never fire).
+
+32. **Stock zsh emits only OSC 0/2 — OSC 133/1337 need an emitter.** The
+    `ZDOTDIR` shim (`install_zsh_integration`) points `ZDOTDIR` at a
+    pid-scoped temp dir whose `.zshrc`/`.zshenv` source the REAL user file
+    (`$BNT_USER_ZDOTDIR`, restoring `ZDOTDIR` around the source) and then
+    APPEND the hooks (`add-zsh-hook precmd/preexec`) — never overwrite the
+    user's `precmd_functions`/`preexec_functions`. Removed on `Session::drop`;
+    `kill -9` leaks the dir, so the app should tolerate a stale one.
+    `133;D;<status>` on precmd + `1337;CurrentDir=$PWD` is what makes
+    `~`-collapsed cwd titles and the nonzero-exit marker possible.
+
+33. **A login-shell `#[test]` HANGS FOREVER.** `Session::new(..)` in a unit
+    test spawns a real PTY; teardown (`Session::destroy` → reader returns →
+    `Pty::Drop`) SIGHUPs the child AND WAITS, so the test never finishes and
+    `cargo test` blocks indefinitely (burned ~25 min here across kills). Keep
+    tests PURE (parser + `shorten_cwd` + the pipe transparency test); verify
+    rendering with launch.sh + a window-local capture, never a PTY test.
+
+34. **A fresh login shell paints at the BOTTOM of the grid, not the top.**
+    Measuring ink in the upper band (panel_y 235–420) reads ZERO on a
+    brand-new session and looks exactly like "the grid is blank". The prompt
+    lands near panel_y 512–568 in a 420pt-tall panel. Measure the WHOLE
+    panel_y range before concluding a grid regression — and re-check the
+    window id via `swift scripts/bntw.swift` first, since a relaunch changes
+    it (a stale id silently captures nothing).
 
 ## Repo / process rules
 
