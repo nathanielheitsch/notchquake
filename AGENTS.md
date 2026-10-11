@@ -283,8 +283,18 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     4 is **H** (sent Ctrl-D = EOT, killing the line), 2 is D (sent BS), 13 is
     W (sent CR = early submit). Fix: Ctrl chords derive from
     `event.characters()` (`b & 0x1f`), and keyCode arms are reserved for
-    actual special keys (53=Esc 8=Backspace 13=Return 3=Enter 26=Tab). Plain
-    printable chars already fall through via `characters()`.
+    actual special keys. Plain printable chars fall through via
+    `characters()`.
+
+    CORRECTION (2026-10-11): the replacement table in this lesson was ALSO
+    wrong — `8/13/3/26` are not Backspace/Return/Enter/Tab; in Carbon's
+    virtual-key table (Events.h) they are the letters **C/W/F/7**. So typing
+    `w` sent CR (a newline), `c` sent Backspace, `f` sent Enter, `7` sent
+    Tab. The verified table (kbd "Show Virtual Keys" / Events.h): **Esc=53,
+    Backspace(Delete)=51, Return=36, keypad Enter=76, Tab=48**, arrows
+    123–126 (sent as ANSI `\x1b[A..D`, NOT the `\u{F700}+` NSFunctionKey
+    chars `characters()` returns), ForwardDelete=117 (`\x1b[3~`).
+    Verified end-to-end: typing `wcf7` now produces `wcf7`.
 
 21. **Draw order in the tab strip = z-order.** Fills → LINE separators/borders
     → labels+hint → `×` LAST, so a long shell title can never overpaint the

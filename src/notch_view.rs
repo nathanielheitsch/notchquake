@@ -946,14 +946,25 @@ fn key_bytes(event: &NSEvent) -> Vec<u8> {
         }
     }
 
-    // Special keys by keyCode (these ARE keyCode-space, not letters).
-    // 53=Esc 8=Backspace 13=Return 3=Enter 26=Tab.
+    // Special keys by keyCode (these ARE keyCode-space, not letters). Numbers
+    // from Carbon's virtual-key table (Events.h): Esc=53, Backspace(Delete)=51,
+    // Return=36, keypad Enter=76, Tab=48. An earlier table here used 8/13/3/26
+    // — those are the LETTERS C/W/F/7 in that table, so typing `w` sent CR (a
+    // newline), `c` sent Backspace, `f` sent Enter, `7` sent Tab.
     match keyCode {
-        53 => return vec![0x1b],
-        8 => return vec![0x7f],
-        13 => return vec![0x0d],
-        3 => return vec![0x0d],
-        26 => return vec![0x09],
+        53 => return vec![0x1b],          // kVK_Escape
+        51 => return vec![0x7f],          // kVK_Delete (Backspace)
+        36 => return vec![0x0d],          // kVK_Return
+        76 => return vec![0x0d],          // kVK_ANSI_KeypadEnter
+        48 => return vec![0x09],          // kVK_Tab
+        // Arrows / ForwardDelete: the PTY wants ANSI escape sequences, NOT the
+        // NSFunctionKey unicode chars `characters()` returns for these
+        // (\u{F700}+ would reach the shell as UTF-8 garbage).
+        126 => return b"\x1b[A".to_vec(), // kVK_UpArrow
+        125 => return b"\x1b[B".to_vec(), // kVK_DownArrow
+        124 => return b"\x1b[C".to_vec(), // kVK_RightArrow
+        123 => return b"\x1b[D".to_vec(), // kVK_LeftArrow
+        117 => return b"\x1b[3~".to_vec(),// kVK_ForwardDelete
         _ => {}
     }
 
