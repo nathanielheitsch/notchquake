@@ -83,7 +83,7 @@ window capture for alpha, the desktop capture for the composited result.
 | Expand/collapse round-trip via `toggle()` | ✅ | 33.5 → 420 → 33 |
 | Rounded silhouette, bottom taper ~20pt/side | ✅ | bottom row 599 vs 639 wide |
 | Live shell grid (text visible) | ✅ verified | window-local alpha capture (open h=420): 704 light text pixels; row 0 reads `Waiting for another flutter command to release the startup lock…` |
-| Tab bar (iTerm style): 3 tabs + `+` button, selected lighter, dividers | ✅ | window-local alpha capture (open h=420): selected x 33–216, unselected 218–607, painted through y=420 (flush with chin line), straight tab top at y=404 with corners curving in from 399, `+` at x≈588–608. **Restyled 2026-10-10** (commit `4c2f172`): square tabs (no rounded corners), all tabs filled `0D0C0C`, only the ACTIVE tab has 1px LINE (`3E3D3D`) side borders (no top/bottom), separators `3E3D3D`, labels `⌘1/⌘2/⌘3` (active `FBFAFC`, inactive `828383`), header block filled `0D0C0C` with a `3E3D3D` separator under it. |
+| Tab bar (iTerm style): 3 tabs + `+` button, selected DARKER, dividers | ✅ | window-local alpha capture (open h=420, commit `8f23b1c`): square tabs, inactive fill `1A1A1A`, **active fill `141414` (darker, per iTerm's dark theme)**, separators/active borders `373737`, labels `FFFFFF`/`969696`, `⌘<n>` hint in iTerm blue accent `4372E0` on EVERY tab. Strip spans the FULL silhouette width (x 0–639.5 = silhouette alpha extent), chin corners cropped by the clip; `+` button square at `TAB_HEIGHT` (28pt, x 612–639.5). Titles start at the same offset on all tabs (35.0/35.3/35.2pt) so they do NOT shift on hover. Chrome text is San Francisco (`ui_font`), ink-centered on `cap_height`. |
 | Click tab → switch PTY | ✅ verified | `mouseDown:` on the open panel selects the tab under the cursor; synthetic click on the middle tab moved selection from tab 0 (sel 64–435) to tab 1 (sel 434–805) |
 | Option+Space global hotkey | ✅ verified | Carbon `RegisterEventHotKey` (no TCC grant); synthetic Option+Space toggles open then close |
 | Click closed pill → open | ✅ verified | synthetic click on the pill toggles open (via `mouseDown:` for real clicks / global monitor fallback) |
@@ -127,15 +127,23 @@ waiting on unanswered terminal queries.
 
 ## The shipped tab strip
 
-iTerm-style: tabs are rounded-TOP-corner rectangles flush with the silhouette
-chin line (square bottom edge, rounded part facing up into the panel),
-selected tab lighter, unselected dimmed, 1px dividers between tabs, a `+`
-button at the right end (decorative — sessions are a fixed `TAB_COUNT`, so it
-is not a click target). Geometry lives in **`tab_strip(h, w)`**, the single
-source of truth shared by the renderer and `select_at_screen_point`, so draw
-and click hit-testing cannot drift. Tabs inset by `chin_radius(h) + TAB_INSET
-from the silhouette sides so they stay inside the clip at every animation
-height.
+iTerm-style: tabs are square rectangles flush with the silhouette chin line, 1px
+dividers between tabs, and a `+` button at the right end (a real click target —
+sessions are dynamic). Geometry lives in **`tab_strip(h, w, count)`**, the single
+source of truth shared by the renderer, the `+` rect, the `×` rect, hover, and
+`select_at_screen_point`, so draw and click hit-testing cannot drift.
+
+The strip insets by **`TAB_INSET` only (0.0)** — NOT by `chin_radius(h)`. It is
+drawn under the silhouette clip, so the tapered chin corners crop the outermost
+tabs (intended) and the leftmost tab / `+` button touch the true silhouette
+edges. Insetting by the chin radius instead left an 18pt black gutter each side.
+
+Chrome text (titles, `⌘<n>` hints) uses **`ui_font`** (San Francisco,
+`.AppleSystemUIFont`) — never the grid's `monospace`. The title band is
+`x + TAB_CLOSE_W + TAB_TITLE_PAD .. x + tab_w - TAB_HINT_W`, with the `×`
+footprint and the hint reservation applied to **every** tab whether or not that
+tab currently draws a `×`, so the centered title never re-centres on hover.
+Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
 
 ## Lessons learned this session
 
@@ -301,9 +309,41 @@ height.
 
 24. **The `×` gutter must be reserved in the title band.** A long shell
     title centered in the full tab width starts at the tab's left edge and
-    overpaints the left-aligned `×`. The active/hovered tab's label band
-    starts at `TAB_CLOSE_W` (`CLOSE_INSET + CLOSE_R`) from the tab's left;
-    other tabs keep the full width.
+    overpaints the left-aligned `×`. The `×` footprint (`TAB_CLOSE_W` = `CLOSE_INSET
+    + CLOSE_R + CLOSE_BUTTON_PAD`, i.e. the drawn BUTTON square, not just the
+    glyph) plus `TAB_TITLE_PAD` is reserved on EVERY tab — see lesson 25 for why
+    it must not be conditional on hover.
+
+25. **Reserve the `×` gutter on EVERY tab, not just the active/hovered one.**
+    Making `left_pad` conditional (`TAB_CLOSE_W + PAD` when active/hovered, else
+    `PAD`) means the band widens the moment the pointer enters the strip, and a
+    centered title then JUMPS sideways and retruncates. Symptom: titles visibly
+    shift on hover. The reservation must be a per-tab constant so all tabs share
+    one band; the `×` is drawn on top of empty space on the tabs that show it.
+
+26. **`CGContextFillPath` CONSUMES the current path — `CGContext::clip` right
+    after a `fill_path` clips an EMPTY path (a no-op).** The silhouette's rounded
+    chin corners came from the FILL, not the clip, so nothing looked wrong as long
+    as every child rect stayed inside the silhouette. Once the tab strip spanned
+    the full width it painted straight over the corners and SQUARED them. Fix:
+    `trace_silhouette(...)` again immediately before `CGContext::clip(ctx)`. This
+    latent bug also left the grid and header unclipped during the open animation.
+    Verify with a window-local alpha capture: the bottom row must inset the SAME
+    amount on both sides and the corner alpha must staircase (`0,0,0,63,255…`).
+
+27. **Center chrome text on `CTFont::cap_height()`, never `ascent + descent`.**
+    San Francisco's `ascent` carries accent/diacritic headroom ~4pt above cap
+    height, so centering the EM box rides every glyph ~6pt high in the tab —
+    titles looked top-heavy while the vector `×` (drawn from rects) sat correctly
+    centered. `baseline = y + (TAB_HEIGHT - cap) / 2.0` puts ink at panel-y
+    208.5–218.5 (center 213.5) against the `×` center 214.2. Same expression in
+    `draw_tab_label` and `draw_tab_hint` so title and hint cannot drift.
+
+28. **`CTLineCreateTruncatedLine` with a NULL token draws NO ellipsis** — it
+    just cuts the line. Pass a real `…` `CTLine` token shaped with the **SAME
+    font** as the label: a mismatched-font token can be wider than `w`, and the
+    call returns NULL then (which the code treats as "draw nothing"), silently
+    blanking the title.
 
 ## Repo / process rules
 
