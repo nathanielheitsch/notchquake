@@ -61,6 +61,16 @@ pub fn monospace(size: CGFloat) -> CFRetained<CTFont> {
     unsafe { CTFont::with_name(&fallback, size, null::<CGAffineTransform>()) }
 }
 
+/// The system UI font (San Francisco), used for the chrome text — the tab
+/// titles and the `⌘<n>` index hint. iTerm2 draws its tab strip in this face,
+/// and `.AppleSystemUIFont` is the reserved PostScript name for the current
+/// system text face, so it always resolves on macOS: no fallback chain needed
+/// (unlike `monospace`, which asks for a third-party family that may be absent).
+pub fn ui_font(size: CGFloat) -> CFRetained<CTFont> {
+    let name = CFString::from_str(".AppleSystemUIFont");
+    unsafe { CTFont::with_name(&name, size, null::<CGAffineTransform>()) }
+}
+
 /// The horizontal advance of a space in `font`, in points.
 ///
 /// Measured with `CTFontGetAdvancesForGlyphs` on the space glyph. This is the

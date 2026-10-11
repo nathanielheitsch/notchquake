@@ -44,7 +44,7 @@ use std::cell::OnceCell;
 use core::ffi::c_double;
 use crate::animation::Spring;
 use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, DEFAULT_SCROLLBACK_LINES, NOTCH_WIDTH, OPEN_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH};
-use crate::font::{FONT_SIZE, monospace, cell_metrics};
+use crate::font::{FONT_SIZE, monospace, cell_metrics, ui_font};
 use crate::render::{draw_grid, GRID_PAD, GRID_TOP_PAD};
 use crate::terminal::Session;
 
@@ -61,31 +61,62 @@ const MIN_TAB_W: CGFloat = 28.0;
 /// left inset from the tab's left edge (the × is LEFT-aligned in the tab).
 const CLOSE_R: CGFloat = 5.0;
 const CLOSE_HIT: CGFloat = 9.0;
-const CLOSE_INSET: CGFloat = 12.0;
+const CLOSE_INSET: CGFloat = 14.0;
 /// The `×` close-affordance footprint from the tab's left edge: its inset
-/// plus its radius. The title band starts after this so a long shell title
-/// can never collide with the `×`.
-const TAB_CLOSE_W: CGFloat = CLOSE_INSET + CLOSE_R;
-/// Point size of the tab title and of the right-aligned `⌘<n>` index hint.
-const TAB_LABEL_SIZE: CGFloat = 11.0;
+/// plus the BUTTON half-size (glyph radius + backdrop pad), so the title band
+/// starts after the drawn button square rather than after the glyph — the
+/// backdrop is what a long title would otherwise overpaint.
+const CLOSE_BUTTON_PAD: CGFloat = 4.0;
+const TAB_CLOSE_W: CGFloat = CLOSE_INSET + CLOSE_R + CLOSE_BUTTON_PAD;
+/// Point size of the tab title (measured off iTerm2's tab strip: a 14px cap
+/// height at 1.5× window scale ≈ 9.3pt cap, which is ~13pt San Francisco)
+/// and of the right-aligned `⌘<n>` index hint.
+const TAB_LABEL_SIZE: CGFloat = 13.0;
 const TAB_HINT_SIZE: CGFloat = 10.0;
 /// Right inset of the `⌘<n>` hint from the tab's right edge.
-const TAB_HINT_INSET: CGFloat = 8.0;
+const TAB_HINT_INSET: CGFloat = 10.0;
+/// Left padding between the `×` gutter and the start of the title band, so
+/// the title can never touch the `×` even on the tab that draws it.
+const TAB_TITLE_PAD: CGFloat = 10.0;
+/// Width the right-aligned `⌘<n>` hint reserves from the tab's right edge:
+/// its inset plus the widest hint we can draw (`⌘` + up to 2 digits, at the
+/// SF average advance of ~0.6em). The title band gives up this much so the
+/// title can never paint over the hint.
+const TAB_HINT_W: CGFloat = TAB_HINT_INSET + 3.0 * (TAB_HINT_SIZE * 0.6);
 const TAB_HEIGHT: CGFloat = 28.0;
 
-/// Tab-strip palette, sRGB (user spec): inactive tab fill `0D0C0C`,
-/// inactive label `828383`, separator lines `3E3D3D`, active label `FBFAFC`.
+/// Tab-strip palette, sRGB — measured off iTerm2's real window at 1.5× scale
+/// (inactive tab fill `1A1A1A`, active tab fill `141414` — the ACTIVE tab is
+/// DARKER than the inactive ones in iTerm's dark theme — separator/active-tab
+/// border `373737`, active label `FFFFFF`, inactive label `969696`, and the
+/// `⌘<n>` index hint in iTerm's blue accent `4372E0` on every tab).
 const fn rgb(r: u8, g: u8, b: u8) -> (CGFloat, CGFloat, CGFloat) {
     (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
 }
-const TAB_FILL: (CGFloat, CGFloat, CGFloat) = rgb(0x0D, 0x0C, 0x0C);
-const LINE: (CGFloat, CGFloat, CGFloat) = rgb(0x3E, 0x3D, 0x3D);
-const TEXT_ACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0xFB, 0xFA, 0xFC);
-const TEXT_INACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0x82, 0x83, 0x83);
+const TAB_FILL: (CGFloat, CGFloat, CGFloat) = rgb(0x1A, 0x1A, 0x1A);
+/// Selected-tab fill: darker than `TAB_FILL`, used ONLY for the selected tab's
+/// rectangle (the header block keeps `TAB_FILL` so it matches the inactive tabs).
+const TAB_FILL_ACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0x14, 0x14, 0x14);
+const LINE: (CGFloat, CGFloat, CGFloat) = rgb(0x37, 0x37, 0x37);
+const TEXT_ACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0xFF, 0xFF, 0xFF);
+const TEXT_INACTIVE: (CGFloat, CGFloat, CGFloat) = rgb(0x96, 0x96, 0x96);
+/// The `⌘<n>` index hint, in iTerm's blue accent, on BOTH active and inactive
+/// tabs (it does not follow the label color).
+const HINT_ACCENT: (CGFloat, CGFloat, CGFloat) = rgb(0x43, 0x72, 0xE0);
 
-const TAB_INSET: CGFloat = 8.0;
-const TAB_RADIUS: CGFloat = 6.0;
-const TAB_PLUS_W: CGFloat = 20.0;
+/// Extra inset beyond the silhouette's own chin radius. 0.0 means the strip
+/// spans the FULL silhouette width, and `tab_strip` therefore ignores
+/// `chin_radius` entirely — the strip is drawn under the silhouette clip, so
+/// the tapered chin corners crop it (intended) rather than insetting it, and
+/// the leftmost/rightmost tabs and the `+` button touch the true edges.
+/// All visibility guards use `CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT` so they
+/// stay correct automatically as this constant changes.
+const TAB_INSET: CGFloat = 0.0;
+/// Width of the `+` button at the right end of the strip: square with the
+/// strip's height so it reads as a button rather than a sliver. `tab_strip`
+/// subtracts it from the tab span, so the click rect and the render rect stay
+/// in sync automatically.
+const TAB_PLUS_W: CGFloat = TAB_HEIGHT;
 
 /// Control-point factor for a quarter-circle cubic (1 - cos(pi/4)/... ).
 const KAPPA: CGFloat = 0.4477;
@@ -343,7 +374,13 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     CGContext::set_fill_color_with_color(ctx, Some(&CGColor::new_generic_gray(0.0, 1.0)));
     CGContext::fill_path(ctx);
 
-    // Everything below stays inside the silhouette.
+    // Everything below stays inside the silhouette. `CGContextFillPath`
+    // CONSUMES the current path, so the clip needs its OWN trace: clipping the
+    // (already empty) path silently did nothing. That went unnoticed only
+    // because the strip used to stop short of the chin corners — once the
+    // strip spans the full width it painted straight over them, squaring the
+    // silhouette's rounded bottom corners. Re-trace, then clip.
+    trace_silhouette(ctx, h, w);
     CGContext::clip(ctx);
 
     // Take the session vec once for the whole frame (put it back at the
@@ -424,7 +461,8 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         let hovered = ivars.hovered.get();
         for index in 0..count {
             let x = left + index as CGFloat * tab_w;
-            CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TAB_FILL)));
+            let fill = if Some(index) == selected { TAB_FILL_ACTIVE } else { TAB_FILL };
+            CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(fill)));
             CGContext::fill_rect(
                 ctx,
                 CGRect::new(CGPoint::new(x, chin_y), CGSize::new(tab_w, TAB_HEIGHT)),
@@ -480,23 +518,24 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         // The tab labels: the shell's OSC title, truncated so the right-aligned
         // `⌘<n>` hint always stays visible. Active TEXT_ACTIVE, inactive
         // TEXT_INACTIVE; ellipsis-truncated when too wide.
-        let label_font = ivars.label_font.get_or_init(|| monospace(TAB_LABEL_SIZE));
-        let hint_font = ivars.hint_font.get_or_init(|| monospace(TAB_HINT_SIZE));
-        // Reserve the hint's width (⌘ + up to 2 digits) plus its inset so the
-        // title never paints over it.
-        let hint_w = TAB_HINT_INSET + 3.0 * (TAB_HINT_SIZE * 0.6);
+        let label_font = ivars.label_font.get_or_init(|| ui_font(TAB_LABEL_SIZE));
+        let hint_font = ivars.hint_font.get_or_init(|| ui_font(TAB_HINT_SIZE));
         for index in 0..count {
             let x = left + index as CGFloat * tab_w;
             let label = sessions.get(index)
                 .map(|s| s.title())
                 .unwrap_or_else(|| format!("Tab {}", index + 1));
             let color = if Some(index) == selected { TEXT_ACTIVE } else { TEXT_INACTIVE };
-            // The `×` is drawn on the active/hovered tab only, so only that
-            // tab loses its left gutter to it; the others keep the full width.
-            let gutter = if Some(index) == selected || hovered == Some(index) { TAB_CLOSE_W } else { 0.0 };
-            draw_tab_label(ctx, Some(label_font), &label, x + gutter, chin_y, tab_w - hint_w - gutter, color);
+            // The title band is `x + TAB_CLOSE_W + TAB_TITLE_PAD .. x +
+            // tab_w - TAB_HINT_W`. The `×` footprint and the hint reservation
+            // are BOTH reserved on EVERY tab, whether or not that tab currently
+            // draws a `×` (hover/selection only): the band is therefore
+            // identical for all tabs, so the title never re-centres — and thus
+            // never shifts or retruncates — when the pointer enters the strip.
+            let left_pad = TAB_CLOSE_W + TAB_TITLE_PAD;
+            draw_tab_label(ctx, Some(label_font), &label, x + left_pad, chin_y, tab_w - left_pad - TAB_HINT_W, color);
             let hint = format!("\u{2318}{}", index + 1);
-            draw_tab_hint(ctx, Some(hint_font), &hint, x, chin_y, tab_w, color);
+            draw_tab_hint(ctx, Some(hint_font), &hint, x, chin_y, tab_w, HINT_ACCENT);
         }
         // The `×` close affordance: shown on the ACTIVE tab always, and on any
         // hovered tab. LEFT-aligned in the tab (reference style). Drawn AFTER
@@ -507,7 +546,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 let (cx, cy) = close_center(x, chin_y);
                 // The reference style puts the `×` inside a rounded dark
                 // square button (gray fill, ~2x glyph size).
-                let b = CLOSE_R + 4.0;
+                let b = CLOSE_R + CLOSE_BUTTON_PAD;
                 CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(LINE)));
                 CGContext::fill_rect(
                     ctx,
@@ -558,7 +597,7 @@ fn tab_strip(h: CGFloat, w: CGFloat, count: usize) -> Option<(CGFloat, CGFloat)>
     if h <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT || count == 0 {
         return None
     }
-    let inset = chin_radius(h) + TAB_INSET;
+    let inset = TAB_INSET;
     let left = (PANEL_WIDTH - w) / 2.0 + inset;
     let right = (PANEL_WIDTH + w) / 2.0 - inset;
     let span = right - left - TAB_PLUS_W;
@@ -632,8 +671,12 @@ fn trace_tab_rect(
     CGContext::close_path(ctx);
 }
 
-/// Draw one tab label centered in the tab `(x, y, w)`, cut off at the tab
-/// width when it does not fit. The line is shaped from a
+/// Draw one tab label centered in the band `(x, y, w)`, ellipsis-truncated
+/// when it does not fit. The ellipsis is a real `…` glyph shaped with the
+/// SAME font: `CTLineCreateTruncatedLine` with a NULL truncation token just
+/// cuts the line off and draws no ellipsis at all, and it returns NULL when
+/// the token is wider than `w` — which a mismatched-font token would hit.
+/// The line is shaped from a
 /// `CFMutableAttributedString` whose font attribute covers the FULL string
 /// range (a zero-length range is the INSERT range for
 /// `CFMutableAttributedString::replace_string`, not the range of the inserted
@@ -654,9 +697,11 @@ fn draw_tab_label(
     let text = CFString::from_str(label);
     let line = unsafe { shaped_line(font, &text) };
 
-    let line_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
-    let line = if line_width as CGFloat > w {
-        match unsafe { line.truncated_line(w as c_double, CTLineTruncationType::End, None) } {
+    let line_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) } as CGFloat;
+    let line = if line_width > w {
+        let ellipsis = CFString::from_str("\u{2026}");
+        let token = unsafe { shaped_line(font, &ellipsis) };
+        match unsafe { line.truncated_line(w as c_double, CTLineTruncationType::End, Some(&*token)) } {
           Some(truncated) => truncated,
           _ => return,
         }
@@ -668,9 +713,15 @@ fn draw_tab_label(
     // than the original), so the label centers on its own width.
     let drawn_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) } as CGFloat;
 
-    let ascent = unsafe { font.ascent() };
-    let descent = unsafe { font.descent() };
-    let baseline = y + (TAB_HEIGHT - (ascent + descent)) / 2.0 + ascent;
+    // Center the visible ink, not the EM box: San Francisco's `ascent`
+    // includes accent/diacritic headroom far above the cap height, so
+    // centering `(ascent + descent)` pushes visible glyphs ~6pt high. The
+    // cap-height band (baseline .. baseline + cap_height) is what the eye
+    // sees, so center THAT in the tab: baseline = y + (TAB_HEIGHT - cap) / 2,
+    // which puts ink at panel-y ≈209.8..219.2 for a band centred on 214.5 —
+    // the same centre as the vector `×` (measured 214.2).
+    let cap = unsafe { font.cap_height() };
+    let baseline = y + (TAB_HEIGHT - cap) / 2.0;
     let cx = x + (w - drawn_width) / 2.0;
 
     CGContext::save_g_state(ctx);
@@ -705,9 +756,10 @@ fn draw_tab_hint(
     } else {
         line_width as CGFloat
     };
-    let ascent = unsafe { font.ascent() };
-    let descent = unsafe { font.descent() };
-    let baseline = y + (TAB_HEIGHT - (ascent + descent)) / 2.0 + ascent;
+    // Same ink-centered baseline as `draw_tab_label`: center the cap-height
+    // band, so the smaller hint glyphs share the tab's vertical centre.
+    let cap = unsafe { font.cap_height() };
+    let baseline = y + (TAB_HEIGHT - cap) / 2.0;
     let cx = x + w - drawn_width - TAB_HINT_INSET;
     CGContext::save_g_state(ctx);
     CGContext::translate_ctm(ctx, cx, baseline);
