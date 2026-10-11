@@ -246,13 +246,29 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     silently DROPS the first; the wheel stops working. Combine into one
     monitor and dispatch on `event.subtype()` inside the handler.
 
-16. **A display change (monitor unplugged / resolution changed) arrives as a
-    `ScrollWheel` event with subtype `ScreenChanged`** carrying a bogus
-    `deltaY`. Handle it in the single ScrollWheel monitor: call `reposition()`
-    (re-pin the panel to the notch display's top-centre + refresh `set_notch`),
-    never `scroll_wheel`. The panel was placed once at startup, so an
-    unplug/resolution change left it off-centre. Verified: desktop 1920×1243
-    pts, panel bounds x=640 w=640 → center 960 = exact screen center.
+16. **A display change must be handled with `NSApplicationDidChangeScreen-
+    ParametersNotification`, NOT a `ScrollWheel`/`ScreenChanged` monitor.**
+    The panel is placed once at startup and AppKit does not re-centre a
+    borderless panel on a resize, so it keeps its old frame origin and
+    drifts off-centre — horizontally, because the y offset stays put and can
+    coincidentally still look "at the top".
+    The original code watched for a `ScrollWheel` event with subtype
+    `ScreenChanged`. **That never fires**: reloaded and measured, on a
+    1920→2048 resize the panel origin stayed exactly `(640, 623)` —
+    `reposition` was never called, and the old "verified" note below was a
+    false positive (a no-op run whose panel happened to still be centred).
+    Fix: register one observer in `applicationDidFinishLaunching:` via
+    `NSNotificationCenter::defaultCenter().addObserverForName_object_queue_
+    usingBlock(...NSApplicationDidChangeScreenParametersNotification...)`
+    (queue `None` = synchronous on the posting thread) and **hold the
+    returned observer token in an ivar** — the center does not retain it, so
+    dropping the token silently unregisters the block. The ScrollWheel
+    monitor now unconditionally forwards `scroll_wheel`.
+    Verified end-to-end with `screenresolution set` + CoreGraphics mode
+    restore: 2560→x=960, 1920→x=640, 2048→x=704, all PASS. Note the user's
+    real mode (1920×1243) is a HiDPI mode `screenresolution` cannot set —
+    restore it via `CGConfigureDisplayWithDisplayMode` with
+    `kCGDisplayShowDuplicateLowResolutionModes` (1920×1243 px=3840×2486).
 
 17. **Dynamic tabs (2026-10-10).** `sessions` is a live `Cell<Vec<Session>>` with
     `spawned: Cell<bool>` (so closing the last tab doesn't auto-resurrect) and

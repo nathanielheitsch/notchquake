@@ -32,18 +32,19 @@ use objc2_app_kit::{
     NSApplication,
     NSApplicationActivationPolicy,
     NSApplicationDelegate,
+    NSApplicationDidChangeScreenParametersNotification,
     NSPanel,
     NSEvent,
     NSEventMask,
     NSEventType,
-    NSEventModifierFlags,
-    NSEventSubtype,
-    NSScreen,
+
+
 };
 use objc2_foundation::{
     MainThreadMarker,
     NSObjectProtocol,
     NSNotification,
+    NSNotificationCenter,
     NSPoint,
     NSRect,
     NSSize,
@@ -64,7 +65,12 @@ use crate::window::create_panel;
 struct AppDelegateIvars {
     panel: OnceCell<Retained<NSPanel>>,
     view: OnceCell<Retained<NotchView>>,
-    monitors: OnceCell<(Monitor, Monitor, Monitor, Monitor)>,
+    monitors: OnceCell<(Monitor, Monitor, Monitor)>,
+    // Held so the screen-parameter observer stays registered for the app's
+    // life. `addObserverForName:...usingBlock:` returns an opaque observer
+    // token; NSNotificationCenter holds it weakly-to-nothing, so dropping it
+    // silently unregisters the block.
+    screen_observer: OnceCell<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     tick_timer: OnceCell<Retained<NSTimer>>,
 }
 
@@ -177,25 +183,15 @@ define_class!(
                 NSEventMask::LeftMouseDown,
                 &click_block,
             );
-            // Scroll wheel + display change: ONE global monitor on the
-            // ScrollWheel mask. macOS keeps only ONE global monitor per event
-            // type — registering a second one for the same mask silently drops
-            // the first, which is why the wheel stopped working once the
-            // display-change monitor was added. A display change (monitor
-            // unplugged / resolution changed) arrives as a ScrollWheel event
-            // with subtype ScreenChanged carrying a bogus deltaY, so dispatch
-            // on the subtype inside this single handler: reposition the panel,
-            // never scroll.
+            // Scroll wheel: one global monitor. macOS keeps only ONE global
+            // monitor per event type, so a second ScrollWheel monitor would
+            // silently drop this one (that was the old bug that killed the
+            // wheel).
             let view_for_wheel = view.clone();
             let wheel_block = RcBlock::new(
                 move |event: NonNull<NSEvent>| {
                     if MainThreadMarker::new().is_some() {
-                        let event_ref = unsafe { event.as_ref() };
-                        if event_ref.subtype() == NSEventSubtype::ScreenChanged {
-                            view_for_wheel.reposition();
-                        } else {
-                            view_for_wheel.scroll_wheel(event_ref.deltaY());
-                        }
+                        view_for_wheel.scroll_wheel(unsafe { event.as_ref() }.deltaY());
                     }
                 },
             );
@@ -203,6 +199,34 @@ define_class!(
                 NSEventMask::ScrollWheel,
                 &wheel_block,
             );
+
+            // Display geometry change (resolution switch, monitor
+            // plug/unplug, menu-bar/Dock rearrangement). The panel is placed
+            // once at startup and AppKit does NOT re-centre a borderless
+            // panel on a resize, so it keeps its old origin and drifts off
+            // centre (usually horizontally).
+            //
+            // The previous approach watched for a ScrollWheel event with
+            // subtype ScreenChanged. That NEVER fires in a global monitor:
+            // measured on a 1920->2048 resize the panel origin stayed exactly
+            // (640,623) — `reposition` was simply never called. Use the
+            // documented NSApplication notification instead.
+            let center = NSNotificationCenter::defaultCenter();
+            let view_for_screen = view.clone();
+            let screen_block = RcBlock::new(
+                move |_note: NonNull<NSNotification>| {
+                    view_for_screen.reposition();
+                },
+            );
+            let screen_observer = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(NSApplicationDidChangeScreenParametersNotification),
+                    None,
+                    None,
+                    &screen_block,
+                )
+            };
+            let _ = ivars.screen_observer.set(screen_observer);
 
             // dirty from an ivar change, so a repeating timer drives the
             // animation passes. `tick` no-ops once the spring settles.
@@ -218,7 +242,7 @@ define_class!(
                 )
             };
             let _ = ivars.tick_timer.set(tick_timer);
-            let _ = ivars.monitors.set((None, local_monitor, click_monitor, wheel_monitor));
+            let _ = ivars.monitors.set((local_monitor, click_monitor, wheel_monitor));
             // Take over from any other app and activate. Required because
             // Cargo builds an unbundled binary (no .app bundle / no launch
             // request).
