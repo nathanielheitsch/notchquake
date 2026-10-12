@@ -15,6 +15,7 @@ use objc2::ClassType;
 use objc2_foundation::MainThreadMarker;
 
 use crate::notch_view::NotchView;
+use crate::settings::{Chord, Settings};
 
 /// `OSType` four-character code: `b"keyb"` -> `0x6B657962`.
 const K_EVENT_CLASS_KEYBOARD: u32 = 0x6B657962;
@@ -75,9 +76,27 @@ type EventHandlerUPP =
     unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u32;
 type EventHotKeyRef = *mut std::ffi::c_void;
 
-// Suppress the unused `active_flag_bit` for clarity; it IS used in the mask.
-#[allow(dead_code)]
-const _USED: u32 = ALPHA_LOCK_BIT;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+/// The two registered hotkey refs, stored as integers so they can live in a
+/// `static` next to the Carbon calls that consume them. `RegisterEventHotKey`
+/// hands back an `EventHotKeyRef` that must stay alive for the chord to keep
+/// working, and is the ONLY handle `UnregisterEventHotKey` accepts; the pre-
+/// settings code threw both away, which is why a chord could never be changed.
+///
+/// Slot 0 = `HOTKEY_ID_TOGGLE`, slot 1 = `HOTKEY_ID_NEW_TAB`; 0 means "never
+/// registered" (Carbon refs are heap pointers, never null-ish in practice).
+///
+/// A `static` rather than a view ivar because `notch_view.rs` already depends
+/// on this module (`hot_key_handler` calls back into `NotchView`), so the ivar
+/// struct cannot name these cells without a cycle. A Carbon ref is `!Send`/`!Sync`
+/// in spirit, but every access here is main-thread-only by construction: launch
+/// registers from `main`/`applicationDidFinishLaunching:`, and the settings
+/// panel re-registers from a click handler that runs on the main run loop.
+/// `AtomicUsize` is the cheapest way to keep the process-wide state legal in
+/// Rust without wrapping a raw pointer in a new type.
+static HOT_REFS: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
@@ -98,6 +117,7 @@ unsafe extern "C" {
         options: u32,
         out_ref: *mut EventHotKeyRef,
     ) -> i32;
+    fn UnregisterEventHotKey(hot_ref: EventHotKeyRef) -> i32;
     fn GetEventParameter(
         event: *mut std::ffi::c_void,
         name: u32,
@@ -113,6 +133,8 @@ unsafe extern "C" {
 const HOTKEY_ID_TOGGLE: u32 = 1;
 /// iTerm's "new tab" chord (Cmd+T).
 const HOTKEY_ID_NEW_TAB: u32 = 2;
+/// The four-character signature Carbon matches our hotkey ids against.
+const HOTKEY_SIGNATURE: u32 = u32::from_be_bytes(*b"BNTh");
 
 /// The Carbon event handler. `userData` is the raw `NotchView *` we passed to
 /// `InstallEventHandler`. Carbon dispatches this on the main run loop, so
@@ -154,12 +176,61 @@ unsafe extern "C" fn hot_key_handler(
     0
 }
 
-/// Register the global hotkeys. The returned value is only non-zero on
-/// failure (matching the old monitor's `is_none()` check).
+/// Register one of our two chords from `chord` and remember Carbon's ref so
+/// `reregister_hotkeys` can unregister it later. A failure is logged but not
+/// fatal: the other chord and every click path still work.
+fn register_chord(target: EventTargetRef, id: u32, chord: Chord) {
+    let slot = if id == HOTKEY_ID_NEW_TAB { 1 } else { 0 };
+    let hotkey_id = EventHotKeyID {
+        signature: HOTKEY_SIGNATURE,
+        id,
+    };
+    let modifiers = modifier_mask(chord.option, chord.cmd, chord.shift, chord.ctrl);
+    let mut hot_ref: EventHotKeyRef = std::ptr::null_mut();
+    let status = unsafe {
+        RegisterEventHotKey(chord.key_code as u32, modifiers, hotkey_id, target, 0, &mut hot_ref)
+    };
+    if status != 0 {
+        eprintln!("notch-terminal: RegisterEventHotKey (id {id}) failed: {status}");
+        return
+    }
+    if slot == 0 {
+        HOT_REFS.0.swap(hot_ref as usize, Ordering::SeqCst);
+    } else {
+        HOT_REFS.1.swap(hot_ref as usize, Ordering::SeqCst);
+    }
+}
+
+/// Unregister both stored chords. Carbon keeps its own queue entry alive only
+/// through the ref we were handed, so dropping the ref (as the pre-settings
+/// code did) would leak a live registration that the settings panel could not
+/// replace — the old Option+Space would keep toggling after the user picked a
+/// new chord.
+fn unregister_hotkeys() {
+    unregister_one(&HOT_REFS.0);
+    unregister_one(&HOT_REFS.1);
+}
+
+/// Unregister one stored chord ref (a 0 slot means "never registered").
+fn unregister_one(stored: &AtomicUsize) {
+    let raw = stored.swap(0, Ordering::SeqCst);
+    if raw == 0 {
+        return
+    }
+    let status = unsafe { UnregisterEventHotKey(raw as *mut std::ffi::c_void) };
+    if status != 0 {
+        eprintln!("notch-terminal: UnregisterEventHotKey failed: {status}");
+    }
+}
+
+/// Register the global hotkeys. The returned value is only false on failure
+/// (matching the old monitor's `is_none()` check).
 ///
 /// `view` is retained by the caller for the process lifetime; we hand Carbon
-/// its raw pointer as the handler's `userData`.
-pub fn register_hotkeys(mtm: MainThreadMarker, view: &NotchView) -> bool {
+/// its raw pointer as the handler's `userData`. The chords come from `settings`
+/// (whose defaults are exactly the old hardcoded Option+Space / Cmd+T), so a
+/// stored preference is what launch registers.
+pub fn register_hotkeys(mtm: MainThreadMarker, view: &NotchView, settings: Settings) -> bool {
     let _ = mtm;
     let target = unsafe { GetApplicationEventTarget() };
     if target.is_null() {
@@ -185,34 +256,30 @@ pub fn register_hotkeys(mtm: MainThreadMarker, view: &NotchView) -> bool {
         eprintln!("notch-terminal: InstallEventHandler failed: {status}");
         return false;
     }
-    // Space virtual key code is 49; Option is the only modifier we want.
-    let modifiers = modifier_mask(true, false, false, false);
-    let id = EventHotKeyID {
-        signature: u32::from_be_bytes(*b"BNTh"),
-        id: HOTKEY_ID_TOGGLE,
-    };
-    let mut hot_ref: EventHotKeyRef = std::ptr::null_mut();
-    let status = unsafe {
-        RegisterEventHotKey(49, modifiers, id, target, 0, &mut hot_ref)
-    };
-    if status != 0 {
-        eprintln!("notch-terminal: RegisterEventHotKey failed: {status}");
-        return false;
+    register_chord(target, HOTKEY_ID_TOGGLE, settings.toggle_chord);
+    register_chord(target, HOTKEY_ID_NEW_TAB, settings.new_tab_chord);
+    true
+}
+
+/// Re-register both chords from a changed settings bundle, called by the
+/// settings panel through `NotchView::reregister_hotkeys` when a hotkey row
+/// steps to a different preset. The ids stay the same, so `hot_key_handler`
+///'s dispatch is untouched; only the Carbon registrations move.
+///
+/// `InstallEventHandler` is NOT re-installed: its ref was taken at launch and
+/// stays alive for the process (the delegate retains the view, which is the
+/// handler's `userData`), so re-registering the chords against the same target
+/// is enough.
+pub fn reregister_hotkeys(mtm: MainThreadMarker, view: &NotchView, settings: Settings) -> bool {
+    let _ = mtm;
+    unregister_hotkeys();
+    let target = unsafe { GetApplicationEventTarget() };
+    if target.is_null() {
+        eprintln!("notch-terminal: GetApplicationEventTarget() returned null during re-registration");
+        return false
     }
-    // iTerm's "new tab": Cmd+T. kVK_ANSI_T is 0x11 (17) in Carbon's virtual-
-    // key table (Events.h) - NOT the letter's position. Same handler, other id.
-    let cmd_t = modifier_mask(false, true, false, false);
-    let new_tab_id = EventHotKeyID {
-        signature: u32::from_be_bytes(*b"BNTh"),
-        id: HOTKEY_ID_NEW_TAB,
-    };
-    let mut hot_ref2: EventHotKeyRef = std::ptr::null_mut();
-    let status = unsafe {
-        RegisterEventHotKey(0x11, cmd_t, new_tab_id, target, 0, &mut hot_ref2)
-    };
-    if status != 0 {
-        eprintln!("notch-terminal: RegisterEventHotKey (Cmd+T) failed: {status}");
-        return false;
-    }
+    register_chord(target, HOTKEY_ID_TOGGLE, settings.toggle_chord);
+    register_chord(target, HOTKEY_ID_NEW_TAB, settings.new_tab_chord);
+    let _ = view;
     true
 }

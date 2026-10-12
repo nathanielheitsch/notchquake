@@ -41,24 +41,36 @@ pub const FONT_SIZE: CGFloat = 14.0;
 /// `u16` in `objc2-core-foundation`).
 const SPACE_CODE_UNIT: u16 = 32;
 
-/// Creates the monospace font: "Fira Code" when the system resolves it,
-/// otherwise "Menlo".
-pub fn monospace(size: CGFloat) -> CFRetained<CTFont> {
-    let preferred = CFString::from_str("Fira Code");
+/// Creates the monospace font for `family` at `size`, falling back to "Menlo".
+///
+/// `None` means the default family ("Fira Code"). `CTFontCreateWithName` never
+/// returns nil, it only "best matches" the requested name, so the resolved
+/// `family_name()` is compared against the request before the font is accepted;
+/// a family that does not resolve ("SF Mono" is not installed, etc.) falls back
+/// to Menlo, which macOS always ships.
+pub fn monospace_with(size: CGFloat, family: Option<&str>) -> CFRetained<CTFont> {
+    let requested = family.unwrap_or("Fira Code");
+    let preferred = CFString::from_str(requested);
     let font = unsafe { CTFont::with_name(&preferred, size, null::<CGAffineTransform>()) };
 
     // `CTFontCreateWithName` never returns nil, it only "best matches" the
     // requested name; so verify the family actually resolved before
     // accepting it, otherwise the fallback would be silently shadowed by
     // whatever CoreText substituted.
-    let family = unsafe { font.family_name() };
-    let resolved = unsafe { family.compare(Some(&preferred), CFStringCompareFlags(0)) };
+    let family_name = unsafe { font.family_name() };
+    let resolved = unsafe { family_name.compare(Some(&preferred), CFStringCompareFlags(0)) };
     if resolved.0 == CFComparisonResult::CompareEqualTo.0 {
         return font;
     }
 
     let fallback = CFString::from_str("Menlo");
     unsafe { CTFont::with_name(&fallback, size, null::<CGAffineTransform>()) }
+}
+
+/// The default monospace font at `size`: "Fira Code" when the system resolves
+/// it, otherwise "Menlo".
+pub fn monospace(size: CGFloat) -> CFRetained<CTFont> {
+    monospace_with(size, None)
 }
 
 /// The system UI font (San Francisco), used for the chrome text — the tab

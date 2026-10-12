@@ -47,6 +47,8 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiR
 use alacritty_terminal::vte::{Parser as VteParser, Perform};
 use polling::{Event as PollingEvent, PollMode, Poller};
 
+use crate::settings::Settings;
+
 /// Per-session OSC state harvested by the PTY tee's side-channel parser.
 ///
 /// `alacritty_terminal`'s `Term` does NOT override `vte::ansi::Handler::osc_dispatch`,
@@ -511,6 +513,15 @@ pub struct Session {
     shim_dir: Option<PathBuf>,
     rows: usize,
     columns: usize,
+    /// The color palette this session was built with: a `Copy` snapshot of
+    /// the live `Settings`, taken at `Session::new` on the MAIN thread and
+    /// read back only in `snapshot()` (also the MAIN thread). `Term.colors()`
+    /// only holds colors an OSC/SGR sequence wrote, so every unset index
+    /// resolves through this bundle — which is why the palette is threaded
+    /// through the `Session` instead of living in a `static Cell<Settings>`
+    /// (not `Sync`) or a `thread_local!` (the PTY reader thread would read a
+    /// different value).
+    palette: Settings,
 }
 
 /// Monotonic id mixed into the shim-dir name so parallel sessions in one
@@ -641,8 +652,12 @@ impl Drop for Session {
 
 impl Session {
     /// Spawn the PTY once and start the PTY reader thread. `scrollback` is
-    /// the history cutoff in lines (0 disables scrolling history).
-    pub fn new(rows: usize, columns: usize, cell_width: f64, cell_height: f64, scrollback: usize) -> Self {
+    /// the history cutoff in lines (0 disables scrolling history). `palette`
+    /// is the color bundle (ANSI 16, default foreground, default background,
+    /// cursor color) baked into this session; it is copied here on the MAIN
+    /// thread and read back in `snapshot()`, so the reader thread never has
+    /// to see it and the OSC tee path stays untouched.
+    pub fn new(rows: usize, columns: usize, cell_width: f64, cell_height: f64, scrollback: usize, palette: &Settings) -> Self {
         let shell = login_shell().expect("the current user has a login shell");
         let listener = TitleListener::new();
 
@@ -722,6 +737,11 @@ impl Session {
             shim_dir,
             rows,
             columns,
+            // Copy the palette bundle out of the settings cell (a `Copy` read,
+            // taken on the MAIN thread here) so `snapshot()` resolves every
+            // unset color index against the settings this session was built
+            // with.
+            palette: *palette,
         }
     }
 
@@ -752,7 +772,7 @@ impl Session {
         (0..self.columns).map(|column| {
                 let cell = &grid[Line((offset + line) as i32)][Column(column)];
                 let inverse = cell.flags.intersects(Flags::INVERSE);
-                let (fg, bg) = (resolve(colors, cell.fg), resolve(colors, cell.bg));
+                let (fg, bg) = (resolve(colors, cell.fg, &self.palette), resolve(colors, cell.bg, &self.palette));
                 CellSnapshot {
                     character: cell.c,
                     foreground: if inverse { bg } else { fg },
@@ -990,40 +1010,47 @@ fn shorten_cwd(path: &str) -> Option<String> {
 ///
 /// `Term.colors()` starts as `[None; 269]` and is only written by OSC/SGR
 /// color operations, so a `None` entry falls back to our own default palette.
-fn resolve(colors: &Colors, color: AnsiColor) -> (f64, f64, f64) {
+fn resolve(colors: &Colors, color: AnsiColor, palette: &Settings) -> (f64, f64, f64) {
     match color {
         AnsiColor::Spec(rgb) => (rgb.r as f64 / 255.0, rgb.g as f64 / 255.0, rgb.b as f64 / 255.0),
-        AnsiColor::Indexed(index) => palette_or(colors, index as usize),
-        AnsiColor::Named(named) => palette_or(colors, named as usize),
+        AnsiColor::Indexed(index) => palette_or(colors, index as usize, palette),
+        AnsiColor::Named(named) => palette_or(colors, named as usize, palette),
     }
 }
 
-/// Indexed palette fallback: the terminal's `colors()` table when set, else a
-/// fixed dark-theme palette (black bg, light gray fg family).
-fn palette_or(colors: &Colors, index: usize) -> (f64, f64, f64) {
+/// Indexed palette fallback: the terminal's `colors()` table when set, else
+/// the session's own default palette.
+fn palette_or(colors: &Colors, index: usize, palette: &Settings) -> (f64, f64, f64) {
     if let Some(rgb) = colors[index] {
         return (rgb.r as f64 / 255.0, rgb.g as f64 / 255.0, rgb.b as f64 / 255.0)
     }
-    default_color(index)
+    default_color(index, palette)
 }
 
-/// A fixed dark-theme palette for the 16 named colors (alacritty's defaults).
-fn default_color(index: usize) -> (f64, f64, f64) {
-    let palette = [
-        (0x18, 0x18, 0x18), (0xC4, 0x3C, 0x3B), (0x70, 0x98, 0x78), (0xD8, 0xA8, 0x4A),
-        (0x4C, 0x72, 0x9E), (0xA8, 0x68, 0x94), (0x68, 0xA8, 0xC4), (0xD8, 0xD8, 0xD8),
-        (0x60, 0x60, 0x60), (0xE4, 0x5C, 0x5B), (0x98, 0xC0, 0xA0), (0xF0, 0xC0, 0x62),
-        (0x6C, 0x92, 0xBE), (0xD8, 0x98, 0xC4), (0x88, 0xC8, 0xE4), (0xF8, 0xF8, 0xF8),
-    ];
-    if index < palette.len() {
-        let (r, g, b) = palette[index];
-        return (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
+/// The default palette for an index, read from the session's baked `Settings`
+/// (`Settings.ansi` for the 16 named colors, `Settings.foreground`/`background`
+/// /`cursor_color` for the named defaults) and falling back to alacritty's
+/// dark-theme ramp for whatever the settings bundle does not carry (the color
+/// cube and the grayscale ramp).
+fn default_color(index: usize, palette: &Settings) -> (f64, f64, f64) {
+    if index < 16 {
+        let (r, g, b) = palette.ansi[index].rgb();
+        return (r, g, b)
     }
-    // Named defaults (256..258): the theme's own fg/bg, not the ramp.
+    // Named defaults (256..268): 256 foreground, 257 background, 258 cursor,
+    // 259..267 dim variants, 267 bright foreground, 268 dim background.
     // `NamedColor::Background` is what every unpainted cell carries, so
-    // falling through to the ramp would paint the whole grid gray.
+    // falling through to the ramp would paint the whole grid the foreground
+    // color. The dim/bright aliases read the same fg/bg bundle entries.
     if index >= 256 {
-        return if index == 257 { (0.0, 0.0, 0.0) } else { (0xD8 as f64 / 255.0, 0xD8 as f64 / 255.0, 0xD8 as f64 / 255.0) }
+        let (r, g, b) = if index == 257 {
+            palette.background.rgb()
+        } else if index == 258 {
+            palette.cursor_color.rgb()
+        } else {
+            palette.foreground.rgb()
+        };
+        return (r, g, b)
     }
     // Color cube (16..232) and grayscale ramp (233..255): approximate.
     if index < 232 {

@@ -15,6 +15,7 @@ pub mod font;
 pub mod notch_view;
 pub mod terminal;
 pub mod render;
+pub mod settings;
 
 
 use std::cell::OnceCell;
@@ -135,7 +136,11 @@ define_class!(
             // zero callbacks. The Carbon path sees only this chord, never
             // other keystrokes.
             let view_ptr: *const crate::notch_view::NotchView = &*view;
-            let hotkey_ok = crate::hotkey::register_hotkeys(mtm, &*view);
+            // The chords come from the stored settings (read once in
+            // `NotchView::new`), so a preference saved on a previous run is
+            // what launch registers — the settings panel can then change them
+            // at runtime via `NotchView::reregister_hotkeys`.
+            let hotkey_ok = crate::hotkey::register_hotkeys(mtm, &*view, view.current_settings());
             let _ = view_ptr;
             if !hotkey_ok {
                 eprintln!("notch-terminal: global Option+Space hotkey not registered");

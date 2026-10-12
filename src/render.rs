@@ -19,10 +19,12 @@ use objc2_core_text::{
     CTLine,
     kCTFontAttributeName,
     kCTForegroundColorFromContextAttributeName,
+    kCTLigatureAttributeName,
 };
 use objc2_core_foundation::{
     CFBoolean,
     CFMutableAttributedString,
+    CFNumber,
     CFRange,
     CFString,
     CFRetained,
@@ -35,6 +37,7 @@ use objc2_core_foundation::kCFBooleanTrue;
 
 use std::ptr::null;
 
+use crate::settings::{CursorShape, Settings};
 use crate::consts::{PANEL_HEIGHT, PANEL_WIDTH};
 use crate::terminal::CellSnapshot;
 
@@ -44,12 +47,11 @@ pub const GRID_PAD: CGFloat = 8.0;
 /// Vertical padding at the top of the grid: row 0 must clear the silhouette's
 /// rounded top corners and top edge, whose taper reaches ~20pt down each side.
 pub const GRID_TOP_PAD: CGFloat = 22.0;
-/// The default terminal background: cells painted this color are skipped
-/// (the silhouette fill is already black).
-const DEFAULT_BG: (CGFloat, CGFloat, CGFloat) = (0.0, 0.0, 0.0);
-
 /// Alpha of the filled cursor block.
 const CURSOR_ALPHA: CGFloat = 0.85;
+
+/// Thickness of the bar/underline cursor, as a fraction of the cell it sits in.
+const CURSOR_STROKE_FRACTION: CGFloat = 0.12;
 
 /// Paint the grid background rects, then every text run, then the cursor.
 ///
@@ -65,6 +67,7 @@ pub fn draw_grid(
     cell_height: CGFloat,
     height: CGFloat,
     header: CGFloat,
+    settings: &Settings,
 ) {
     let ctx_opt = Some(ctx);
     let cols = if grid.is_empty() { 0 } else { grid[0].len() };
@@ -79,13 +82,17 @@ pub fn draw_grid(
     // its background block (ascent 12.92 vs descent 4.31 at 14pt Fira Code).
     let descent = unsafe { font.descent() };
 
-    // Background pass: only runs whose bg differs from the silhouette black.
+    // Background pass: only runs whose bg differs from the panel background —
+    // the silhouette is already filled with `settings.background`, so cells
+    // painted that same color are skipped (a settings bg change repaints the
+    // silhouette in `notch_view.rs::draw`, this only keeps the grid in sync).
+    let panel_bg = settings.background.rgb();
     for (row, cells) in grid.iter().enumerate() {
         if let Some((top, h)) = row_rect(row, cell_height, height, header) {
             let mut col = 0;
             while col < used_cols {
                 let bg = cells[col].background;
-                if bg == DEFAULT_BG {
+                if bg == panel_bg {
                     col += 1;
                     continue;
                 }
@@ -124,7 +131,7 @@ pub fn draw_grid(
 
                 let run_text: String = cells[start..col + 1].iter().map(|cell| cell.character).collect();
                 let text = CFString::from_str(&run_text);
-                let line = unsafe { run(font, &text) };
+                let line = unsafe { run(font, &text, settings.ligatures) };
                 CGContext::save_g_state(ctx_opt);
                 CGContext::translate_ctm(ctx_opt, x0 + start as CGFloat * cell_width, baseline);
                 CGContext::set_fill_color_with_color(ctx_opt, Some(&srgb(fg)));
@@ -137,21 +144,45 @@ pub fn draw_grid(
         }
     }
 
-    // Cursor pass.
+    // Cursor pass. The COLOR comes from settings; the SHAPE is a pure render
+    // read (`Term` never sees it): Block fills the cell, Bar is a vertical
+    // stroke at the cell's left edge, Underline a horizontal stroke at its
+    // bottom edge (y-up space, so the bottom edge is the rect's `top`).
     if let Some((line, column)) = cursor {
         if column < used_cols && line < grid.len() {
             if let Some((top, h)) = row_rect(line, cell_height, height, header) {
+                let (cr, cg, cb) = settings.cursor_color.rgb();
                 CGContext::set_fill_color_with_color(
                     ctx_opt,
-                    Some(&CGColor::new_srgb(0.75, 0.75, 0.75, CURSOR_ALPHA)),
+                    Some(&CGColor::new_srgb(cr, cg, cb, CURSOR_ALPHA)),
                 );
-                CGContext::fill_rect(
-                    ctx_opt,
-                    CGRect::new(
-                        CGPoint::new(x0 + column as CGFloat * cell_width, top),
-                        CGSize::new(cell_width, h),
+                let x = x0 + column as CGFloat * cell_width;
+                match settings.cursor_shape {
+                  CursorShape::Block =>
+                    CGContext::fill_rect(
+                        ctx_opt,
+                        CGRect::new(
+                            CGPoint::new(x, top),
+                            CGSize::new(cell_width, h),
+                        ),
                     ),
-                );
+                  CursorShape::Bar =>
+                    CGContext::fill_rect(
+                        ctx_opt,
+                        CGRect::new(
+                            CGPoint::new(x, top),
+                            CGSize::new(cell_width * CURSOR_STROKE_FRACTION, h),
+                        ),
+                    ),
+                  CursorShape::Underline =>
+                    CGContext::fill_rect(
+                        ctx_opt,
+                        CGRect::new(
+                            CGPoint::new(x, top),
+                            CGSize::new(cell_width, h * CURSOR_STROKE_FRACTION),
+                        ),
+                    ),
+                }
             }
         }
     }
@@ -183,7 +214,16 @@ fn srgb(rgb: (CGFloat, CGFloat, CGFloat)) -> CFRetained<CGColor> {
 /// falls back to the default font/colour). With the font attached,
 /// `CTLineDraw` reads the text colour from the CGContext fill colour the
 /// caller sets per-run.
-unsafe fn run(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
+///
+/// `ligatures` off sets `kCTLigatureAttributeName` to 0 (essential ligatures
+/// only) over the same range. This is the text-attribute path that DOES work
+/// for ligature shaping — unlike `kCTFontFeatureSettingsAttribute`, which
+/// CoreText/HarfBuzz applies from the FONT, not from the attributed string
+/// (AGENTS.md lessons 1/2: a `calt` setting put on the string is a dead end).
+/// Fira Code draws `->` as two `.seq` half-glyphs that compose the arrow, so
+/// with the attribute off the two halves stay visually separate cells; verify
+/// with glyph NAMES, not glyph count, which stays 2 either way (lesson 1).
+unsafe fn run(font: &CTFont, text: &CFString, ligatures: bool) -> CFRetained<CTLine> {
     let attr = CFMutableAttributedString::new(None, 0).expect("an attributed string");
     let insert = CFRange { location: 0, length: 0 };
     unsafe { CFMutableAttributedString::replace_string(Some(&*attr), insert, Some(text)) };
@@ -203,6 +243,17 @@ unsafe fn run(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
             Some(kCTForegroundColorFromContextAttributeName),
             Some(&*kCFBooleanTrue.expect("a boolean")),
         );
+        if !ligatures {
+            // 0 = only ligatures ESSENTIAL for proper rendering; the standard
+            // (font-default) value is 1. A CFNumber, not a CFBoolean.
+            let essential = CFNumber::new_i32(0);
+            CFMutableAttributedString::set_attribute(
+                Some(&*attr),
+                full,
+                Some(kCTLigatureAttributeName),
+                Some(&*essential),
+            );
+        }
     };
-    CTLine::with_attributed_string(&**attr)
+    unsafe { CTLine::with_attributed_string(&**attr) }
 }

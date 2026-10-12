@@ -92,6 +92,7 @@ window capture for alpha, the desktop capture for the composited result.
 | Header bar (notch height, open state) | ✅ verified | desktop capture: grid text starts at y≈50pt = notch 33 + GRID_TOP_PAD 22; the notch-height block above it is reserved (empty for now, buttons later). `row_rect`/`draw_grid` take a `header` param; `grid_dims` reserves the same inset. |
 | Dynamic tabs: `+` spawns | ✅ verified | synthetic click on the `+` grew the strip from 3 to 4 tabs (labels reflowed, tab_w shrank). `sessions` is a live `Cell<Vec<Session>>`; `tab_strip(h,w,count)` is the single source of truth for renderer + hover + click. |
 | Tab close via `×` (selected or hovered) | ✅ verified | click on the `×` of the SELECTED tab fires `close_tab` (the affordance is drawn on hovered OR selected, and the hit-test accepts either). Verified lifecycle: 1 tab → `+` → 2 → ⌘T → 3 → `×` → 2 tabs; closing the LAST tab collapses to the 33pt pill. Closing a live tab no longer hangs the app (see lesson 35). |
+| Settings menu (gear + overlay) | ✅ verified | gear button top-right of the open header; click toggles a settings overlay (Geometry/Font/Colors/Scrollback/Hotkeys/Bell rows). Controls: `< value >` chevrons (cycle/step), toggle switches, color wells. Persists via `NSUserDefaults` (bundle id `local.bnt` → `~/Library/Preferences/local.bnt.plist`). See lessons 40-45. |
 | Shell exit self-destruct | ⚠️ built, not driver-verifiable | `Event::Exit` (post-drain) sets `Arc<AtomicBool>` dead flag; `tick` → `reap_dead_sessions()` tears down via `Msg::Shutdown` (reader thread returns → `Pty::Drop` SIGHUPs the child). Needs a real `exit` keystroke to exercise. |
 
 ## The tab-bar defect — root cause (fixed 2026-10-09)
@@ -467,6 +468,61 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     full screen, or `computer_use_get_desktop_state`) is the user-visible truth:
     measure the dark run down the screen-center column (33pt = closed pill).
     Do not conclude "panel blank" from a transparent `-l` capture alone.
+
+40. **Settings live in ONE `Settings` struct (`src/settings.rs`) carried as
+    `ivars.settings: Cell<Settings>`** (`#[derive(Clone, Copy)]`, plain data —
+    `Cell` needs `Copy`, so `font_family` is `&'static str` from a preset list,
+    NOT a `String`; enum-ish knobs persist as an INDEX via `setInteger:forKey:`,
+    the only safe typed setter in objc2-foundation 0.3.2). Read once per frame
+    (`ivars.settings.get()`) and threaded into the silhouette fill, `draw_grid`,
+    and each `Session::new` palette. The palette is threaded through `Session::new`
+    (Term built on the main thread, moved into the reader thread) — NOT a
+    `static Cell` (not Sync) or `thread_local!` (reader thread gets a different
+    value).
+
+41. **`NSUserDefaults` persistence gotchas.** (a) The plist is named after the
+    **bundle id** (`local.bnt` → `~/Library/Preferences/local.bnt.plist`), NOT
+    the app name or key prefix — grep the right file before concluding a write
+    failed. (b) Writes are buffered and flushed on process EXIT, so a still-running
+    app has no plist yet. (c) The defaults domain is keyed by the running
+    **process name**, so a renamed copy (`/tmp/bnt-rt`) starts at DEFAULTS — use
+    that to prove a true cross-process round-trip, since the SAME-name relaunch
+    reads a stale in-memory cache, not the plist. (d) `key_name` applies the
+    `BNT.` prefix EXACTLY once; `channel_key` returns a bare SUFFIX (`bg.r`).
+    Double-prefixing (prefix in both) wrote `BNT.BNT.bg.r` and left chord keys
+    single-prefixed, so `load` read a different key than `save` wrote.
+
+42. **The settings overlay is a click-driven UI, no text entry.** The panel
+    can't take key focus while another app is frontmost, so values are edited
+    with preset/stepper controls, not typed: `< value >` chevrons (a cycle row
+    steps through a preset ring; a step row nudges by a unit), a toggle switch,
+    and color wells. `settings_rows(settings)` is the SINGLE source of truth
+    consumed by BOTH `draw_settings` and the click hit-test, so draw and hit-test
+    cannot drift. `settings_region()` returns `(left,right,top,bottom)`; the
+    bottom clamp is `bottom.min(top)` — `max` collapses the region to zero height
+    and silently drops every row AND every click route.
+
+43. **Chevron direction = which chevron was hit.** `apply_settings_row` computes
+    `left_cx`/`right_cx` and steps `-1`/`+1` by `cx <= left_cx`. Comparing against
+    `x_right - SETTINGS_CHEVRON` makes BOTH chevrons step back (the right chevron
+    center is itself below that threshold). And a click that lands ON a row must
+    `return` (keep the overlay open) — falling through to the "click off the rows
+    closes settings" branch closed the overlay after EVERY control click.
+
+44. **A row with NO wells must not index `wells`.** `wells.len() - 1` on an empty
+    vec underflows (a chevron/toggle row has `wells == []`); guard with
+    `row.wells.is_empty() || well >= row.wells.len() ? 0`. This was a hard panic
+    (`attempt to subtract with overflow`) on the FIRST chevron click.
+
+45. **Hotkey config = Carbon re-registration, not a new subsystem.** `hotkey.rs`
+    keeps the two `EventHotKeyRef`s in a `static HOT_REFS: (AtomicUsize,AtomicUsize)`;
+    `reregister_hotkeys` unregisters the old refs and registers the two chords
+    from `settings` against the SAME `GetApplicationEventTarget()` (the delegate
+    handler stays installed). `chord_mask` uses Carbon modifier bits (cmd=1<<8,
+    shift=1<<9, option=1<<11, ctrl=1<<12, plus a 1<<0 sentinel when any modifier
+    is set) so Option+Space=2049 and Cmd+Space=257 are DISTINCT. `CHORD_PRESETS`
+    is the cycle ring; a chord change persists and takes effect at the next launch
+    (verified: Cmd+Space toggle persisted, Option+Space inert on relaunch).
 
 ## Repo / process rules
 
