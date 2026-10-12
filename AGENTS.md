@@ -92,7 +92,7 @@ window capture for alpha, the desktop capture for the composited result.
 | Header bar (notch height, open state) | ✅ verified | desktop capture: grid text starts at y≈50pt = notch 33 + GRID_TOP_PAD 22; the notch-height block above it is reserved. **Restyled 2026-10-12**: the header fill IS `settings.background` (seamless with the terminal), the hard LINE separator is gone, and `draw_header_shadow` fades a 32pt band of terminal-bg color over the top grid rows AFTER the grid (verified by pixel measurement: top row max lum 181/216 ≈ the gradient alpha at that depth, full brightness by 65pt). See lesson 46. |
 | Dynamic tabs: `+` spawns | ✅ verified | synthetic click on the `+` grew the strip from 3 to 4 tabs (labels reflowed, tab_w shrank). `sessions` is a live `Cell<Vec<Session>>`; `tab_strip(h,w,count)` is the single source of truth for renderer + hover + click. |
 | Tab close via `×` (hover only) | ✅ verified (by construction) | click on the `×` fires `close_tab`. **Changed 2026-10-12**: the `×` draws ONLY on a HOVERED tab (not the active one) and the hit-test matches (`hovered.get() == Some(index)` only) — see lesson 47. Verified lifecycle (before the change): 1 tab → `+` → 2 → ⌘T → 3 → `×` → 2 tabs; closing the LAST tab collapses to the 33pt pill. Closing a live tab no longer hangs the app (see lesson 35). |
-| Settings menu (gear + overlay) | ✅ verified | gear button top-right of the open header; click toggles a settings overlay (Geometry/Font/Colors/Scrollback/Hotkeys/Bell rows). Controls: `< value >` chevrons (cycle/step), toggle switches, color wells. Persists via `NSUserDefaults` (bundle id `local.bnt` → `~/Library/Preferences/local.bnt.plist`). See lessons 40-45. |
+| Settings **window** (gear -> separate native `NSWindow`) | ✅ verified | gear click opens a real titled layer-0 window (`BNT Settings` 560x652; `computer_use_list_windows` sees it — the first window tool ever to see anything for this app) with 16 native click-driven controls in one `NSGridView`: 4 `NSSlider`, 6 `NSPopUpButton`, 2 `NSSwitch`, 1 `NSSegmentedControl`, 3 `NSColorWell` (+ 16 display `NSBox` ANSI swatches + About text). Verified: a real pixel click on the Ligatures `NSSwitch` flipped it (`BNT.ligatures` true->false in the plist, knob moved right->left); a color well opened the native `NSColorPanel` popover; the panel stayed open (461pt) through every in-window click (collapse guard works). The in-panel overlay is DELETED (-572 lines). See lessons 48-51. |
 | Shell exit self-destruct | ⚠️ built, not driver-verifiable | `Event::Exit` (post-drain) sets `Arc<AtomicBool>` dead flag; `tick` → `reap_dead_sessions()` tears down via `Msg::Shutdown` (reader thread returns → `Pty::Drop` SIGHUPs the child). Needs a real `exit` keystroke to exercise. |
 
 ## The tab-bar defect — root cause (fixed 2026-10-09)
@@ -548,6 +548,45 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     still not driver-verifiable (NSTrackingArea `mouseMoved:` never fires for
     synthetic pointer moves — same limitation as keystrokes), so the `×` path is
     verified by construction, not by a synthetic click.
+
+48. **A separate native settings window beats the hand-drawn overlay** for every
+    setting: the notch panel is a non-activating layer-27 `NSPanel` and can never
+    take key focus, but a normal `NSWindow` is a different object entirely —
+    `computer_use_list_windows` sees it, `get_window_state` returns a real AX tree,
+    and native AppKit controls (`NSSlider`/`NSPopUpButton`/`NSSwitch`/
+    `NSColorWell`/`NSSegmentedControl`) come free from `objc2-app-kit`, already a
+    dependency. The overlay (~572 lines of hand-drawn chevrons/wells/rows) is
+    deleted; the gear glyph + `gear_rect` stay as the affordance and now only
+    open/refocus the window.
+
+49. **`sel!(applyKnob:)` with a trailing colon PANICS at window build.**
+    `objc2`'s `define_class!` asserts at runtime that the selector's argument
+    count matches the Rust method's arity:
+    `assertion failed: selector applyKnob: accepts 1 arguments, but function
+    accepts 0`. The panic fires when the first control is built, killing the
+    whole app — which looks like "the window never appears" rather than an
+    error. A zero-argument handler needs the colon-FREE selector:
+    `#[unsafe(method(applyKnob))]` + `sel!(applyKnob)`, in BOTH the method
+    declaration and every `setTarget:`/`setAction:` site.
+
+50. **A click inside the settings window COLLAPSED the open notch.** The global
+    `LeftMouseDown` monitor receives clicks delivered to the frontmost app, and
+    `click_at_screen_point` hit-tests them as OUTSIDE the panel frame ->
+    `collapse()` (measured: 461pt -> 33pt pill). Fix: before EVERY dismissal
+    branch, bail when the click point is inside
+    `settings_window::window_frame(&ivars.settings_owner)`. The guard reads the
+    LIVE frame, so a user drag of the movable window keeps it correct; a click
+    in the window's titlebar is swallowed too (still our window — intended).
+
+51. **`Accessory` activation policy does NOT block the settings window.**
+    `bring_to_front` succeeds on it (the notch panel refuses), and a real
+    foreground PIXEL click flips an `NSSwitch` (knob x 888-948 -> 924-984).
+    What IS blocked: background synthetic input is refused
+    (`minimized_or_hidden_window`) because the app is hidden, and `AXPress`
+    does nothing — test these controls with pixel clicks, never AX. Typing is
+    still unproven, so the UI is click-driven only: sliders, popup menus,
+    switches, color wells, segmented controls, static labels — no editable
+    `NSTextField`, no typed chord entry.
 
 ## Repo / process rules
 

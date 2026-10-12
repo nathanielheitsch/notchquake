@@ -16,6 +16,7 @@ pub mod notch_view;
 pub mod terminal;
 pub mod render;
 pub mod settings;
+pub mod settings_window;
 
 
 use std::cell::OnceCell;
