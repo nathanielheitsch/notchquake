@@ -31,7 +31,7 @@ use objc2_core_foundation::{
     CGRect,
     CGSize,
 };
-use objc2_core_graphics::{CGColor, CGContext};
+use objc2_core_graphics::{CGColorSpace, CGColor, CGGradient, CGGradientDrawingOptions, CGContext};
 use objc2_core_foundation::{
     CFMutableAttributedString,
     CFRange,
@@ -120,6 +120,11 @@ const DOT_ERROR: (CGFloat, CGFloat, CGFloat) = rgb(0xE0, 0x43, 0x43);
 /// read as "this tab is coloured" without hiding the selected/inactive
 /// distinction (which is a 6/255 fill delta, far smaller than 25%).
 const TINT_MIX: CGFloat = 0.25;
+
+/// How far the header's shadow fade reaches down into the grid (pt): the band
+/// of terminal-bg color that fades from opaque at the header edge to clear, so
+/// the top text rows fade away under the bar instead of meeting a hard line.
+const SHADOW_FADE: CGFloat = 32.0;
 
 /// Extra inset beyond the silhouette's own chin radius. 0.0 means the strip
 /// spans the FULL silhouette width, and `tab_strip` therefore ignores
@@ -518,11 +523,10 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
             // or `draw_grid` matches `_ => {}` and the terminal renders blank.
             ivars.selected.set(Some(count - 1));
         }
-        // The header bar: a filled block hugging the menu-bar edge, height
-        // = the measured notch height, so the grid can never slide under
-        // the notch. Empty for now (buttons later). Drawn before the grid
-        // so the grid cannot overpaint it, inside the silhouette clip.
-        CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TAB_FILL)));
+        // The header bar: filled with the TERMINAL background color (settings
+        // #7) so it is seamless with the grid below; the shadow band drawn
+        // after the grid (see below) is what separates it visually.
+        CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(settings.background.rgb())));
         CGContext::fill_rect(
             ctx,
             CGRect::new(
@@ -530,18 +534,12 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 CGSize::new(w, header),
             ),
         );
-        // Separator between the header box and the terminal, LINE color.
-        CGContext::begin_path(ctx);
-        CGContext::move_to_point(ctx, (PANEL_WIDTH - w) / 2.0, PANEL_HEIGHT - header);
-        CGContext::add_line_to_point(ctx, (PANEL_WIDTH + w) / 2.0, PANEL_HEIGHT - header);
-        CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(LINE)));
-        CGContext::set_line_width(ctx, 1.0);
-        CGContext::stroke_path(ctx);
+        // No hard separator line: the shadow fade band (drawn AFTER the grid
+        // so text fades under it) replaces it.
         // The gear button, top-right of the header band, flush to the open
         // silhouette's right edge and vertically centered in the header. Drawn
-        // AFTER the header fill + separator so it sits on top of the header
-        // block, and BEFORE the grid/settings match so the grid can never
-        // overpaint it (the grid starts below the separator anyway).
+        // AFTER the header fill so it sits on top of the header block, and
+        // BEFORE the grid/settings match so the grid can never overpaint it.
         let (gear_x0, gear_y0, gear_x1, gear_y1) = gear_rect(w, header);
         draw_gear(ctx, (gear_x0 + gear_x1) / 2.0, (gear_y0 + gear_y1) / 2.0, ivars.settings_hovered.get());
 
@@ -567,6 +565,12 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
               }
               _ => {}
             }
+            // The shadow fade: a band of the TERMINAL background color, opaque
+            // at the header's bottom edge and fading to transparent ~32pt down,
+            // drawn AFTER the grid so the top row of text fades away under it
+            // instead of meeting a hard line. Cohesive: the bar and the terminal
+            // share one color, the fade is the only separation.
+            draw_header_shadow(ctx, w, header, settings.background.rgb())
         }
     }
 
@@ -601,11 +605,10 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
             // error (7501 `error` or 9;4 `st=2`) > done (7501 `done`) > blue
             // activity (a command finished / 133;D). ONE dot only, so a tab
             // with several states still shows a single marker. Drawn only when
-            // the `×` is NOT drawn for this tab — the `×` appears on
-            // selected/hovered tabs, so the two are mutually exclusive by
-            // construction and can never collide in the shared `TAB_CLOSE_W`
-            // gutter. The dot is a FILL (never a stroke: fill and stroke colour
-            // are separate CGContext state).
+            // the tab is neither selected nor hovered: the `×` occupies the same
+            // gutter on a hovered tab, and the selected tab is the one being
+            // looked at. The dot is a FILL (never a stroke: fill and stroke
+            // colour are separate CGContext state).
             let looking = Some(index) == selected || hovered == Some(index);
             let active = sessions.get(index).map(|s| s.has_activity()).unwrap_or(false);
             if !looking {
@@ -709,11 +712,12 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
             let hint = format!("\u{2318}{}", index + 1);
             draw_tab_hint(ctx, Some(hint_font), &hint, x, chin_y, tab_w, HINT_ACCENT);
         }
-        // The `×` close affordance: shown on the ACTIVE tab always, and on any
-        // hovered tab. LEFT-aligned in the tab (reference style). Drawn AFTER
-        // the labels so a long title cannot overpaint it.
+        // The `×` close affordance: shown ONLY on a HOVERED tab (not the
+        // active one) — the pointer has to be on the tab to see/close it. LEFT-
+        // aligned in the tab (reference style). Drawn AFTER the labels so a
+        // long title cannot overpaint it.
         for index in 0..count {
-            if Some(index) == selected || hovered == Some(index) {
+            if hovered == Some(index) {
                 let x = left + index as CGFloat * tab_w;
                 let (cx, cy) = close_center(x, chin_y);
                 // The reference style puts the `×` inside a rounded dark
@@ -1235,6 +1239,42 @@ fn draw_settings(ctx: Option<&CGContext>, ivars: &NotchViewIvars, w: CGFloat, he
 fn header_height(ivars: &NotchViewIvars) -> CGFloat {
     let (_, n) = ivars.notch.get();
     if n < 1.0 { CLOSED_HEIGHT } else { n }
+}
+
+/// The shadow fade under the header bar: a band of the TERMINAL background
+/// color, opaque at the header's bottom edge and fading to transparent `SHADOW_FADE`
+/// pt down, drawn AFTER the grid so the top text rows fade away under it. The
+/// header itself is filled with the same background color, so the bar reads as
+/// a soft shadow over the terminal rather than a hard-edged block.
+fn draw_header_shadow(ctx: Option<&CGContext>, w: CGFloat, header: CGFloat, bg: (CGFloat, CGFloat, CGFloat)) {
+    let (r, g, b) = bg;
+    let space = CGColorSpace::new_device_rgb();
+    // Two stops: opaque terminal-bg at the top, fully clear at the bottom.
+    let components = [r, g, b, 1.0, r, g, b, 0.0];
+    let stops = [0.0, 1.0];
+    let gradient = match space {
+      None => None,
+      Some(space) => unsafe {
+        CGGradient::with_color_components(Some(&*space), components.as_ptr(), stops.as_ptr(), 2)
+      },
+    };
+    // y-up space: the band hangs from the header's bottom edge (y = PANEL_HEIGHT
+    // - header) down `SHADOW_FADE` pt. Opaque at the START point (top), clear at
+    // the END point (bottom); DrawsAfterEndLocation extends the clear tail so a
+    // partial band never shows a hard edge.
+    let x0 = (PANEL_WIDTH - w) / 2.0;
+    CGContext::save_g_state(ctx);
+    CGContext::begin_path(ctx);
+    CGContext::add_rect(ctx, CGRect::new(CGPoint::new(x0, PANEL_HEIGHT - header - SHADOW_FADE), CGSize::new(w, SHADOW_FADE)));
+    CGContext::clip(ctx);
+    CGContext::draw_linear_gradient(
+        ctx,
+        gradient.as_ref().map(|g| &**g),
+        CGPoint::new(x0, PANEL_HEIGHT - header),
+        CGPoint::new(x0, PANEL_HEIGHT - header - SHADOW_FADE),
+        CGGradientDrawingOptions::DrawsAfterEndLocation,
+    );
+    CGContext::restore_g_state(ctx);
 }
 
 /// Move the session vec out of its `Cell` (leaves `vec![]` behind); pair
@@ -2036,7 +2076,11 @@ impl NotchView {
                 let x0 = left + index as CGFloat * tab_w;
                 if x >= x0 && x <= x0 + tab_w {
                     let (cx, cy) = close_center(x0, chin_y);
-                    let on_close = (ivars.hovered.get() == Some(index) || ivars.selected.get() == Some(index))
+                    // The `×` exists only on a HOVERED tab (the pointer got
+                    // there via `mouseMoved:` before the click), so the hit-
+                    // test matches the draw: a click in an un-hovered tab's
+                    // gutter just selects the tab.
+                    let on_close = ivars.hovered.get() == Some(index)
                         && (x - cx).abs() <= CLOSE_HIT && (y - cy).abs() <= CLOSE_HIT;
                     if on_close {
                         self.close_tab(index);

@@ -89,9 +89,9 @@ window capture for alpha, the desktop capture for the composited result.
 | Click closed pill → open | ✅ verified | synthetic click on the pill toggles open (via `mouseDown:` for real clicks / global monitor fallback) |
 | Scroll wheel → history | ✅ wired | ONE global `ScrollWheel` monitor → `scroll_wheel()`; alacritty `Scroll::Delta`, `BNT_SCROLLBACK` (default 10000). Wheel events proven to reach the handler (40× dy=-1 logged). Grid visibly moves only when the session has scrollback history — a fresh login shell has none, so `display_offset` clamps to 0. |
 | Click outside panel → collapse | ✅ built | `click_at_screen_point` collapses an open panel on an outside click; idempotent `expand`/`collapse` so both click paths land once. |
-| Header bar (notch height, open state) | ✅ verified | desktop capture: grid text starts at y≈50pt = notch 33 + GRID_TOP_PAD 22; the notch-height block above it is reserved (empty for now, buttons later). `row_rect`/`draw_grid` take a `header` param; `grid_dims` reserves the same inset. |
+| Header bar (notch height, open state) | ✅ verified | desktop capture: grid text starts at y≈50pt = notch 33 + GRID_TOP_PAD 22; the notch-height block above it is reserved. **Restyled 2026-10-12**: the header fill IS `settings.background` (seamless with the terminal), the hard LINE separator is gone, and `draw_header_shadow` fades a 32pt band of terminal-bg color over the top grid rows AFTER the grid (verified by pixel measurement: top row max lum 181/216 ≈ the gradient alpha at that depth, full brightness by 65pt). See lesson 46. |
 | Dynamic tabs: `+` spawns | ✅ verified | synthetic click on the `+` grew the strip from 3 to 4 tabs (labels reflowed, tab_w shrank). `sessions` is a live `Cell<Vec<Session>>`; `tab_strip(h,w,count)` is the single source of truth for renderer + hover + click. |
-| Tab close via `×` (selected or hovered) | ✅ verified | click on the `×` of the SELECTED tab fires `close_tab` (the affordance is drawn on hovered OR selected, and the hit-test accepts either). Verified lifecycle: 1 tab → `+` → 2 → ⌘T → 3 → `×` → 2 tabs; closing the LAST tab collapses to the 33pt pill. Closing a live tab no longer hangs the app (see lesson 35). |
+| Tab close via `×` (hover only) | ✅ verified (by construction) | click on the `×` fires `close_tab`. **Changed 2026-10-12**: the `×` draws ONLY on a HOVERED tab (not the active one) and the hit-test matches (`hovered.get() == Some(index)` only) — see lesson 47. Verified lifecycle (before the change): 1 tab → `+` → 2 → ⌘T → 3 → `×` → 2 tabs; closing the LAST tab collapses to the 33pt pill. Closing a live tab no longer hangs the app (see lesson 35). |
 | Settings menu (gear + overlay) | ✅ verified | gear button top-right of the open header; click toggles a settings overlay (Geometry/Font/Colors/Scrollback/Hotkeys/Bell rows). Controls: `< value >` chevrons (cycle/step), toggle switches, color wells. Persists via `NSUserDefaults` (bundle id `local.bnt` → `~/Library/Preferences/local.bnt.plist`). See lessons 40-45. |
 | Shell exit self-destruct | ⚠️ built, not driver-verifiable | `Event::Exit` (post-drain) sets `Arc<AtomicBool>` dead flag; `tick` → `reap_dead_sessions()` tears down via `Msg::Shutdown` (reader thread returns → `Pty::Drop` SIGHUPs the child). Needs a real `exit` keystroke to exercise. |
 
@@ -523,6 +523,31 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     is set) so Option+Space=2049 and Cmd+Space=257 are DISTINCT. `CHORD_PRESETS`
     is the cycle ring; a chord change persists and takes effect at the next launch
     (verified: Cmd+Space toggle persisted, Option+Space inert on relaunch).
+
+46. **The header bar is seamless with the terminal, not a separate block.** It
+    is filled with `settings.background.rgb()` (NOT `TAB_FILL`) and there is no
+    hard separator stroke. The visual separation is `draw_header_shadow`: a
+    `SHADOW_FADE` (32pt) band of the SAME terminal-bg color, a two-stop
+    `CGGradient` (opaque → alpha-0), drawn AFTER the grid so the top text rows
+    fade away under the bar instead of meeting a line. CGGradient in objc2:
+    `CGGradient::with_color_components(space, components.as_ptr(), stops.as_ptr(),
+    n)` (device-RGB components, 4 floats/stop) — no CFArray needed; `CGColorSpace::
+    new_device_rgb()` returns `Option<CFRetained<…>>` and the C wrappers want
+    `Option<&T>`, so bind the CFRetained in a `match`/`as_ref` and pass `&*` —
+    a `.map(|s| &*s)` closure returns a dangling borrow (E0515/E0597). Clip the
+    band with `begin_path` + `add_rect` + `clip` (NOT `set_clip_path`), then
+    `draw_linear_gradient` start=header-edge (opaque) end=below (clear) with
+    `DrawsAfterEndLocation`. The band lives in the GRID branch only (settings
+    replaces the grid, so no fade there).
+
+47. **The `×` affordance is hover-only now** (the active tab no longer shows it):
+    draw `if hovered == Some(index)`, hit-test `hovered.get() == Some(index)` —
+    draw and hit-test must stay the same predicate or a click can hit an
+    invisible `×`. The attention dot keeps `looking = selected || hovered` so a
+    selected tab still never shows a dot in the `×` gutter. Hover itself is
+    still not driver-verifiable (NSTrackingArea `mouseMoved:` never fires for
+    synthetic pointer moves — same limitation as keystrokes), so the `×` path is
+    verified by construction, not by a synthetic click.
 
 ## Repo / process rules
 
