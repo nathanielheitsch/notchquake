@@ -57,7 +57,7 @@ fn visible_frame(screen: &NSScreen) -> NSRect {
     screen.visibleFrame()
 }
 
-use crate::consts::{PANEL_HEIGHT, PANEL_WIDTH};
+use crate::consts::{PANEL_HEIGHT, PANEL_WIDTH_FALLBACK};
 
 /// True when the display has a physical notch: the two menu-bar halves
 /// leave a real gap in the middle (on a flat display they span the full
@@ -96,9 +96,9 @@ pub fn notch_size(screen: &NSScreen) -> (CGFloat, CGFloat) {
 /// The panel's frame in AppKit (bottom-left origin) screen coordinates, given
 /// the main screen's frame. The panel hangs from the top edge of the screen,
 /// horizontally centred.
-pub fn panel_origin(screen: NSRect) -> NSPoint {
+pub fn panel_origin(screen: NSRect, canvas: CGFloat) -> NSPoint {
     NSPoint::new(
-        screen.origin.x + screen.size.width / 2.0 - PANEL_WIDTH / 2.0,
+        screen.origin.x + screen.size.width / 2.0 - canvas / 2.0,
         screen.origin.y + screen.size.height - PANEL_HEIGHT,
     )
 }
@@ -106,7 +106,9 @@ pub fn panel_origin(screen: NSRect) -> NSPoint {
 /// Creates (but does not show) the panel window, and returns it together with
 /// its content view.
 pub fn create_panel(mtm: MainThreadMarker) -> (Retained<NSPanel>, Retained<NSView>) {
-    let origin = notch_screen_origin(mtm);
+    let screen = notch_screen(mtm).expect("there is always a screen");
+    let canvas = canvas_width(&screen);
+    let origin = panel_origin(screen.frame(), canvas);
     let this = NotchPanel::alloc(mtm).set_ivars(());
     // Call the inherited `NSPanel` designated initialiser via the superclass
     // (`msg_send![super(this), ...]`). `set_ivars(())` advances
@@ -116,7 +118,7 @@ pub fn create_panel(mtm: MainThreadMarker) -> (Retained<NSPanel>, Retained<NSVie
     // so we dispatch through super. Returns `Retained<NotchPanel>`; upcast to
     // `Retained<NSPanel>` for the caller.
     let panel: Retained<NotchPanel> = unsafe {
-        msg_send![super(this), initWithContentRect: NSRect::new(origin, NSSize::new(PANEL_WIDTH, PANEL_HEIGHT)) styleMask: NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel | NSWindowStyleMask::UtilityWindow | NSWindowStyleMask::HUDWindow backing: NSBackingStoreType::Buffered defer: false]
+        msg_send![super(this), initWithContentRect: NSRect::new(origin, NSSize::new(canvas, PANEL_HEIGHT)) styleMask: NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel | NSWindowStyleMask::UtilityWindow | NSWindowStyleMask::HUDWindow backing: NSBackingStoreType::Buffered defer: false]
     };
     let panel: Retained<NSPanel> = panel.into_super();
 
@@ -142,13 +144,35 @@ pub fn create_panel(mtm: MainThreadMarker) -> (Retained<NSPanel>, Retained<NSVie
 
     panel.orderFrontRegardless();
 
+    // Re-assert the canvas size before the content view is taken: `NSView::setFrame`
+    // is parent-relative, so an explicit size avoids inheriting a content rect
+    // AppKit derived against the notch inset. (`NSWindow` has no `setFrameSize:` —
+    // that is an `NSView` method — so the full-frame setter `setFrame:display:` is
+    // the API-faithful equivalent of the plan's re-assert.)
+    panel.setFrame_display(NSRect::new(origin, NSSize::new(canvas, PANEL_HEIGHT)), true);
+
     let content_view = panel.contentView().expect("a panel always has a content view");
     (panel, content_view)
+}
+
+/// The canvas (window) width for `screen`: the display's logical width.
+pub fn canvas_width(screen: &NSScreen) -> CGFloat {
+    screen.frame().size.width
+}
+
+/// The canvas width to size the panel window to: the notch display's logical
+/// width, falling back to `PANEL_WIDTH_FALLBACK` when no screen resolves
+/// (mirrors `notch_screen_origin`'s `expect`).
+pub fn canvas_size(mtm: MainThreadMarker) -> CGFloat {
+    match notch_screen(mtm) {
+      Some(screen) => canvas_width(&screen),
+      _ => PANEL_WIDTH_FALLBACK,
+    }
 }
 
 /// The window's frame origin for the notch display (see `panel_origin`).
 fn notch_screen_origin(mtm: MainThreadMarker) -> NSPoint {
     let screen = notch_screen(mtm).expect("there is always a screen");
-    panel_origin(screen.frame())
+    panel_origin(screen.frame(), canvas_width(&screen))
 }
 

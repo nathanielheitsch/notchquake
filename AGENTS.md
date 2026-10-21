@@ -490,7 +490,10 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     reads a stale in-memory cache, not the plist. (d) `key_name` applies the
     `BNT.` prefix EXACTLY once; `channel_key` returns a bare SUFFIX (`bg.r`).
     Double-prefixing (prefix in both) wrote `BNT.BNT.bg.r` and left chord keys
-    single-prefixed, so `load` read a different key than `save` wrote.
+    single-prefixed, so `load` read a different key than `save` wrote. (e) The
+    store is resolved by `defaults_store()`, which honours `BNT_DEFAULTS_SUITE`
+    and falls back to `standardUserDefaults()`; verification runs MUST set it so
+    a click pass cannot write real preferences (see lesson 52).
 
 42. **The settings overlay is a click-driven UI, no text entry.** The panel
     can't take key focus while another app is frontmost, so values are edited
@@ -587,6 +590,54 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     still unproven, so the UI is click-driven only: sliders, popup menus,
     switches, color wells, segmented controls, static labels — no editable
     `NSTextField`, no typed chord entry.
+
+52. **A verification click pass wrote REAL preferences and bricked the hotkey.**
+    Driving the settings window persists every change through `Settings::save`
+    — so a pass that cycles the toggle chord wrote `BNT.toggle.mods = 257`
+    (Cmd+Space) into the user's actual `local.bnt.plist`, and it was never
+    reverted. Result: Option+Space no longer matched the registered chord, and
+    Cmd+Space IS registered but is swallowed by Spotlight before the app sees
+    it, so the app became unreachable by hotkey. Fix: `Settings::load`/`save`
+    now resolve their store through `defaults_store()`, which honours
+    `BNT_DEFAULTS_SUITE` — run verification as
+    `BNT_DEFAULTS_SUITE=bnt-verify open -n BNT.app` so every read AND write
+    lands in a throwaway domain. Unset (normal use) it is
+    `standardUserDefaults()`. **Rule: never drive the settings window against
+    the default suite.**
+
+53. **A stale renamed binary steals the exclusive Carbon hotkey.** A
+    `RegisterEventHotKey` chord is exclusive per process, so a second instance
+    holding Option+Space wins it and the real app is silent. `launch.sh` only
+    killed `BNT.app/Contents/MacOS/BNT`, so a `/tmp/bnt-rt` left over from the
+    lesson-41c cross-process test kept running for HOURS and ate the chord
+    (symptom: the hotkey "stopped working", Option+Space just typed a space).
+    Fix: `launch.sh` now also `pkill -f bnt-rt`. Check for strays with
+    `ps ax | grep -iE 'BNT|bnt-rt'` whenever the hotkey goes dead.
+
+54. **Open width is a canvas problem, not a slider problem.** `WIDTH_MAX` was
+    `PANEL_WIDTH` AND the panel window was created once at 640×620 and never
+    resized — two ceilings numerically equal, so maxing the slider still painted
+    a 640pt panel on a 1710pt display. Fix: the canvas = the notch display's
+    logical width, sized ONCE at startup (`window.rs::canvas_size` threaded into
+    `panel_origin`, `initWithContentRect`, `setFrame_display`, the view frame in
+    `main.rs`, and a new `canvas: Cell<CGFloat>` ivar read everywhere geometry is
+    drawn); `PANEL_WIDTH` survives ONLY as the `open_width` default and the
+    `PANEL_WIDTH_FALLBACK`. Three traps found while landing it: (a) `grid_dims`
+    must bake columns from `settings.open_width`, NEVER the live spring `w` —
+    spawn runs on the first open frame while `w` is still the ~212pt notch width;
+    (b) `click_at_screen_point` gained an x-gate from `ivars.width.get()` so a
+    click beside the terminal INSIDE the widened canvas still collapses (the old
+    code hit-tested the panel-frame rect, which is now full-screen); (c) the
+    tracking-area ivar CANNOT be `Cell<Option<Retained<…>>>` (`get()`/`update`
+    need `T: Copy`) — use the lesson-17 move-out/move-back `Cell<Vec<…>>`
+    idiom with a `tracking_canvas` sentinel to reinstall on canvas change. The
+    settings-window x centering must switch with `panel_origin`: with the canvas
+    as its left edge, `(PANEL_WIDTH - WINDOW_W)/2` pins the window to the screen
+    edge — it is `(frame.size.width - WINDOW_W)/2` now. Verified live by seeding
+    `bnt-verify.plist` `BNT.openWidth` as a plist `<real>` (the `defaults` CLI
+    stores strings; `get_sized` needs numbers): silhouette 1600pt, window-local
+    alpha capture shows tab titles out to ~1746pt, closed pill unchanged at
+    189pt/33pt. Live x-gate click test NOT run (see notes).
 
 ## Repo / process rules
 

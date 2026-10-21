@@ -38,7 +38,7 @@ use objc2_core_foundation::kCFBooleanTrue;
 use std::ptr::null;
 
 use crate::settings::{CursorShape, Settings};
-use crate::consts::{PANEL_HEIGHT, PANEL_WIDTH};
+use crate::consts::{PANEL_HEIGHT};
 use crate::terminal::CellSnapshot;
 
 /// Horizontal padding of the grid inside the silhouette (each side).
@@ -53,11 +53,13 @@ const CURSOR_ALPHA: CGFloat = 0.85;
 /// Thickness of the bar/underline cursor, as a fraction of the cell it sits in.
 const CURSOR_STROKE_FRACTION: CGFloat = 0.12;
 
-/// Paint the grid background rects, then every text run, then the cursor.
-///
-/// `grid` is top-to-bottom; rows below the silhouette's current bottom edge
-/// (`height`) are skipped — the clip already wipes them, this only avoids
-/// off-screen work.
+/// `x0` is the grid's left edge in CANVAS space (the silhouette's left edge
+/// plus `GRID_PAD`, supplied by `notch_view.rs::draw`), and `usable` is the
+/// width the grid may occupy — the live silhouette's inner width. Column
+/// counting uses `usable`, so the grid reflows with the silhouette; the
+/// session's own row/col count is baked from `settings.open_width` at spawn
+/// (see `grid_dims`). Vertical placement is unchanged: `row_rect` still hangs
+/// rows from `PANEL_HEIGHT`.
 pub fn draw_grid(
     ctx: &CGContext,
     grid: &[Vec<CellSnapshot>],
@@ -68,11 +70,11 @@ pub fn draw_grid(
     height: CGFloat,
     header: CGFloat,
     settings: &Settings,
+    x0: CGFloat,
+    usable: CGFloat,
 ) {
     let ctx_opt = Some(ctx);
     let cols = if grid.is_empty() { 0 } else { grid[0].len() };
-    let x0 = GRID_PAD;
-    let usable = PANEL_WIDTH - 2.0 * GRID_PAD;
     let used_cols = if cell_width > 0.0 { (usable / cell_width).floor() as usize } else { cols };
     let used_cols = if used_cols < cols { used_cols } else { cols };
 

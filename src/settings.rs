@@ -19,8 +19,12 @@
 //! `setDouble:`/`setInteger:`/`setBool:` persist asynchronously on their own;
 //! `synchronize()` is deprecated and not needed.
 
+use objc2::rc::Retained;
+use objc2::AnyThread;
 use objc2_foundation::{NSInteger, NSString, NSUserDefaults};
 use objc2_core_foundation::CGFloat;
+use objc2_foundation::MainThreadMarker;
+use objc2_app_kit::NSScreen;
 
 use core::ffi::c_double;
 use crate::consts::{
@@ -78,8 +82,11 @@ pub struct Chord {
 /// are the `FONT_FAMILIES` literals, so a static name is enough.
 #[derive(Clone, Copy)]
 pub struct Settings {
-    // Geometry — points, clamped to the fixed 640×620 canvas (the panel
-    // window is never resized, so an open size beyond these is impossible).
+    // Geometry — points. The upper bound is the notch display's logical width
+    // (`screen.rs::display_width`) / `PANEL_HEIGHT`, sized at startup and re-read
+    // on a display change — NOT a fixed 640×620 canvas: 640 is only the default
+    // on the default 640pt-wide display. `Settings::load` clamps against the live
+    // canvas so a wider display can actually be reached by the width slider.
     pub open_height: CGFloat,
     pub open_width: CGFloat,
 
@@ -341,14 +348,60 @@ impl Settings {
             finished_notify_secs: 5.0,
         }
     }
+}
 
+/// The store every knob is read from and written to.
+///
+/// Normally this is `standardUserDefaults()` — the app's own search list, no
+/// suite name, so there is no `-init` instance to keep alive. Verification
+/// builds set `BNT_DEFAULTS_SUITE` to divert every read AND write into a
+/// throwaway domain, so driving the settings window cannot mutate the real
+/// `~/Library/Preferences/local.bnt.plist`. (A click pass that persisted
+/// `BNT.toggle.mods = 257` — Cmd+Space — into the real plist once left the
+/// app unreachable by hotkey: Option+Space no longer matched the registered
+/// chord, and Cmd+Space is swallowed by Spotlight.)
+///
+/// `initWithSuiteName:` returns `None` for an empty name, which reads as "no
+/// store" — the caller then keeps `Settings::default()` rather than
+/// persisting anywhere.
+fn defaults_store() -> Option<Retained<NSUserDefaults>> {
+    match std::env::var("BNT_DEFAULTS_SUITE") {
+        Ok(suite) if !suite.is_empty() => {
+            let name = NSString::from_str(&suite);
+            NSUserDefaults::initWithSuiteName(NSUserDefaults::alloc(), Some(&name))
+        }
+        _ => Some(NSUserDefaults::standardUserDefaults()),
+    }
+}
+
+/// The widest display's logical width in points, or `0.0` when no screen
+/// resolves. Reads `NSScreen` directly with the local import above — `window.rs::notch_screen`
+/// is private to that module and must not be reached from settings. `pub` so
+/// `settings_window.rs::width_max` can feed the SAME value to the slider rail
+/// and the `apply_knob_value` clamp as this module's `load` clamp uses.
+/// shortcut: max over screens, not the notch display specifically — the panel
+/// itself is sized to `notch_screen`'s pick, which differs only on a
+/// multi-display setup, and the extra headroom only widens a slider rail.
+pub fn display_width() -> CGFloat {
+    let screens = match MainThreadMarker::new() {
+      Some(mtm) => NSScreen::screens(mtm),
+      _ => return 0.0,
+    };
+    let mut w: CGFloat = 0.0;
+    for screen in screens.iter() { w = w.max(screen.frame().size.width) }
+    w
+}
+
+impl Settings {
     /// Read the stored preferences, falling back to `default()` per knob.
     /// `integerForKey:`/`doubleForKey:`/`boolForKey:` read 0 for an absent key,
     /// so every knob is probed for presence (`objectForKey:`) before it is
     /// accepted, and every numeric knob is clamped to its legal range.
     pub fn load() -> Settings {
         let base = Settings::default();
-        let defaults = NSUserDefaults::standardUserDefaults();
+        let Some(defaults) = defaults_store() else {
+            return base;
+        };
 
         let has_key = |key: &str| -> bool {
             let name = NSString::from_str(&key_name(key));
@@ -416,7 +469,7 @@ impl Settings {
 
         Settings {
             open_height: get_sized("openHeight", CLOSED_HEIGHT + 80.0, PANEL_HEIGHT - 20.0, base.open_height),
-            open_width: get_sized("openWidth", NOTCH_WIDTH, PANEL_WIDTH, base.open_width),
+            open_width: get_sized("openWidth", NOTCH_WIDTH, PANEL_WIDTH.max(display_width()), base.open_width),
             font_family: FONT_FAMILIES[get_index("fontFamily", FONT_FAMILIES.len())],
             font_size: get_sized("fontSize", 8.0, 32.0, base.font_size),
             ligatures: !has_key("ligatures") || get_bool("ligatures"),
@@ -443,7 +496,9 @@ impl Settings {
     /// cheap and persist asynchronously (`synchronize` is deprecated and
     /// unnecessary).
     pub fn save(&self) {
-        let defaults = NSUserDefaults::standardUserDefaults();
+        let Some(defaults) = defaults_store() else {
+            return;
+        };
 
         let set_double = |key: &str, value: CGFloat| {
             let name = NSString::from_str(&key_name(key));

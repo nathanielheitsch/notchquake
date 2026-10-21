@@ -39,6 +39,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
     NSBackingStoreType,
     NSBox,
+    NSBoxType,
     NSColor,
     NSColorSpace,
     NSColorWell,
@@ -47,7 +48,11 @@ use objc2_app_kit::{
     NSControlStateValueOn,
     NSGridView,
     NSMenu,
+    NSTabView,
+    NSTabViewItem,
+    NSTabViewType,
     NSMenuItem,
+    NSTitlePosition,
     NSPopUpButton,
     NSSegmentSwitchTracking,
     NSSegmentedControl,
@@ -98,33 +103,56 @@ use crate::window::{notch_screen, panel_origin};
 use crate::notch_view::NotchView;
 
 // ── Window geometry ───────────────────────────────────────────────────────
-/// The window is sized to its content: 24 grid rows (15 knob rows + 2 ANSI
-/// picker rows + 1 ANSI swatch row + 6 About rows) at the grid's natural row
-/// height, plus the titlebar. A fixed frame is enough because `NSGridView`
-/// does its own internal sizing.
+/// The window is sized to its TALLEST tab, not to the whole control surface:
+/// the knobs live in an `NSTabView` with one `NSGridView` per section, and the
+/// tallest tab (Colors: 3 color wells + 2 popup pickers + the 16-swatch palette
+/// row = 6 rows) plus the tab row and bezel is what must fit. A FIXED frame is
+/// deliberate: a resize on tab switch would move the window frame, which the
+/// collapse guard in `notch_view.rs` hit-tests.
 const WINDOW_W: CGFloat = 560.0;
-const WINDOW_H: CGFloat = 620.0;
-/// Grid placement inside the window's content view. The titlebar sits ABOVE
-/// the content view (it is not part of it), so the content view is exactly the
-/// content rect in the window's own y-up space: the grid's bottom-left is
-/// `(inset, inset)`.
+const WINDOW_H: CGFloat = 288.0;
+/// Placement of the `NSTabView` inside the window's content view. The titlebar
+/// sits ABOVE the content view (it is not part of it), so the content view is
+/// exactly the content rect in the window's own y-up space: the tab view's
+/// bottom-left is `(inset, inset)`.
 const GRID_INSET_X: CGFloat = 20.0;
 const GRID_INSET_Y: CGFloat = 16.0;
+/// Margin between the tab view's content rect and the section grid inside it.
+/// `TopTabsBezelBorder` draws a bezel around the content area; the grid is its
+/// child, so this inset keeps the first row of controls off that border.
+const GRID_BEZEL_MARGIN: CGFloat = 4.0;
 
-/// Slider value ranges. The geometry knobs are clamped to the fixed 640×620
-/// canvas (the panel window is never resized), the font/notify knobs to the
-/// ranges `Settings::load` accepts. Kept in sync with `settings.rs`.
+/// Slider value ranges. Height is clamped to the panel canvas (`PANEL_HEIGHT`);
+/// width is clamped to the RUNTIME notch display canvas — the notch window is
+/// sized to the display's logical width at startup (see `window.rs::canvas_width`
+/// and `notch_view.rs::reposition`), so the width slider's rail must physically
+/// reach the screen width on a wider display, not stop at the 640pt default.
+/// Width therefore comes from `width_max()` (which reads the same `NSScreen`
+/// helper as `Settings::load`), so the slider rail and the `apply_knob_value`
+/// clamp cannot drift. Height stays compile-time because `PANEL_HEIGHT` never
+/// changes. Kept in sync with `settings.rs`.
 const HEIGHT_MIN: CGFloat = CLOSED_HEIGHT + 80.0;
 const HEIGHT_MAX: CGFloat = PANEL_HEIGHT - 20.0;
 const WIDTH_MIN: CGFloat = NOTCH_WIDTH;
-const WIDTH_MAX: CGFloat = PANEL_WIDTH;
 const FONT_MIN: CGFloat = 8.0;
 const FONT_MAX: CGFloat = 32.0;
+/// The runtime upper bound for the open-width knob: the live notch canvas
+/// (the notch display's logical width), floored at `WIDTH_MIN` so a degenerate
+/// screen lookup cannot invert the range. Consumed by BOTH the slider rail
+/// (`grid_for_section`) and the `apply_knob_value` clamp, and it is the same
+/// `NSScreen` read `Settings::load` clamps against, so the three sites —
+/// rail, clamp and settings load — cannot disagree.
+pub fn width_max() -> CGFloat {
+    WIDTH_MIN.max(crate::settings::display_width())
+}
+
 const SECS_MIN: CGFloat = 0.0;
 const SECS_MAX: CGFloat = 3600.0;
 
 /// Swatch metrics for the ANSI-16 display row.
 const SWATCH: CGFloat = 16.0;
+/// Gap between adjacent ANSI swatches in the palette row.
+const SWATCH_GAP: CGFloat = 4.0;
 /// The ANSI picker's two-step menu sizes: 16 slots, 12 preset colors.
 const ANSI_SLOTS: usize = 16;
 const ANSI_COLORS: usize = PALETTE_PRESETS.len();
@@ -132,6 +160,39 @@ const ANSI_COLORS: usize = PALETTE_PRESETS.len();
 /// The three cursor shapes a segmented control can select, in the same order
 /// `settings.rs::cursor_shape_of` decodes.
 const CURSOR_SHAPES: [&'static str; 3] = ["Block", "Bar", "Underline"];
+
+/// The five sections of the settings pane, each one `NSTabViewItem` of the
+/// `NSTabView` with its own `NSGridView`. Every knob is placed by exactly one
+/// section (see `grid_for_section`); the order here is the tab order.
+const SECTIONS: [Section; 5] = [
+    Section::General,
+    Section::Appearance,
+    Section::Colors,
+    Section::Keys,
+    Section::About,
+];
+
+#[derive(Clone, Copy)]
+enum Section {
+    General,
+    Appearance,
+    Colors,
+    Keys,
+    About,
+}
+
+impl Section {
+    /// The tab label.
+    pub fn title(&self) -> &'static str {
+        match self {
+          Section::General => "General",
+          Section::Appearance => "Appearance",
+          Section::Colors => "Colors",
+          Section::Keys => "Keys",
+          Section::About => "About",
+        }
+    }
+}
 
 // ── Knob identity ─────────────────────────────────────────────────────────
 /// The knob a `SettingsCell` mutates. One index per knob, consumed by
@@ -228,7 +289,7 @@ pub fn apply_knob_value(settings: Settings, knob: usize, value: KnobValue) -> Se
     let mut s = settings;
     match knob {
       KNOB_OPEN_HEIGHT => s.open_height = value.number.clamp(HEIGHT_MIN, HEIGHT_MAX),
-      KNOB_OPEN_WIDTH => s.open_width = value.number.clamp(WIDTH_MIN, WIDTH_MAX),
+      KNOB_OPEN_WIDTH => s.open_width = value.number.clamp(WIDTH_MIN, width_max()),
       KNOB_FONT_FAMILY => s.font_family = FONT_FAMILIES[value.index.min(FONT_FAMILIES.len() - 1)],
       KNOB_FONT_SIZE => s.font_size = value.number.clamp(FONT_MIN, FONT_MAX),
       KNOB_LIGATURES => s.ligatures = value.index != 0,
@@ -326,7 +387,7 @@ impl SettingsCell {
 
 /// Read the value a control currently holds, by the class that sent the
 /// action. The cast is sound because the cell's `knob` fixes which control
-/// class was built for it, and every control is created in [`build_grid`]
+/// class was built for it, and every control is created in [`grid_for_section`]
 /// with the matching knob.
 fn knob_value_from_sender(knob: usize, control: *const AnyObject) -> KnobValue {
     match knob {
@@ -359,7 +420,11 @@ fn knob_value_from_sender(knob: usize, control: *const AnyObject) -> KnobValue {
 pub struct SettingsOwnerIvars {
     window: OnceCell<Retained<NSWindow>>,
     controller: OnceCell<Retained<NSWindowController>>,
-    grid: OnceCell<Retained<NSGridView>>,
+    tab_view: OnceCell<Retained<NSTabView>>,
+    /// One grid per tab item. The tab view retains its items, which retain
+    /// their views, so the grids are already alive; keeping them here too is
+    /// the same belt-and-braces discipline as `cells`.
+    grids: OnceCell<Vec<Retained<NSGridView>>>,
     /// Every `SettingsCell` TARGET. These are NOT in the view tree, so this
     /// `Vec` is the only thing keeping them alive — without it a control's
     /// clicks silently no-op (the lesson-16 analogue: a dropped object means
@@ -434,7 +499,7 @@ impl SettingsOwner {
         // edge so a short display cannot push it off-screen.
         let panel_bottom = frame.origin.y + frame.size.height - PANEL_HEIGHT;
         let content_origin = NSPoint::new(
-            panel_origin(frame).x + (PANEL_WIDTH - WINDOW_W) / 2.0,
+            panel_origin(frame, frame.size.width).x + (frame.size.width - WINDOW_W) / 2.0,
             (panel_bottom - WINDOW_H).max(frame.origin.y),
         );
 
@@ -470,122 +535,184 @@ impl SettingsOwner {
             NSWindowController::initWithWindow(NSWindowController::alloc(mtm), Some(&*window));
 
         let mut cells: Vec<Retained<SettingsCell>> = vec![];
-        let grid = self.build_grid(mtm, view, view.current_settings(), &mut cells);
 
-        // The grid fills the content view inset by the margins. The content
-        // view is the content rect (the titlebar sits ABOVE it and is not part
-        // of it), so its own size — not the window's — is what the grid must
-        // fit inside; using the window height here would push the last About
-        // row past the bottom edge.
+        // One `NSGridView` per section, each wrapped as an `NSTabViewItem`
+        // (label + view) and added to one plain `NSTabView` with top tabs —
+        // the iTerm prefs-pane chrome. A plain `NSTabView`, not an
+        // `NSTabViewController`: we need no per-tab view controller and no
+        // toolbar/segmented style, only a label and an arbitrary view per tab.
+        let tab_view: Retained<NSTabView> = NSTabView::new(mtm);
+        tab_view.setTabViewType(NSTabViewType::TopTabsBezelBorder);
+        let grids: Vec<Retained<NSGridView>> = SECTIONS.map(|section| {
+            let grid = self.grid_for_section(mtm, view, view.current_settings(), section, &mut cells);
+            let item: Retained<NSTabViewItem> = NSTabViewItem::new();
+            item.setLabel(&*NSString::from_str(section.title()));
+            item.setView(Some(grid.as_super()));
+            tab_view.addTabViewItem(&*item);
+            grid
+        }).to_vec();
+        tab_view.selectTabViewItemAtIndex(0);
+
+        // The tab view fills the content view inset by the margins. The
+        // content view is the content rect (the titlebar sits ABOVE it and is
+        // not part of it), so its own size — not the window's — is what the
+        // tab view must fit inside.
         let content_view = window.contentView().expect("a titled window always has a content view");
         let content = content_view.frame();
-        content_view.addSubview(grid.as_super());
-        grid.as_super().setFrame(
+        tab_view.as_super().setFrame(
             NSRect::new(
                 NSPoint::new(GRID_INSET_X, GRID_INSET_Y),
                 NSSize::new(content.size.width - GRID_INSET_X * 2.0, content.size.height - GRID_INSET_Y * 2.0),
             ),
         );
+        content_view.addSubview(tab_view.as_super());
+
+        // Size every section grid to its NATURAL height, anchored to the TOP
+        // of the tab view's content rect. The grid IS the `NSTabViewItem`'s
+        // view (`setView` above), but `NSTabView` ONLY lays out the SELECTED
+        // item's view and NEVER resizes it: it leaves every grid at whatever
+        // frame it was built with, and a grid at its own natural content size
+        // is taller than the content area, so its first row painted straight
+        // OVER the tab labels (measured: the General grid's "Open height" row
+        // overlapped the tab strip). `contentRect()` is the area under the
+        // tabs and inside the bezel, in the tab view's own coordinates —
+        // exactly the region a section grid belongs in. Stretching the grid to
+        // the FULL content height instead made `NSGridView` push its rows
+        // apart to fill the spare space — a visible void between rows 0 and 1.
+        // So size it to `fittingSize` (its own minimum natural size: rows at
+        // their control heights joined by the default spacing) and anchor that
+        // to the top, leaving any leftover height as empty space BELOW the
+        // last row.
+        let content = tab_view.contentRect();
+        for item in tab_view.tabViewItems().iter() {
+            match item.view(mtm) {
+              None => {}
+              Some(view_ret) => {
+                let view: &NSView = &*view_ret;
+                let fit = view.fittingSize();
+                // The item view lives in a FLIPPED container (y grows
+                // downward), so the TOP of the content rect is the SMALL y:
+                // anchoring the grid there leaves the slack BELOW the last
+                // row, iTerm-style. (Measured: the opposite formula parked
+                // General's rows at the bottom with a 65pt void above row 0.)
+                view.setFrame(NSRect::new(
+                    NSPoint::new(
+                        content.origin.x + GRID_BEZEL_MARGIN,
+                        content.origin.y + GRID_BEZEL_MARGIN,
+                    ),
+                    NSSize::new(
+                        (content.size.width - GRID_BEZEL_MARGIN * 2.0).max(1.0),
+                        fit.height,
+                    ),
+                ));
+                view.setNeedsLayout(true);
+                view.layout();
+              }
+            }
+        }
 
         let _ = ivars.window.set(window);
         let _ = ivars.controller.set(controller);
-        let _ = ivars.grid.set(grid);
+        let _ = ivars.tab_view.set(tab_view);
+        let _ = ivars.grids.set(grids);
         let _ = ivars.cells.set(cells);
 
         self.show_or_focus();
     }
 
-    /// The whole control surface: one `NSGridView` row per knob (a static
-    /// label plus one click-driven control), the ANSI-16 swatch row, and the
-    /// About rows. Built from the live settings bundle so the initial slider
+    /// The rows of ONE section, as its own `NSGridView`: a static label plus
+    /// one click-driven control per knob, the ANSI-16 swatch row, or the About
+    /// labels. Built from the live settings bundle so the initial slider
     /// positions, popup selections, well colors and swatch fills match what
     /// the panel is already using. Every target cell is pushed into `cells`,
-    /// which the owner keeps alive.
-    fn build_grid(&self, mtm: MainThreadMarker, view: &NotchView, settings: Settings, cells: &mut Vec<Retained<SettingsCell>>) -> Retained<NSGridView> {
+    /// which the owner keeps alive — the factories are unchanged, so every
+    /// `SettingsCell::new` + `keep()` + `cells.push` still runs.
+    fn grid_for_section(&self, mtm: MainThreadMarker, view: &NotchView, settings: Settings, section: Section, cells: &mut Vec<Retained<SettingsCell>>) -> Retained<NSGridView> {
         let rows: Retained<NSMutableArray<NSArray<NSView>>> = NSMutableArray::new();
 
-        // ── Geometry ──
-        push_row(&rows, &[
-            label(mtm, "Open height"),
-            slider(mtm, view, cells, KNOB_OPEN_HEIGHT, settings.open_height, HEIGHT_MIN, HEIGHT_MAX),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "Open width"),
-            slider(mtm, view, cells, KNOB_OPEN_WIDTH, settings.open_width, WIDTH_MIN, WIDTH_MAX),
-        ]);
+        match section {
+          Section::General => {
+            push_row(&rows, &[
+                label(mtm, "Open height"),
+                slider(mtm, view, cells, KNOB_OPEN_HEIGHT, settings.open_height, HEIGHT_MIN, HEIGHT_MAX),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Open width"),
+                slider(mtm, view, cells, KNOB_OPEN_WIDTH, settings.open_width, WIDTH_MIN, width_max()),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Scrollback lines"),
+                popup(mtm, view, cells, KNOB_SCROLLBACK, scrollback_titles(), scrollback_index(settings.scrollback_lines)),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Bell enabled"),
+                switch(mtm, view, cells, KNOB_BELL, settings.bell_enabled),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Notify after (s)"),
+                slider(mtm, view, cells, KNOB_NOTIFY_SECS, settings.finished_notify_secs, SECS_MIN, SECS_MAX),
+            ]);
+          }
 
-        // ── Font ──
-        push_row(&rows, &[
-            label(mtm, "Font family"),
-            popup(mtm, view, cells, KNOB_FONT_FAMILY, family_titles(), family_index(settings.font_family)),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "Font size"),
-            slider(mtm, view, cells, KNOB_FONT_SIZE, settings.font_size, FONT_MIN, FONT_MAX),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "Ligatures"),
-            switch(mtm, view, cells, KNOB_LIGATURES, settings.ligatures),
-        ]);
+          Section::Appearance => {
+            push_row(&rows, &[
+                label(mtm, "Font family"),
+                popup(mtm, view, cells, KNOB_FONT_FAMILY, family_titles(), family_index(settings.font_family)),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Font size"),
+                slider(mtm, view, cells, KNOB_FONT_SIZE, settings.font_size, FONT_MIN, FONT_MAX),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Ligatures"),
+                switch(mtm, view, cells, KNOB_LIGATURES, settings.ligatures),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Cursor shape"),
+                segmented(mtm, view, cells, KNOB_CURSOR_SHAPE, &CURSOR_SHAPES, cursor_shape_index(settings.cursor_shape)),
+            ]);
+          }
 
-        // ── Colors ──
-        push_row(&rows, &[
-            label(mtm, "Background"),
-            well(mtm, view, cells, KNOB_BACKGROUND, settings.background),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "Foreground"),
-            well(mtm, view, cells, KNOB_FOREGROUND, settings.foreground),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "Cursor color"),
-            well(mtm, view, cells, KNOB_CURSOR_COLOR, settings.cursor_color),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "Cursor shape"),
-            segmented(mtm, view, cells, KNOB_CURSOR_SHAPE, &CURSOR_SHAPES, cursor_shape_index(settings.cursor_shape)),
-        ]);
+          Section::Colors => {
+            push_row(&rows, &[
+                label(mtm, "Background"),
+                well(mtm, view, cells, KNOB_BACKGROUND, settings.background),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Foreground"),
+                well(mtm, view, cells, KNOB_FOREGROUND, settings.foreground),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "Cursor color"),
+                well(mtm, view, cells, KNOB_CURSOR_COLOR, settings.cursor_color),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "ANSI slot"),
+                popup(mtm, view, cells, KNOB_ANSI_SLOT, ansi_slot_titles(), ANSI_SLOT.load(Ordering::SeqCst)),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "ANSI color"),
+                popup(mtm, view, cells, KNOB_ANSI_COLOR, palette_titles(), ansi_color_index(settings)),
+            ]);
+            push_row(&rows, &swatch_row(mtm, settings));
+          }
 
-        // ── Scrollback ──
-        push_row(&rows, &[
-            label(mtm, "Scrollback lines"),
-            popup(mtm, view, cells, KNOB_SCROLLBACK, scrollback_titles(), scrollback_index(settings.scrollback_lines)),
-        ]);
+          Section::Keys => {
+            push_row(&rows, &[
+                label(mtm, "Toggle chord"),
+                popup(mtm, view, cells, KNOB_TOGGLE_CHORD, chord_titles(), chord_index(settings.toggle_chord)),
+            ]);
+            push_row(&rows, &[
+                label(mtm, "New tab chord"),
+                popup(mtm, view, cells, KNOB_NEW_TAB_CHORD, chord_titles(), chord_index(settings.new_tab_chord)),
+            ]);
+          }
 
-        // ── Hotkeys ──
-        push_row(&rows, &[
-            label(mtm, "Toggle chord"),
-            popup(mtm, view, cells, KNOB_TOGGLE_CHORD, chord_titles(), chord_index(settings.toggle_chord)),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "New tab chord"),
-            popup(mtm, view, cells, KNOB_NEW_TAB_CHORD, chord_titles(), chord_index(settings.new_tab_chord)),
-        ]);
-
-        // ── Bell ──
-        push_row(&rows, &[
-            label(mtm, "Bell enabled"),
-            switch(mtm, view, cells, KNOB_BELL, settings.bell_enabled),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "Notify after (s)"),
-            slider(mtm, view, cells, KNOB_NOTIFY_SECS, settings.finished_notify_secs, SECS_MIN, SECS_MAX),
-        ]);
-
-        // ── ANSI-16: a two-step picker plus a display row of swatches ──
-        push_row(&rows, &[
-            label(mtm, "ANSI slot"),
-            popup(mtm, view, cells, KNOB_ANSI_SLOT, ansi_slot_titles(), ANSI_SLOT.load(Ordering::SeqCst)),
-        ]);
-        push_row(&rows, &[
-            label(mtm, "ANSI color"),
-            popup(mtm, view, cells, KNOB_ANSI_COLOR, palette_titles(), ansi_color_index(settings)),
-        ]);
-        push_row(&rows, &swatch_row(mtm, settings));
-
-        // ── About ──
-        for text in about_rows(settings) {
-            push_row(&rows, &[label(mtm, &text)]);
+          Section::About => {
+            for text in about_rows(settings) {
+                push_row(&rows, &[label(mtm, &text)]);
+            }
+          }
         }
 
         NSGridView::gridViewWithViews(&rows.into_super(), mtm)
@@ -616,6 +743,12 @@ fn label(mtm: MainThreadMarker, text: &str) -> Retained<NSView> {
 /// from the slider (`NSControl::doubleValue`) when the action fires.
 fn slider(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<SettingsCell>>, knob: usize, value: CGFloat, lo: CGFloat, hi: CGFloat) -> Retained<NSView> {
     let cell = SettingsCell::new(mtm, knob, view);
+    // Normalize the rail HERE so a runtime `hi` (the width rail is the live
+    // display canvas, so `hi` can shrink between builds) can never invert the
+    // range or leave the start value off the rail: the slider and the
+    // `apply_knob_value` clamp then agree by construction.
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+    let value = value.clamp(lo, hi);
     let control: Retained<NSSlider> = unsafe {
         NSSlider::sliderWithValue_minValue_maxValue_target_action(
             value as c_double,
@@ -733,8 +866,18 @@ fn well(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<Settin
 /// 16-slot palette is visible without a picker. Display only — editing goes
 /// through the two-step slot/color popup pair (the lazier of the plan's two
 /// ANSI options: no `NSScrollView`, no per-slot well).
+///
+/// The `NSBox` default type is `Primary`, which IGNORES `fillColor` (AppKit's
+/// `NSBox.h`: "Custom boxes draw based entirely on user parameters"), so the
+/// box type must be `Custom` or every swatch renders as the default gray
+/// frame. The default title is the literal string `Title`, so the title
+/// position must be cleared too or each swatch also paints a stray label.
 fn swatch(mtm: MainThreadMarker, color: Color) -> Retained<NSView> {
     let swatch_box: Retained<NSBox> = NSBox::new(mtm);
+    swatch_box.setBoxType(NSBoxType::Custom);
+    swatch_box.setTitlePosition(NSTitlePosition::NoTitle);
+    swatch_box.setBorderWidth(0.0);
+    swatch_box.setCornerRadius(3.0);
     swatch_box.setFillColor(&*srgb_color(color));
     swatch_box.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(SWATCH, SWATCH)));
     swatch_box.clone().into_super()
@@ -758,9 +901,29 @@ fn ansi_color_index(settings: Settings) -> usize {
     }
 }
 
-/// The 16 swatches, in one grid row.
+/// The 16 swatches, in one grid row. Wrapped in a single plain `NSView` so
+/// the row is ONE grid cell: a 16-view row would otherwise force `NSGridView`
+/// to 16 columns, which then stretch to the grid width and render the palette
+/// as 16 ragged slabs (the pre-existing defect this replaces). The container
+/// sizes itself to `16*SWATCH + 15*SWATCH_GAP` and lays the swatches out with
+/// explicit frames, so `NSGridView` keeps its two columns (label + control),
+/// the sliders stay long, and every swatch stays a `SWATCH`-sized square.
 fn swatch_row(mtm: MainThreadMarker, settings: Settings) -> Vec<Retained<NSView>> {
-    (0..ANSI_SLOTS).map(|i| swatch(mtm, settings.ansi[i])).collect()
+    let container: Retained<NSView> = NSView::new(mtm);
+    let step = SWATCH + SWATCH_GAP;
+    for i in 0..ANSI_SLOTS {
+        let tile = swatch(mtm, settings.ansi[i]);
+        tile.setFrame(NSRect::new(
+            NSPoint::new(step * i as CGFloat, 0.0),
+            NSSize::new(SWATCH, SWATCH),
+        ));
+        container.addSubview(&*tile);
+    }
+    container.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(step * ANSI_SLOTS as CGFloat - SWATCH_GAP, SWATCH),
+    ));
+    vec![container]
 }
 
 /// Record the control a cell will receive its action from, so the action

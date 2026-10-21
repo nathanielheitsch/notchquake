@@ -188,7 +188,22 @@ pub struct NotchViewIvars {
     hovered: Cell<Option<usize>>,
     label_font: OnceCell<CFRetained<CTFont>>,
     hint_font: OnceCell<CFRetained<CTFont>>,
-    tracking: OnceCell<Retained<NSTrackingArea>>,
+    /// The hover tracking areas installed over the panel. A `Vec`, not a
+    /// `Cell<Option<Retained<…>>>`: `Retained` is not `Copy`, so `get()`/
+    /// `is_none()` (and `OnceCell::take` on an immutable ivar borrow) are
+    /// unavailable — lesson 17's move-out/move-back pair is the only legal
+    /// shape. The vec is always put back before returning, so a dropped
+    /// tracking handle (dead hover) cannot happen on a success path.
+    tracking: Cell<Vec<Retained<NSTrackingArea>>>,
+    /// The canvas width the installed tracking area was sized to; the pair
+    /// `(tracking_canvas != canvas)` is the reinstall sentinel. `CGFloat` is
+    /// `Copy`, so this one reads with `get()`/`set()`.
+    tracking_canvas: Cell<CGFloat>,
+    /// The canvas (panel window) width in logical points: the notch display's
+    /// logical width, sized once at startup (see `window::canvas_size`) and
+    /// re-set by `reposition` on a display change. Every centring expression is
+    /// `(canvas ± w) / 2`, so draw and hit-testing share one geometry source.
+    canvas: Cell<f64>,
     // Wheel-scroll state: `scroll` is the whole lines already applied to the
     // selected session's display_offset; `scroll_pts` carries the leftover
     // fractional wheel points between events. Reset on collapse.
@@ -260,11 +275,22 @@ define_class!(
                 self.mark_dirty();
             }
 
-            // The hover tracking area, installed once over the whole panel.
+            // The hover tracking area, installed over the whole panel.
             // `ActiveInKeyWindow` ties hover to key focus, which the panel
             // takes on click (see Item 1).
-            if ivars.tracking.get().is_none() {
-                let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PANEL_WIDTH, PANEL_HEIGHT));
+            //
+            // shortcut: the rect is reinstalled only when the display canvas
+            // changes — the canvas is the only input to its size, so a frame
+            // that does not change the canvas cannot leave a stale rect.
+            let canvas = ivars.canvas.get();
+            if ivars.tracking_canvas.get() != canvas {
+                // Move the old handles out, drop them from the view, then move
+                // the fresh one back in (lesson 17's idiom).
+                let old = ivars.tracking.replace(vec![]);
+                for area in &old {
+                    self.as_super().removeTrackingArea(area)
+                }
+                let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(canvas, PANEL_HEIGHT));
                 let opts = NSTrackingAreaOptions::MouseEnteredAndExited
                     .union(NSTrackingAreaOptions::MouseMoved)
                     .union(NSTrackingAreaOptions::ActiveInKeyWindow)
@@ -279,7 +305,8 @@ define_class!(
                     )
                 };
                 self.as_super().addTrackingArea(&area);
-                let _ = ivars.tracking.set(area);
+                ivars.tracking.replace(vec![area]);
+                ivars.tracking_canvas.set(canvas);
             }
         }
 
@@ -351,20 +378,20 @@ define_class!(
         }
     }
 );
-/// The silhouette path, traced in a top-left-origin rect `(0, 0, PANEL_WIDTH,
+/// The silhouette path, traced in a top-left-origin rect `(0, 0, canvas,
 /// h)`: square top corners at the menu bar (a straight top edge, since the
 /// panel sits flush under the notch), then the chin corners rounded at
 /// `BOTTOM_CORNER_RADIUS`, which also inset the bottom edge on both sides.
-fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat) {
+fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat, canvas: CGFloat) {
     // AppKit clamps corner radii to the rect; do the same so the closed pill
     // (h < 2 * bottom) stays a proper pill instead of self-intersecting.
     let bottom = chin_radius(h);
 
     // y-up space: the silhouette hangs from the panel top, so the menu-bar
     // edge is at `max_y` and the chin (bottom) at `min_y`. The shape is
-    // horizontally centred in the fixed panel.
-    let (min_x, min_y) = ((PANEL_WIDTH - w) / 2.0, PANEL_HEIGHT - h);
-    let (max_x, max_y) = ((PANEL_WIDTH + w) / 2.0, PANEL_HEIGHT);
+    // horizontally centred in the canvas.
+    let (min_x, min_y) = ((canvas - w) / 2.0, PANEL_HEIGHT - h);
+    let (max_x, max_y) = ((canvas + w) / 2.0, PANEL_HEIGHT);
 
 
     // Square top corners: a straight top edge at the menu bar (`max_y`),
@@ -429,12 +456,17 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     // grid colors, session palette, the settings overlay) must agree.
     let settings = ivars.settings.get();
 
+    // The canvas (panel window) width: the other half of every centring
+    // expression `(canvas ± w) / 2`. Read from the ivar so draw, hit-testing
+    // and the tracking rect share one source after a display change.
+    let canvas = ivars.canvas.get();
+
     CGContext::save_g_state(ctx);
 
     // The silhouette. Its fill IS `settings.background` (plan A #7): the grid
     // skips cells painted the panel background, so the panel color has to come
     // from here for a color-well change to repaint anything.
-    trace_silhouette(ctx, h, w);
+    trace_silhouette(ctx, h, w, canvas);
     CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(settings.background.rgb())));
     CGContext::fill_path(ctx);
 
@@ -444,7 +476,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     // because the strip used to stop short of the chin corners — once the
     // strip spans the full width it painted straight over them, squaring the
     // silhouette's rounded bottom corners. Re-trace, then clip.
-    trace_silhouette(ctx, h, w);
+    trace_silhouette(ctx, h, w, canvas);
     CGContext::clip(ctx);
 
     // Take the session vec once for the whole frame (put it back at the
@@ -485,7 +517,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         CGContext::fill_rect(
             ctx,
             CGRect::new(
-                CGPoint::new((PANEL_WIDTH - w) / 2.0, PANEL_HEIGHT - header),
+                CGPoint::new((canvas - w) / 2.0, PANEL_HEIGHT - header),
                 CGSize::new(w, header),
             ),
         );
@@ -495,7 +527,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         // silhouette's right edge and vertically centered in the header. Drawn
         // AFTER the header fill so it sits on top of the header block, and
         // BEFORE the grid/settings match so the grid can never overpaint it.
-        let (gear_x0, gear_y0, gear_x1, gear_y1) = gear_rect(w, header);
+        let (gear_x0, gear_y0, gear_x1, gear_y1) = gear_rect(w, header, canvas);
         draw_gear(ctx, (gear_x0 + gear_x1) / 2.0, (gear_y0 + gear_y1) / 2.0);
 
         // The grid, unconditional: the settings surface is a separate window
@@ -503,6 +535,12 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         match ivars.selected.get().and_then(|i| sessions.get(i)) {
           Some(session) => {
             let grid = session.snapshot();
+            // The grid is laid out inside the LIVE silhouette: `grid_x0` is
+            // canvas-relative (the silhouette's left edge plus `GRID_PAD`), and
+            // `grid_usable` is the silhouette's inner width — the columns the
+            // session baked from `settings.open_width` are centred in it.
+            let grid_x0 = (canvas - w) / 2.0 + GRID_PAD;
+            let grid_usable = w - 2.0 * GRID_PAD;
             draw_grid(
                 ctx.expect("a current context"),
                 &grid,
@@ -513,6 +551,8 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
                 h,
                 header,
                 &settings,
+                grid_x0,
+                grid_usable,
             )
           }
           _ => {}
@@ -522,7 +562,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         // drawn AFTER the grid so the top row of text fades away under it
         // instead of meeting a hard line. Cohesive: the bar and the terminal
         // share one color, the fade is the only separation.
-        draw_header_shadow(ctx, w, header, settings.background.rgb())
+        draw_header_shadow(ctx, w, header, settings.background.rgb(), canvas)
     }
 
     // The tab strip hanging from the silhouette's bottom edge — SQUARE
@@ -535,7 +575,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     // the mirror. All three pass the same count to `tab_strip` — the single
     // source of truth for strip geometry, the `+` rect and the `×` rect.
     let count = sessions.len();
-    match tab_strip(h, w, count) {
+    match tab_strip(h, w, count, canvas) {
       Some((left, tab_w)) => {
         let selected = ivars.selected.get();
         let hovered = ivars.hovered.get();
@@ -720,13 +760,13 @@ fn chin_radius(h: CGFloat) -> CGFloat {
 /// The tab strip's left edge and per-tab width at silhouette size `(h, w)`;
 /// `None` when the strip is not drawn. Single source of truth shared by the
 /// renderer and the click hit-test so they cannot drift.
-fn tab_strip(h: CGFloat, w: CGFloat, count: usize) -> Option<(CGFloat, CGFloat)> {
+fn tab_strip(h: CGFloat, w: CGFloat, count: usize, canvas: CGFloat) -> Option<(CGFloat, CGFloat)> {
     if h <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT || count == 0 {
         return None
     }
     let inset = TAB_INSET;
-    let left = (PANEL_WIDTH - w) / 2.0 + inset;
-    let right = (PANEL_WIDTH + w) / 2.0 - inset;
+    let left = (canvas - w) / 2.0 + inset;
+    let right = (canvas + w) / 2.0 - inset;
     let span = right - left - TAB_PLUS_W;
     let tab_w = span / count as CGFloat;
     if span <= 0.0 || tab_w < MIN_TAB_W {
@@ -777,8 +817,8 @@ fn close_center(x: CGFloat, chin_y: CGFloat) -> (CGFloat, CGFloat) {
 /// `w` with a `header`-tall header band: flush to the silhouette's right edge,
 /// vertically centered in the header. Single source of truth for the render in
 /// `draw` and the hit-test in `click_at_screen_point`.
-fn gear_rect(w: CGFloat, header: CGFloat) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
-    let right = (PANEL_WIDTH + w) / 2.0;
+fn gear_rect(w: CGFloat, header: CGFloat, canvas: CGFloat) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+    let right = (canvas + w) / 2.0;
     let cy = PANEL_HEIGHT - header / 2.0;
     (right - SETTINGS_BTN_W, cy - SETTINGS_BTN_W / 2.0, right, cy + SETTINGS_BTN_W / 2.0)
 }
@@ -838,7 +878,7 @@ fn header_height(ivars: &NotchViewIvars) -> CGFloat {
 /// pt down, drawn AFTER the grid so the top text rows fade away under it. The
 /// header itself is filled with the same background color, so the bar reads as
 /// a soft shadow over the terminal rather than a hard-edged block.
-fn draw_header_shadow(ctx: Option<&CGContext>, w: CGFloat, header: CGFloat, bg: (CGFloat, CGFloat, CGFloat)) {
+fn draw_header_shadow(ctx: Option<&CGContext>, w: CGFloat, header: CGFloat, bg: (CGFloat, CGFloat, CGFloat), canvas: CGFloat) {
     let (r, g, b) = bg;
     let space = CGColorSpace::new_device_rgb();
     // Two stops: opaque terminal-bg at the top, fully clear at the bottom.
@@ -854,7 +894,7 @@ fn draw_header_shadow(ctx: Option<&CGContext>, w: CGFloat, header: CGFloat, bg: 
     // - header) down `SHADOW_FADE` pt. Opaque at the START point (top), clear at
     // the END point (bottom); DrawsAfterEndLocation extends the clear tail so a
     // partial band never shows a hard edge.
-    let x0 = (PANEL_WIDTH - w) / 2.0;
+    let x0 = (canvas - w) / 2.0;
     CGContext::save_g_state(ctx);
     CGContext::begin_path(ctx);
     CGContext::add_rect(ctx, CGRect::new(CGPoint::new(x0, PANEL_HEIGHT - header - SHADOW_FADE), CGSize::new(w, SHADOW_FADE)));
@@ -1084,12 +1124,15 @@ fn font_invalidate(ivars: &NotchViewIvars) {
 /// every spawn path (initial batch in `draw`, `spawn_tab`) so grid sizes
 /// cannot drift. Must stay in sync with `row_rect`'s header reservation.
 ///
-/// Columns stay derived from `PANEL_WIDTH` (not `settings.open_width`) because
-/// `render.rs::draw_grid` lays runs out from `GRID_PAD` in PANEL space; a
-/// narrower silhouette clips the grid rather than reflowing it.
+/// The grid reflows to `settings.open_width` — NOT the live spring width:
+/// sessions spawn on the FIRST open frame, while the width spring is still
+/// flying at the ~212pt notch, so baking columns from live `w` would silently
+/// create half-width sessions. `draw_grid` gets the live width (x0/usable) for
+/// painting; a session's row/col count is baked once at spawn (live PTY
+/// resize is out of scope, see `apply_settings`).
 fn grid_dims(cell: (CGFloat, CGFloat), header: CGFloat, settings: Settings) -> (usize, usize, usize) {
     let (cell_width, cell_height) = cell;
-    let usable = PANEL_WIDTH - 2.0 * GRID_PAD;
+    let usable = settings.open_width - 2.0 * GRID_PAD;
     let columns = ((usable / cell_width).floor() as usize).max(1);
     let rows = (((settings.open_height - header - GRID_TOP_PAD - TAB_HEIGHT - 2.0 * TAB_INSET)
                  / cell_height).floor() as usize).max(1);
@@ -1180,7 +1223,9 @@ impl NotchView {
                 hovered: Cell::new(None),
                 label_font: OnceCell::new(),
                 hint_font: OnceCell::new(),
-                tracking: OnceCell::new(),
+                tracking: Cell::new(vec![]),
+                tracking_canvas: Cell::new(0.0),
+                canvas: Cell::new(crate::window::canvas_size(mtm)),
                 scroll: Cell::new(0),
                 scroll_pts: Cell::new(0.0),
                 settings: Cell::new(Settings::load()),
@@ -1202,7 +1247,7 @@ impl NotchView {
     /// start, so an interrupted animation reverses from wherever it is). The
     /// width spring retargets to the settings `open_width` when opening, so a
     /// width-% change animates on the next open without any window resize
-    /// (the panel canvas is fixed at PANEL_WIDTH × PANEL_HEIGHT).
+    /// (the panel canvas is fixed at `window::canvas_size` x PANEL_HEIGHT).
     pub fn set_target(&self, target: f64) {
         let ivars = self.ivars();
         ivars.spring.retarget(target);
@@ -1504,7 +1549,7 @@ impl NotchView {
             return
         }
         let w = ivars.width.get();
-        let new = match tab_strip(h, w, ivars.tab_count.get()) {
+        let new = match tab_strip(h, w, ivars.tab_count.get(), ivars.canvas.get()) {
           Some((left, tab_w)) => {
             let chin_y = PANEL_HEIGHT - h;
             if py < chin_y || py > chin_y + TAB_HEIGHT {
@@ -1565,8 +1610,17 @@ impl NotchView {
 
         // Inside the frame but off the silhouette (transparent margin): same
         // dismissal.
+        // Inside the frame but OFF the silhouette: same dismissal. Both gates
+        // matter now that the canvas is the whole display width — a click
+        // beside the terminal at terminal height used to fall outside the
+        // 640pt frame (collapse) and must keep collapsing; without the x gate
+        // it would fall through to the gear/tab hit-tests and do nothing.
+        // Placed BEFORE the closed-pill arm so clicking the pill still opens.
         let top = PANEL_HEIGHT - h;
-        if y < top || y > PANEL_HEIGHT {
+        let w = ivars.width.get();
+        let canvas = ivars.canvas.get();
+        let (sx0, sx1) = ((canvas - w) / 2.0, (canvas + w) / 2.0);
+        if x < sx0 || x > sx1 || y < top || y > PANEL_HEIGHT {
             if open {
                 self.collapse();
             }
@@ -1579,7 +1633,9 @@ impl NotchView {
             return
         }
 
-        let w = ivars.width.get();
+        // `canvas` is the ivar (not the panel frame width): `reposition` keeps
+        // them in sync, and the same value drives the renderer above.
+        let canvas = ivars.canvas.get();
         // 0) The gear button, top-right of the header band. Routed BEFORE the
         // tab-strip guard because the header sits above the strip and the
         // strip guard early-returns for every point outside it. Gated on
@@ -1587,7 +1643,7 @@ impl NotchView {
         // expands. One branch covers `mouseDown:` and the global monitor,
         // which both funnel here.
         let header = header_height(ivars);
-        let (gx0, gy0, gx1, gy1) = gear_rect(w, header);
+        let (gx0, gy0, gx1, gy1) = gear_rect(w, header, canvas);
         if x >= gx0 && x <= gx1 && y >= gy0 && y <= gy1 {
             // The gear opens (or re-focuses) the separate settings window.
             // `open_or_focus` creates the owner at most once and stores it in
@@ -1603,7 +1659,7 @@ impl NotchView {
         // `tab_count`); the `+` and `×` rects derive from `tab_strip`'s
         // outputs — same math as the renderer in `draw`.
         let count = ivars.tab_count.get();
-        match tab_strip(h, w, count) {
+        match tab_strip(h, w, count, canvas) {
           Some((left, tab_w)) => {
             let chin_y = PANEL_HEIGHT - h;
             if y < chin_y || y > chin_y + TAB_HEIGHT {
@@ -1662,15 +1718,36 @@ impl NotchView {
     pub fn reposition(&self) {
         let mtm = MainThreadMarker::new().expect("main thread");
         let panel = self.as_super().window().expect("a view always lives in a window");
+        let ivars = self.ivars();
         match crate::window::notch_screen(mtm) {
           Some(screen) => {
-            panel.setFrameOrigin(crate::window::panel_origin(screen.frame()));
+            let frame = screen.frame();
+            let canvas = crate::window::canvas_width(&screen);
+            panel.setFrameOrigin(crate::window::panel_origin(frame, canvas));
+            // The canvas follows the display width: re-pin the window frame
+            // (origin + size in the same call, so the two can never disagree)
+            // and hand the same value to the view and its content view, since
+            // every centring expression reads `ivars.canvas`.
+            panel.setFrame_display(NSRect::new(crate::window::panel_origin(frame, canvas), NSSize::new(canvas, PANEL_HEIGHT)), true);
+            ivars.canvas.set(canvas);
+            // Re-set the view's own frame (it fills the canvas, parent-relative),
+            // mirroring `main.rs`'s initial `setFrame`.
+            self.as_super().setFrame(
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(canvas, PANEL_HEIGHT)),
+            );
+            // The tracking area sized to the OLD canvas is stale at the new
+            // edges, but it is NOT removed here: `drawRect:` sees
+            // `tracking_canvas != canvas` and does the remove+reinstall pair
+            // on the next frame, so only ONE place owns that swap. Hover is
+            // not driver-verifiable (lesson 47), so this is correctness-by
+            // construction.
             let (w, h) = crate::window::notch_size(&screen);
             self.set_notch((w, h));
           }
           _ => {}
         }
     }
+
 
     /// Open the panel (idempotent: already-open stays open) at the settings
     /// open height.

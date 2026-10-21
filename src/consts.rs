@@ -1,12 +1,19 @@
 //! Shared layout constants for the notch panel.
 //!
-//! The panel window is a FIXED size and is never resized; only the silhouette
-//! height drawn inside it animates.
+//! The panel WINDOW is a FIXED size, created once at startup and sized to the
+//! notch display's logical width; it is never resized. Only the silhouette
+//! height/width drawn inside that canvas animates.
 
 use objc2_core_foundation::CGFloat;
 
-/// Panel width in logical points.
+/// Default open terminal width in logical points — the default value of
+/// `Settings.open_width`. The canvas itself is sized to the notch display's
+/// width (see `window::canvas_size`), not to this constant.
 pub const PANEL_WIDTH: CGFloat = 640.0;
+
+/// Fallback canvas width used when the process cannot resolve a notch screen
+/// (see `window::canvas_size`).
+pub const PANEL_WIDTH_FALLBACK: CGFloat = 640.0;
 
 /// Maximum terminal height in logical points.
 pub const MAX_TERMINAL_HEIGHT: CGFloat = 420.0;

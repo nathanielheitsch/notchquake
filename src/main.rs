@@ -57,7 +57,7 @@ use objc2::sel;
 
 use block2::RcBlock;
 
-use crate::consts::{PANEL_HEIGHT, PANEL_WIDTH, SPACE_KEY_CODE};
+use crate::consts::{PANEL_HEIGHT, SPACE_KEY_CODE};
 use crate::notch_view::NotchView;
 use crate::window::create_panel;
 
@@ -112,7 +112,7 @@ define_class!(
             view.as_super().setFrame(
                 NSRect::new(
                     NSPoint::new(0.0, 0.0),
-                    NSSize::new(PANEL_WIDTH, PANEL_HEIGHT),
+                    NSSize::new(crate::window::canvas_size(mtm), PANEL_HEIGHT),
                 ),
             );
             let _ = ivars.view.set(view.clone());
