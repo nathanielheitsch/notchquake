@@ -1124,12 +1124,12 @@ fn font_invalidate(ivars: &NotchViewIvars) {
 /// every spawn path (initial batch in `draw`, `spawn_tab`) so grid sizes
 /// cannot drift. Must stay in sync with `row_rect`'s header reservation.
 ///
-/// The grid reflows to `settings.open_width` — NOT the live spring width:
-/// sessions spawn on the FIRST open frame, while the width spring is still
-/// flying at the ~212pt notch, so baking columns from live `w` would silently
-/// create half-width sessions. `draw_grid` gets the live width (x0/usable) for
-/// painting; a session's row/col count is baked once at spawn (live PTY
-/// resize is out of scope, see `apply_settings`).
+    /// The grid reflows to `settings.open_width` — NOT the live spring width:
+    /// sessions spawn on the FIRST open frame, while the width spring is still
+    /// flying at the ~212pt notch, so baking columns from live `w` would silently
+    /// create half-width sessions. `draw_grid` gets the live width (x0/usable) for
+    /// painting; a session's row/col count is baked at spawn and then kept in step
+    /// with the knob by `apply_settings`' live `Session::resize` (see that seam).
 fn grid_dims(cell: (CGFloat, CGFloat), header: CGFloat, settings: Settings) -> (usize, usize, usize) {
     let (cell_width, cell_height) = cell;
     let usable = settings.open_width - 2.0 * GRID_PAD;
@@ -1324,8 +1324,9 @@ impl NotchView {
     /// 2. drop the cached grid font + cell metrics when a font knob moved
     ///    (a `OnceCell` keeps the FIRST size it was created at),
     /// 3. retarget the springs when a geometry knob moved, so the panel
-    ///    animates to the new size without a relaunch (existing sessions keep
-    ///    their baked rows/cols — a live PTY resize is out of scope),
+    ///    animates to the new size without a relaunch — and reflow the LIVE
+    ///    sessions for that new size (`Session::resize`: the `Term` grid under
+    ///    the `FairMutex` plus `Msg::Resize` so the PTY gets `TIOCSWINSZ`),
     /// 4. re-register both Carbon chords when a chord moved, so the new one
     ///    works right away and the old one stops.
     pub fn apply_settings(&self, after: Settings) {
@@ -1338,6 +1339,24 @@ impl NotchView {
         }
         if after.open_height != before.open_height || after.open_width != before.open_width {
             self.set_target(after.open_height);
+            // Reflow the LIVE sessions to the new open size, so the grid the user
+            // is looking at re-wraps instead of only reflowing for tabs spawned
+            // later. Only while the panel is OPEN (gate on the spring target, the
+            // same rule as `draw`'s spawn gate): a closed-panel settings change
+            // must not resize/SIGWINCH a session mid-collapse, and a closed panel
+            // re-spawns on the next open anyway.
+            if ivars.spring.target_value() > CLOSED_HEIGHT + 1.0 {
+                // Cell metrics come from the same cache `draw` uses (`ensure_font`,
+                // which also fills the ivars so the next frame does not recompute),
+                // and rows/cols come from the existing `grid_dims` formula — never
+                // a copy of it.
+                let (_, cell) = ensure_font(ivars, after);
+                let (rows, columns, _) = grid_dims(cell, header_height(ivars), after);
+                // Move the vec out and back (lesson 17); `resize` mutates in place.
+                let mut sessions = take_sessions(ivars);
+                for session in &mut sessions { session.resize(rows, columns, cell.0, cell.1) }
+                put_sessions(ivars, sessions);
+            }
         }
         if after.toggle_chord != before.toggle_chord || after.new_tab_chord != before.new_tab_chord {
             let _ = self.reregister_hotkeys(after);

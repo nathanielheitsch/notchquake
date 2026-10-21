@@ -750,6 +750,37 @@ impl Session {
         let _ = self.sender.send(Msg::Input(Cow::from(bytes)));
     }
 
+    /// Reflow this session to new grid dimensions. Two halves, both cheap
+    /// and non-blocking, so this is safe to call from the MAIN thread while
+    /// the reader thread owns the PTY:
+    ///  1. resize the grid state itself under the `FairMutex`
+    ///     (`Term::resize` re-wraps the lines and moves the vi-mode cursor;
+    ///     it returns early when the dims already match), and
+    ///  2. push `Msg::Resize` through the SAME channel `send_input` uses,
+    ///     which the reader thread's `EventLoop` drains into
+    ///     `Pty::on_resize` → `TIOCSWINSZ` (SIGWINCH), so the shell's cursor
+    ///     and wrap logic follow the new size. Never touch the PTY directly
+    ///     here — the main thread cannot borrow it (lesson 35).
+    ///
+    /// Cell metrics are needed to build the pixel half of `WindowSize`
+    /// (`to_winsize` multiplies rows/cols by them), so the shell gets a
+    /// realistic character cell, matching the `WindowSize` `Session::new`
+    /// hands `pty_new`.
+    pub fn resize(&mut self, rows: usize, columns: usize, cell_width: f64, cell_height: f64) {
+        if rows == self.rows && columns == self.columns {
+            return
+        }
+        self.rows = rows;
+        self.columns = columns;
+        let mut terminal = self.terminal.lock();
+        terminal.resize(NotchSize { screen_lines: rows, columns });
+        let _ = self.sender.send(Msg::Resize(WindowSize {
+            num_lines: rows as u16,
+            num_cols: columns as u16,
+            cell_width: cell_width.ceil() as u16,
+            cell_height: cell_height.ceil() as u16,
+        }));
+    }
     /// Scroll the display through the scrollback history. `lines` > 0 shows
     /// older content (scroll up), < 0 returns toward the live viewport. The
     /// grid clamps to the history size, so the cutoff is the `scrollback`

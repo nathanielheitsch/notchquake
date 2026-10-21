@@ -24,7 +24,6 @@ use objc2::AnyThread;
 use objc2_foundation::{NSInteger, NSString, NSUserDefaults};
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::MainThreadMarker;
-use objc2_app_kit::NSScreen;
 
 use core::ffi::c_double;
 use crate::consts::{
@@ -374,22 +373,22 @@ fn defaults_store() -> Option<Retained<NSUserDefaults>> {
     }
 }
 
-/// The widest display's logical width in points, or `0.0` when no screen
-/// resolves. Reads `NSScreen` directly with the local import above — `window.rs::notch_screen`
-/// is private to that module and must not be reached from settings. `pub` so
+/// The width the panel canvas is actually sized to: the NOTCH display's
+/// logical width, read through `window.rs::canvas_size` — the SAME entry point
+/// that sizes the panel window (`create_panel`) and `notch_view.rs::ivars.canvas`.
+/// Not a max over every screen: a wider secondary display must not raise the
+/// slider bound past the canvas the silhouette is painted into, or the panel
+/// gets clipped and the rail lies. `pub` so
 /// `settings_window.rs::width_max` can feed the SAME value to the slider rail
 /// and the `apply_knob_value` clamp as this module's `load` clamp uses.
-/// shortcut: max over screens, not the notch display specifically — the panel
-/// itself is sized to `notch_screen`'s pick, which differs only on a
-/// multi-display setup, and the extra headroom only widens a slider rail.
 pub fn display_width() -> CGFloat {
-    let screens = match MainThreadMarker::new() {
-      Some(mtm) => NSScreen::screens(mtm),
-      _ => return 0.0,
-    };
-    let mut w: CGFloat = 0.0;
-    for screen in screens.iter() { w = w.max(screen.frame().size.width) }
-    w
+    match MainThreadMarker::new() {
+        Some(mtm) => crate::window::canvas_size(mtm),
+        // Off the main thread there is no canvas to measure; fall back to the
+        // compile-time default, which every caller already maxes its range
+        // against.
+        _ => PANEL_WIDTH,
+    }
 }
 
 impl Settings {

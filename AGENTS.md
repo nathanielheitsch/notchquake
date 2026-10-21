@@ -639,6 +639,28 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     alpha capture shows tab titles out to ~1746pt, closed pill unchanged at
     189pt/33pt. Live x-gate click test NOT run (see notes).
 
+55. **Slider max ≠ canvas had TWO sources, and the open grid never reflowed.**
+    (a) `settings.rs::display_width()` took a MAX over every `NSScreen`
+    (secondary display 1920) while the canvas is the NOTCH display
+    (`window.rs::canvas_size` via `notch_screen`) — so the Open width rail could
+    exceed the canvas and the silhouette got clipped at the screen edge. Fix:
+    `display_width()` delegates to `crate::window::canvas_size(mtm)` — ONE
+    source of truth feeding the slider rail, the `apply_knob_value` clamp AND
+    the `load` clamp. The notch display can even CHANGE between launches
+    (canvas measured 1710 one session, 1920 the next) so no constant is valid.
+    (b) An OPEN panel did not reflow when the size knobs changed: `grid_dims`
+    bakes rows/cols at spawn. Fix at `apply_settings` (`notch_view.rs`):
+    while the spring TARGET is open, call `Session::resize(rows, cols, cell)`
+    per live session with dims from the SAME `grid_dims` formula; `Session::
+    resize` locks the `FairMutex<Term>` and calls alacritty's public
+    `Term::resize(NotchSize{…})` (re-wraps lines, moves the vi cursor) then
+    pushes `Msg::Resize(WindowSize)` through the SAME `EventLoopSender` wire
+    `send_input` uses, so the reader thread's `EventLoop` runs `Pty::on_resize`
+    → `TIOCSWINSZ`/SIGWINCH — never touch the PTY from the main thread (lesson
+    35). Closed panel: skip (mid-collapse); it re-spawns on next open.
+    Live drag of the width slider needs a REAL user click on the gear (menu-bar
+    strip swallows synthetic clicks); verified by code audit + build gate.
+
 ## Repo / process rules
 
 - macOS-only, arm64. `cargo build` is the gate; no LSP.
