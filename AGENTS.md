@@ -646,6 +646,24 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     alpha capture shows tab titles out to ~1746pt, closed pill unchanged at
     189pt/33pt. Live x-gate click test NOT run (see notes).
 
+56. **Renaming the bundle broke execution in three ways** (v0.1-alpha rename
+    BNT.app→NotchQuake.app, id `local.bnt`→`local.notchquake`, binary `BNT`→
+    `notchquake`): (a) `codesign --remove-signature NotchQuake.app` strips
+    recursively — the INNER binary went unsigned and unsigned arm64 gets
+    SIGKILL'd (Killed: 9) at exec; fix is just re-running launch.sh, which
+    copies a fresh linker-signed (adhoc) build over. (b) `open -n` fails
+    (launchd spawn 162/163) while the bundle-level signature is inconsistent
+    with its contents — same root cause. (c) `pkill -f "MacOS/BNT"`-style
+    patterns in a shell self-match the killer command; use a pattern that
+    cannot match the pkill line (`grep -iE 'macos/(bnt|notchquake)$'` to
+    inspect, explicit `kill <pid>` to act). The renamed app launches (launch.
+    sh pid verified) and the Carbon hotkey still registers (Option+Space
+    toggles) — process-name squatting (lesson 53) stays fine because launch.
+    sh now kills `notchquake`. Old prefs under `local.bnt.plist` are orphaned
+    ONE TIME by the bundle-id change; keys keep the `BNT.` prefix so a future
+    prefs-domain migration is a simple file copy, and prefs reset is the
+    accepted v0.1 cost.
+
 55. **Slider max ≠ canvas had TWO sources, and the open grid never reflowed.**
     (a) `settings.rs::display_width()` took a MAX over every `NSScreen`
     (secondary display 1920) while the canvas is the NOTCH display
