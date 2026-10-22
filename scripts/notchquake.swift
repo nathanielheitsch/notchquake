@@ -1,5 +1,5 @@
-// Print candidate notch-panel windows: id, pid, layer, bounds.
-// Usage: swift scripts/bntw.swift   then:  screencapture -x -o -l <id> out.png
+// NotchQuake: print candidate notch-panel windows: id, pid, layer, bounds.
+// Usage: swift scripts/notchquake.swift   then:  screencapture -x -o -l <id> out.png
 import Cocoa
 
 let infos = (CGWindowListCopyWindowInfo(CGWindowListOption.optionAll, 0) as? [[String: AnyObject]]) ?? []

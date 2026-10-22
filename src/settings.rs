@@ -19,23 +19,18 @@
 //! `setDouble:`/`setInteger:`/`setBool:` persist asynchronously on their own;
 //! `synchronize()` is deprecated and not needed.
 
-use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_foundation::{NSInteger, NSString, NSUserDefaults};
+use objc2::rc::Retained;
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::MainThreadMarker;
+use objc2_foundation::{NSInteger, NSString, NSUserDefaults};
 
-use core::ffi::c_double;
 use crate::consts::{
-    CLOSED_HEIGHT,
-    DEFAULT_SCROLLBACK_LINES,
-    NOTCH_WIDTH,
-    OPEN_HEIGHT,
-    PANEL_HEIGHT,
-    PANEL_WIDTH,
+    CLOSED_HEIGHT, DEFAULT_SCROLLBACK_LINES, NOTCH_WIDTH, OPEN_HEIGHT, PANEL_HEIGHT, PANEL_WIDTH,
     SPACE_KEY_CODE,
 };
 use crate::font::FONT_SIZE;
+use core::ffi::c_double;
 
 /// An sRGB channel as a 0..255 integer component divided into 0.0..1.0 — the
 /// form the palette tables in `render.rs` and `terminal.rs` are written in.
@@ -131,7 +126,12 @@ impl Color {
             let scaled = (channel.clamp(0.0, 1.0) * 255.0 + 0.5).floor();
             scaled as u8
         };
-        format!("#{:02X}{:02X}{:02X}", byte(self.r), byte(self.g), byte(self.b))
+        format!(
+            "#{:02X}{:02X}{:02X}",
+            byte(self.r),
+            byte(self.g),
+            byte(self.b)
+        )
     }
 }
 
@@ -159,7 +159,11 @@ pub fn parse_hex(hex: &str) -> Color {
             0.0
         }
     };
-    Color { r: component(0), g: component(2), b: component(4) }
+    Color {
+        r: component(0),
+        g: component(2),
+        b: component(4),
+    }
 }
 
 /// The Carbon modifier mask for a chord — the same bit layout
@@ -207,16 +211,76 @@ pub fn chord_of(key_code: u16, mask: u32) -> Chord {
 /// "record an arbitrary chord" would need a global key-event tap, which is
 /// gated behind a grant this adhoc-signed bundle never gets.
 pub const CHORD_PRESETS: [Chord; 10] = [
-    Chord { key_code: SPACE_KEY_CODE, option: true, cmd: false, shift: false, ctrl: false },
-    Chord { key_code: SPACE_KEY_CODE, option: false, cmd: true, shift: false, ctrl: false },
-    Chord { key_code: SPACE_KEY_CODE, option: false, cmd: false, shift: false, ctrl: true },
-    Chord { key_code: 50, option: true, cmd: false, shift: false, ctrl: false },
-    Chord { key_code: 50, option: false, cmd: true, shift: false, ctrl: false },
-    Chord { key_code: 50, option: false, cmd: false, shift: false, ctrl: true },
-    Chord { key_code: 36, option: true, cmd: false, shift: false, ctrl: false },
-    Chord { key_code: 36, option: false, cmd: true, shift: false, ctrl: false },
-    Chord { key_code: 51, option: true, cmd: false, shift: false, ctrl: false },
-    Chord { key_code: 0x11, option: false, cmd: true, shift: false, ctrl: false },
+    Chord {
+        key_code: SPACE_KEY_CODE,
+        option: true,
+        cmd: false,
+        shift: false,
+        ctrl: false,
+    },
+    Chord {
+        key_code: SPACE_KEY_CODE,
+        option: false,
+        cmd: true,
+        shift: false,
+        ctrl: false,
+    },
+    Chord {
+        key_code: SPACE_KEY_CODE,
+        option: false,
+        cmd: false,
+        shift: false,
+        ctrl: true,
+    },
+    Chord {
+        key_code: 50,
+        option: true,
+        cmd: false,
+        shift: false,
+        ctrl: false,
+    },
+    Chord {
+        key_code: 50,
+        option: false,
+        cmd: true,
+        shift: false,
+        ctrl: false,
+    },
+    Chord {
+        key_code: 50,
+        option: false,
+        cmd: false,
+        shift: false,
+        ctrl: true,
+    },
+    Chord {
+        key_code: 36,
+        option: true,
+        cmd: false,
+        shift: false,
+        ctrl: false,
+    },
+    Chord {
+        key_code: 36,
+        option: false,
+        cmd: true,
+        shift: false,
+        ctrl: false,
+    },
+    Chord {
+        key_code: 51,
+        option: true,
+        cmd: false,
+        shift: false,
+        ctrl: false,
+    },
+    Chord {
+        key_code: 0x11,
+        option: false,
+        cmd: true,
+        shift: false,
+        ctrl: false,
+    },
 ];
 
 /// Human-readable name for a chord, as shown in the settings panel.
@@ -258,13 +322,8 @@ pub fn chord_index(chord: Chord) -> usize {
 /// The font families the settings panel can cycle through: only names that
 /// actually resolve (`font.rs::monospace_with` falls back to Menlo when one
 /// does not).
-pub const FONT_FAMILIES: [&'static str; 5] = [
-    "Fira Code",
-    "Menlo",
-    "Monaco",
-    "SF Mono",
-    "Andale Mono",
-];
+pub const FONT_FAMILIES: [&'static str; 5] =
+    ["Fira Code", "Menlo", "Monaco", "SF Mono", "Andale Mono"];
 
 /// The scrollback values the settings panel steps through (lines of history).
 pub const SCROLLBACK_PRESETS: [usize; 6] = [0, 1000, 5000, 10000, 50000, 100000];
@@ -272,18 +331,66 @@ pub const SCROLLBACK_PRESETS: [usize; 6] = [0, 1000, 5000, 10000, 50000, 100000]
 /// The named colors a color well cycles through — the cheapest honest picker
 /// without an `NSColorPanel` (which would need app activation).
 pub const PALETTE_PRESETS: [Color; 12] = [
-    Color { r: channel(0x00), g: channel(0x00), b: channel(0x00) },
-    Color { r: channel(0x18), g: channel(0x18), b: channel(0x18) },
-    Color { r: channel(0x14), g: channel(0x14), b: channel(0x14) },
-    Color { r: channel(0x2B), g: channel(0x2B), b: channel(0x2B) },
-    Color { r: channel(0x3B), g: channel(0x3C), b: channel(0x3B) },
-    Color { r: channel(0x4C), g: channel(0x72), b: channel(0x9E) },
-    Color { r: channel(0x70), g: channel(0x98), b: channel(0x78) },
-    Color { r: channel(0xD8), g: channel(0xA8), b: channel(0x4A) },
-    Color { r: channel(0xA8), g: channel(0x68), b: channel(0x94) },
-    Color { r: channel(0x68), g: channel(0xA8), b: channel(0xC4) },
-    Color { r: channel(0xD8), g: channel(0xD8), b: channel(0xD8) },
-    Color { r: channel(0xFF), g: channel(0xFF), b: channel(0xFF) },
+    Color {
+        r: channel(0x00),
+        g: channel(0x00),
+        b: channel(0x00),
+    },
+    Color {
+        r: channel(0x18),
+        g: channel(0x18),
+        b: channel(0x18),
+    },
+    Color {
+        r: channel(0x14),
+        g: channel(0x14),
+        b: channel(0x14),
+    },
+    Color {
+        r: channel(0x2B),
+        g: channel(0x2B),
+        b: channel(0x2B),
+    },
+    Color {
+        r: channel(0x3B),
+        g: channel(0x3C),
+        b: channel(0x3B),
+    },
+    Color {
+        r: channel(0x4C),
+        g: channel(0x72),
+        b: channel(0x9E),
+    },
+    Color {
+        r: channel(0x70),
+        g: channel(0x98),
+        b: channel(0x78),
+    },
+    Color {
+        r: channel(0xD8),
+        g: channel(0xA8),
+        b: channel(0x4A),
+    },
+    Color {
+        r: channel(0xA8),
+        g: channel(0x68),
+        b: channel(0x94),
+    },
+    Color {
+        r: channel(0x68),
+        g: channel(0xA8),
+        b: channel(0xC4),
+    },
+    Color {
+        r: channel(0xD8),
+        g: channel(0xD8),
+        b: channel(0xD8),
+    },
+    Color {
+        r: channel(0xFF),
+        g: channel(0xFF),
+        b: channel(0xFF),
+    },
 ];
 
 /// The ring of colors a color well steps through, rotated so it starts AFTER
@@ -314,31 +421,103 @@ impl Settings {
             font_family: FONT_FAMILIES[0],
             font_size: FONT_SIZE,
             ligatures: true,
-            background: Color { r: 0.0, g: 0.0, b: 0.0 },
+            background: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+            },
             foreground: Color {
                 r: channel(0xD8),
                 g: channel(0xD8),
                 b: channel(0xD8),
             },
             ansi: [
-                Color { r: channel(0x18), g: channel(0x18), b: channel(0x18) },
-                Color { r: channel(0xC4), g: channel(0x3C), b: channel(0x3B) },
-                Color { r: channel(0x70), g: channel(0x98), b: channel(0x78) },
-                Color { r: channel(0xD8), g: channel(0xA8), b: channel(0x4A) },
-                Color { r: channel(0x4C), g: channel(0x72), b: channel(0x9E) },
-                Color { r: channel(0xA8), g: channel(0x68), b: channel(0x94) },
-                Color { r: channel(0x68), g: channel(0xA8), b: channel(0xC4) },
-                Color { r: channel(0xD8), g: channel(0xD8), b: channel(0xD8) },
-                Color { r: channel(0x60), g: channel(0x60), b: channel(0x60) },
-                Color { r: channel(0xE4), g: channel(0x5C), b: channel(0x5B) },
-                Color { r: channel(0x98), g: channel(0xC0), b: channel(0xA0) },
-                Color { r: channel(0xF0), g: channel(0xC0), b: channel(0x62) },
-                Color { r: channel(0x6C), g: channel(0x92), b: channel(0xBE) },
-                Color { r: channel(0xD8), g: channel(0x98), b: channel(0xC4) },
-                Color { r: channel(0x88), g: channel(0xC8), b: channel(0xE4) },
-                Color { r: channel(0xF8), g: channel(0xF8), b: channel(0xF8) },
+                Color {
+                    r: channel(0x18),
+                    g: channel(0x18),
+                    b: channel(0x18),
+                },
+                Color {
+                    r: channel(0xC4),
+                    g: channel(0x3C),
+                    b: channel(0x3B),
+                },
+                Color {
+                    r: channel(0x70),
+                    g: channel(0x98),
+                    b: channel(0x78),
+                },
+                Color {
+                    r: channel(0xD8),
+                    g: channel(0xA8),
+                    b: channel(0x4A),
+                },
+                Color {
+                    r: channel(0x4C),
+                    g: channel(0x72),
+                    b: channel(0x9E),
+                },
+                Color {
+                    r: channel(0xA8),
+                    g: channel(0x68),
+                    b: channel(0x94),
+                },
+                Color {
+                    r: channel(0x68),
+                    g: channel(0xA8),
+                    b: channel(0xC4),
+                },
+                Color {
+                    r: channel(0xD8),
+                    g: channel(0xD8),
+                    b: channel(0xD8),
+                },
+                Color {
+                    r: channel(0x60),
+                    g: channel(0x60),
+                    b: channel(0x60),
+                },
+                Color {
+                    r: channel(0xE4),
+                    g: channel(0x5C),
+                    b: channel(0x5B),
+                },
+                Color {
+                    r: channel(0x98),
+                    g: channel(0xC0),
+                    b: channel(0xA0),
+                },
+                Color {
+                    r: channel(0xF0),
+                    g: channel(0xC0),
+                    b: channel(0x62),
+                },
+                Color {
+                    r: channel(0x6C),
+                    g: channel(0x92),
+                    b: channel(0xBE),
+                },
+                Color {
+                    r: channel(0xD8),
+                    g: channel(0x98),
+                    b: channel(0xC4),
+                },
+                Color {
+                    r: channel(0x88),
+                    g: channel(0xC8),
+                    b: channel(0xE4),
+                },
+                Color {
+                    r: channel(0xF8),
+                    g: channel(0xF8),
+                    b: channel(0xF8),
+                },
             ],
-            cursor_color: Color { r: 0.75, g: 0.75, b: 0.75 },
+            cursor_color: Color {
+                r: 0.75,
+                g: 0.75,
+                b: 0.75,
+            },
             cursor_shape: CursorShape::Block,
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             toggle_chord: CHORD_PRESETS[0],
@@ -431,7 +610,8 @@ impl Settings {
         // A stored color is only trusted when all three channels are present,
         // so a half-written color cannot mix default + stored channels.
         let get_color = |prefix: &str, fallback: Color| -> Color {
-            if has_key(&channel_key(prefix, "r")) && has_key(&channel_key(prefix, "g"))
+            if has_key(&channel_key(prefix, "r"))
+                && has_key(&channel_key(prefix, "g"))
                 && has_key(&channel_key(prefix, "b"))
             {
                 Color {
@@ -467,8 +647,18 @@ impl Settings {
         }
 
         Settings {
-            open_height: get_sized("openHeight", CLOSED_HEIGHT + 80.0, PANEL_HEIGHT - 20.0, base.open_height),
-            open_width: get_sized("openWidth", NOTCH_WIDTH, PANEL_WIDTH.max(display_width()), base.open_width),
+            open_height: get_sized(
+                "openHeight",
+                CLOSED_HEIGHT + 80.0,
+                PANEL_HEIGHT - 20.0,
+                base.open_height,
+            ),
+            open_width: get_sized(
+                "openWidth",
+                NOTCH_WIDTH,
+                PANEL_WIDTH.max(display_width()),
+                base.open_width,
+            ),
             font_family: FONT_FAMILIES[get_index("fontFamily", FONT_FAMILIES.len())],
             font_size: get_sized("fontSize", 8.0, 32.0, base.font_size),
             ligatures: !has_key("ligatures") || get_bool("ligatures"),
@@ -477,12 +667,11 @@ impl Settings {
             ansi: palette,
             cursor_color: get_color("cursor", base.cursor_color),
             cursor_shape: cursor_shape_of(get_index("cursorShape", 3)),
-            scrollback_lines:
-                if has_key("scrollbackLines") {
-                    SCROLLBACK_PRESETS[get_index("scrollbackLines", SCROLLBACK_PRESETS.len())]
-                } else {
-                    base.scrollback_lines
-                },
+            scrollback_lines: if has_key("scrollbackLines") {
+                SCROLLBACK_PRESETS[get_index("scrollbackLines", SCROLLBACK_PRESETS.len())]
+            } else {
+                base.scrollback_lines
+            },
             toggle_chord: get_chord("toggle", base.toggle_chord),
             new_tab_chord: get_chord("newTab", base.new_tab_chord),
             bell_enabled: !has_key("bellEnabled") || get_bool("bellEnabled"),
@@ -575,7 +764,9 @@ pub fn scrollback_of(index: usize) -> usize {
 /// The stored index for a scrollback value (off-preset values snap to the
 /// nearest preset at or below them).
 pub fn scrollback_index(lines: usize) -> usize {
-    let at = SCROLLBACK_PRESETS.iter().rposition(|preset| *preset <= lines);
+    let at = SCROLLBACK_PRESETS
+        .iter()
+        .rposition(|preset| *preset <= lines);
     at.unwrap_or(0)
 }
 

@@ -27,80 +27,41 @@
 //! Unlike the notch panel (a non-activating `NSPanel` at layer 27), this is a
 //! normal layer-0 window: window tools can see it, and it can take key focus.
 
+use core::ffi::c_double;
 use objc2::ClassType;
-use objc2::define_class;
 use objc2::DefinedClass;
+use objc2::MainThreadOnly;
+use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
-use objc2::MainThreadOnly;
-use objc2::sel;
 use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, NSObject};
+use objc2::sel;
 use objc2_app_kit::{
-    NSBackingStoreType,
-    NSBox,
-    NSBoxType,
-    NSColor,
-    NSColorSpace,
-    NSColorWell,
-    NSColorWellStyle,
-    NSControlStateValueOff,
-    NSControlStateValueOn,
-    NSGridView,
-    NSMenu,
-    NSTabView,
-    NSTabViewItem,
-    NSTabViewType,
-    NSMenuItem,
-    NSTitlePosition,
-    NSPopUpButton,
-    NSSegmentSwitchTracking,
-    NSSegmentedControl,
-    NSSlider,
-    NSSwitch,
-    NSTextField,
-    NSView,
-    NSWindow,
-    NSWindowController,
+    NSBackingStoreType, NSBox, NSBoxType, NSColor, NSColorSpace, NSColorWell, NSColorWellStyle,
+    NSControlStateValueOff, NSControlStateValueOn, NSGridView, NSMenu, NSMenuItem, NSPopUpButton,
+    NSSegmentSwitchTracking, NSSegmentedControl, NSSlider, NSSwitch, NSTabView, NSTabViewItem,
+    NSTabViewType, NSTextField, NSTitlePosition, NSView, NSWindow, NSWindowController,
     NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{
-    MainThreadMarker,
-    NSMutableArray,
-    NSArray,
-    NSObjectProtocol,
-    NSInteger,
-    NSPoint,
-    NSRect,
-    NSSize,
-    NSString,
+    MainThreadMarker, NSArray, NSInteger, NSMutableArray, NSObjectProtocol, NSPoint, NSRect,
+    NSSize, NSString,
 };
-use core::ffi::c_double;
 
 use std::cell::OnceCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use crate::consts::{CLOSED_HEIGHT, NOTCH_WIDTH, PANEL_HEIGHT, PANEL_WIDTH};
+use crate::notch_view::NotchView;
 use crate::settings::{
-    Color,
-    Settings,
-    CHORD_PRESETS,
-    FONT_FAMILIES,
-    PALETTE_PRESETS,
-    SCROLLBACK_PRESETS,
-    chord_index,
-    chord_name,
-    cursor_shape_index,
-    cursor_shape_of,
-    family_index,
-    parse_hex,
-    scrollback_index,
-    scrollback_of,
+    CHORD_PRESETS, Color, FONT_FAMILIES, PALETTE_PRESETS, SCROLLBACK_PRESETS, Settings,
+    chord_index, chord_name, cursor_shape_index, cursor_shape_of, family_index, parse_hex,
+    scrollback_index, scrollback_of,
 };
 use crate::window::{notch_screen, panel_origin};
-use crate::notch_view::NotchView;
 
 // ── Window geometry ───────────────────────────────────────────────────────
 /// The window is sized to its TALLEST tab, not to the whole control surface:
@@ -185,11 +146,11 @@ impl Section {
     /// The tab label.
     pub fn title(&self) -> &'static str {
         match self {
-          Section::General => "General",
-          Section::Appearance => "Appearance",
-          Section::Colors => "Colors",
-          Section::Keys => "Keys",
-          Section::About => "About",
+            Section::General => "General",
+            Section::Appearance => "Appearance",
+            Section::Colors => "Colors",
+            Section::Keys => "Keys",
+            Section::About => "About",
         }
     }
 }
@@ -240,19 +201,33 @@ pub struct KnobValue {
 
 /// The zero color. `Color`'s fields are private to the `settings` module, so
 /// the only portable way to name it is the hex parser.
-fn black() -> Color { parse_hex("#000000") }
+fn black() -> Color {
+    parse_hex("#000000")
+}
 
 impl KnobValue {
     pub fn number(value: CGFloat) -> KnobValue {
-        KnobValue { number: value, index: 0, color: black() }
+        KnobValue {
+            number: value,
+            index: 0,
+            color: black(),
+        }
     }
 
     pub fn index(index: usize) -> KnobValue {
-        KnobValue { number: 0.0, index, color: black() }
+        KnobValue {
+            number: 0.0,
+            index,
+            color: black(),
+        }
     }
 
     pub fn color(color: Color) -> KnobValue {
-        KnobValue { number: 0.0, index: 0, color }
+        KnobValue {
+            number: 0.0,
+            index: 0,
+            color,
+        }
     }
 }
 
@@ -265,10 +240,15 @@ fn color_of(color: &NSColor) -> Color {
     let srgb = NSColorSpace::sRGBColorSpace();
     let converted = color.colorUsingColorSpace(&*srgb);
     let (r, g, b) = match converted {
-      Some(c) => (c.redComponent(), c.greenComponent(), c.blueComponent()),
-      None => (color.redComponent(), color.greenComponent(), color.blueComponent()),
+        Some(c) => (c.redComponent(), c.greenComponent(), c.blueComponent()),
+        None => (
+            color.redComponent(),
+            color.greenComponent(),
+            color.blueComponent(),
+        ),
     };
-    let hex = format!("#{:02X}{:02X}{:02X}",
+    let hex = format!(
+        "#{:02X}{:02X}{:02X}",
         (r.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u32,
         (g.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u32,
         (b.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u32,
@@ -288,25 +268,29 @@ pub fn srgb_color(color: Color) -> Retained<NSColor> {
 pub fn apply_knob_value(settings: Settings, knob: usize, value: KnobValue) -> Settings {
     let mut s = settings;
     match knob {
-      KNOB_OPEN_HEIGHT => s.open_height = value.number.clamp(HEIGHT_MIN, HEIGHT_MAX),
-      KNOB_OPEN_WIDTH => s.open_width = value.number.clamp(WIDTH_MIN, width_max()),
-      KNOB_FONT_FAMILY => s.font_family = FONT_FAMILIES[value.index.min(FONT_FAMILIES.len() - 1)],
-      KNOB_FONT_SIZE => s.font_size = value.number.clamp(FONT_MIN, FONT_MAX),
-      KNOB_LIGATURES => s.ligatures = value.index != 0,
-      KNOB_BACKGROUND => s.background = value.color,
-      KNOB_FOREGROUND => s.foreground = value.color,
-      KNOB_CURSOR_COLOR => s.cursor_color = value.color,
-      KNOB_CURSOR_SHAPE => s.cursor_shape = cursor_shape_of(value.index),
-      KNOB_SCROLLBACK => s.scrollback_lines = scrollback_of(value.index),
-      KNOB_TOGGLE_CHORD => s.toggle_chord = CHORD_PRESETS[value.index.min(CHORD_PRESETS.len() - 1)],
-      KNOB_NEW_TAB_CHORD => s.new_tab_chord = CHORD_PRESETS[value.index.min(CHORD_PRESETS.len() - 1)],
-      KNOB_BELL => s.bell_enabled = value.index != 0,
-      KNOB_NOTIFY_SECS => s.finished_notify_secs = value.number.clamp(SECS_MIN, SECS_MAX),
-      KNOB_ANSI_COLOR => {
-        let slot = ANSI_SLOT.load(Ordering::SeqCst).min(ANSI_SLOTS - 1);
-        s.ansi[slot] = PALETTE_PRESETS[value.index.min(ANSI_COLORS - 1)];
-      }
-      _ => {},
+        KNOB_OPEN_HEIGHT => s.open_height = value.number.clamp(HEIGHT_MIN, HEIGHT_MAX),
+        KNOB_OPEN_WIDTH => s.open_width = value.number.clamp(WIDTH_MIN, width_max()),
+        KNOB_FONT_FAMILY => s.font_family = FONT_FAMILIES[value.index.min(FONT_FAMILIES.len() - 1)],
+        KNOB_FONT_SIZE => s.font_size = value.number.clamp(FONT_MIN, FONT_MAX),
+        KNOB_LIGATURES => s.ligatures = value.index != 0,
+        KNOB_BACKGROUND => s.background = value.color,
+        KNOB_FOREGROUND => s.foreground = value.color,
+        KNOB_CURSOR_COLOR => s.cursor_color = value.color,
+        KNOB_CURSOR_SHAPE => s.cursor_shape = cursor_shape_of(value.index),
+        KNOB_SCROLLBACK => s.scrollback_lines = scrollback_of(value.index),
+        KNOB_TOGGLE_CHORD => {
+            s.toggle_chord = CHORD_PRESETS[value.index.min(CHORD_PRESETS.len() - 1)]
+        }
+        KNOB_NEW_TAB_CHORD => {
+            s.new_tab_chord = CHORD_PRESETS[value.index.min(CHORD_PRESETS.len() - 1)]
+        }
+        KNOB_BELL => s.bell_enabled = value.index != 0,
+        KNOB_NOTIFY_SECS => s.finished_notify_secs = value.number.clamp(SECS_MIN, SECS_MAX),
+        KNOB_ANSI_COLOR => {
+            let slot = ANSI_SLOT.load(Ordering::SeqCst).min(ANSI_SLOTS - 1);
+            s.ansi[slot] = PALETTE_PRESETS[value.index.min(ANSI_COLORS - 1)];
+        }
+        _ => {}
     }
     s
 }
@@ -369,13 +353,11 @@ impl SettingsCell {
     /// A cell for one knob, bound to the notch view whose `Cell<Settings>` it
     /// mutates.
     pub fn new(mtm: MainThreadMarker, knob: usize, view: &NotchView) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(
-            SettingsCellIvars {
-                knob,
-                control: OnceCell::new(),
-                view: OnceCell::new(),
-            },
-        );
+        let this = Self::alloc(mtm).set_ivars(SettingsCellIvars {
+            knob,
+            control: OnceCell::new(),
+            view: OnceCell::new(),
+        });
         // SAFETY: `NSObject`'s `init` signature is correct.
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         // SAFETY: see the `view` field's comment — the view is retained for
@@ -391,27 +373,33 @@ impl SettingsCell {
 /// with the matching knob.
 fn knob_value_from_sender(knob: usize, control: *const AnyObject) -> KnobValue {
     match knob {
-      KNOB_OPEN_HEIGHT | KNOB_OPEN_WIDTH | KNOB_FONT_SIZE | KNOB_NOTIFY_SECS => {
-        let slider: &NSSlider = unsafe { &*(control as *const NSSlider) };
-        KnobValue::number(slider.doubleValue() as CGFloat)
-      }
-      KNOB_FONT_FAMILY | KNOB_SCROLLBACK | KNOB_TOGGLE_CHORD | KNOB_NEW_TAB_CHORD | KNOB_ANSI_COLOR => {
-        let popup: &NSPopUpButton = unsafe { &*(control as *const NSPopUpButton) };
-        KnobValue::index(popup.indexOfSelectedItem().max(0) as usize)
-      }
-      KNOB_CURSOR_SHAPE => {
-        let segmented: &NSSegmentedControl = unsafe { &*(control as *const NSSegmentedControl) };
-        KnobValue::index(segmented.selectedSegment().max(0) as usize)
-      }
-      KNOB_LIGATURES | KNOB_BELL => {
-        let sw: &NSSwitch = unsafe { &*(control as *const NSSwitch) };
-        KnobValue::index(if sw.state() == NSControlStateValueOn { 1 } else { 0 })
-      }
-      KNOB_BACKGROUND | KNOB_FOREGROUND | KNOB_CURSOR_COLOR => {
-        let well: &NSColorWell = unsafe { &*(control as *const NSColorWell) };
-        KnobValue::color(color_of(&*well.color()))
-      }
-      _ => KnobValue::index(0),
+        KNOB_OPEN_HEIGHT | KNOB_OPEN_WIDTH | KNOB_FONT_SIZE | KNOB_NOTIFY_SECS => {
+            let slider: &NSSlider = unsafe { &*(control as *const NSSlider) };
+            KnobValue::number(slider.doubleValue() as CGFloat)
+        }
+        KNOB_FONT_FAMILY | KNOB_SCROLLBACK | KNOB_TOGGLE_CHORD | KNOB_NEW_TAB_CHORD
+        | KNOB_ANSI_COLOR => {
+            let popup: &NSPopUpButton = unsafe { &*(control as *const NSPopUpButton) };
+            KnobValue::index(popup.indexOfSelectedItem().max(0) as usize)
+        }
+        KNOB_CURSOR_SHAPE => {
+            let segmented: &NSSegmentedControl =
+                unsafe { &*(control as *const NSSegmentedControl) };
+            KnobValue::index(segmented.selectedSegment().max(0) as usize)
+        }
+        KNOB_LIGATURES | KNOB_BELL => {
+            let sw: &NSSwitch = unsafe { &*(control as *const NSSwitch) };
+            KnobValue::index(if sw.state() == NSControlStateValueOn {
+                1
+            } else {
+                0
+            })
+        }
+        KNOB_BACKGROUND | KNOB_FOREGROUND | KNOB_CURSOR_COLOR => {
+            let well: &NSColorWell = unsafe { &*(control as *const NSColorWell) };
+            KnobValue::color(color_of(&*well.color()))
+        }
+        _ => KnobValue::index(0),
     }
 }
 
@@ -463,9 +451,15 @@ impl SettingsOwner {
     /// fallback is needed for `show`).
     pub fn show_or_focus(&self) {
         let ivars = self.ivars();
-        let window = ivars.window.get().expect("an owner always retains its window");
+        let window = ivars
+            .window
+            .get()
+            .expect("an owner always retains its window");
         if !window.isVisible() {
-            let controller = ivars.controller.get().expect("an owner always retains its controller");
+            let controller = ivars
+                .controller
+                .get()
+                .expect("an owner always retains its controller");
             unsafe { controller.showWindow(None) };
         }
         window.makeKeyWindow();
@@ -477,8 +471,8 @@ impl SettingsOwner {
     /// the panel" and COLLAPSES an open notch.
     pub fn window_frame(&self) -> Option<NSRect> {
         match self.ivars().window.get() {
-          None => None,
-          Some(window) => Some(window.frame()),
+            None => None,
+            Some(window) => Some(window.frame()),
         }
     }
 
@@ -520,7 +514,7 @@ impl SettingsOwner {
         };
 
         unsafe {
-            window.setTitle(&*NSString::from_str("BNT Settings"));
+            window.setTitle(&*NSString::from_str("NotchQuake Settings"));
             // A user close must not free the window while the owner still
             // points at it (`setReleasedWhenClosed:` is `unsafe`).
             window.setReleasedWhenClosed(false);
@@ -543,28 +537,34 @@ impl SettingsOwner {
         // toolbar/segmented style, only a label and an arbitrary view per tab.
         let tab_view: Retained<NSTabView> = NSTabView::new(mtm);
         tab_view.setTabViewType(NSTabViewType::TopTabsBezelBorder);
-        let grids: Vec<Retained<NSGridView>> = SECTIONS.map(|section| {
-            let grid = self.grid_for_section(mtm, view, view.current_settings(), section, &mut cells);
-            let item: Retained<NSTabViewItem> = NSTabViewItem::new();
-            item.setLabel(&*NSString::from_str(section.title()));
-            item.setView(Some(grid.as_super()));
-            tab_view.addTabViewItem(&*item);
-            grid
-        }).to_vec();
+        let grids: Vec<Retained<NSGridView>> = SECTIONS
+            .map(|section| {
+                let grid =
+                    self.grid_for_section(mtm, view, view.current_settings(), section, &mut cells);
+                let item: Retained<NSTabViewItem> = NSTabViewItem::new();
+                item.setLabel(&*NSString::from_str(section.title()));
+                item.setView(Some(grid.as_super()));
+                tab_view.addTabViewItem(&*item);
+                grid
+            })
+            .to_vec();
         tab_view.selectTabViewItemAtIndex(0);
 
         // The tab view fills the content view inset by the margins. The
         // content view is the content rect (the titlebar sits ABOVE it and is
         // not part of it), so its own size — not the window's — is what the
         // tab view must fit inside.
-        let content_view = window.contentView().expect("a titled window always has a content view");
+        let content_view = window
+            .contentView()
+            .expect("a titled window always has a content view");
         let content = content_view.frame();
-        tab_view.as_super().setFrame(
-            NSRect::new(
-                NSPoint::new(GRID_INSET_X, GRID_INSET_Y),
-                NSSize::new(content.size.width - GRID_INSET_X * 2.0, content.size.height - GRID_INSET_Y * 2.0),
+        tab_view.as_super().setFrame(NSRect::new(
+            NSPoint::new(GRID_INSET_X, GRID_INSET_Y),
+            NSSize::new(
+                content.size.width - GRID_INSET_X * 2.0,
+                content.size.height - GRID_INSET_Y * 2.0,
             ),
-        );
+        ));
         content_view.addSubview(tab_view.as_super());
 
         // Size every section grid to its NATURAL height, anchored to the TOP
@@ -586,28 +586,28 @@ impl SettingsOwner {
         let content = tab_view.contentRect();
         for item in tab_view.tabViewItems().iter() {
             match item.view(mtm) {
-              None => {}
-              Some(view_ret) => {
-                let view: &NSView = &*view_ret;
-                let fit = view.fittingSize();
-                // The item view lives in a FLIPPED container (y grows
-                // downward), so the TOP of the content rect is the SMALL y:
-                // anchoring the grid there leaves the slack BELOW the last
-                // row, iTerm-style. (Measured: the opposite formula parked
-                // General's rows at the bottom with a 65pt void above row 0.)
-                view.setFrame(NSRect::new(
-                    NSPoint::new(
-                        content.origin.x + GRID_BEZEL_MARGIN,
-                        content.origin.y + GRID_BEZEL_MARGIN,
-                    ),
-                    NSSize::new(
-                        (content.size.width - GRID_BEZEL_MARGIN * 2.0).max(1.0),
-                        fit.height,
-                    ),
-                ));
-                view.setNeedsLayout(true);
-                view.layout();
-              }
+                None => {}
+                Some(view_ret) => {
+                    let view: &NSView = &*view_ret;
+                    let fit = view.fittingSize();
+                    // The item view lives in a FLIPPED container (y grows
+                    // downward), so the TOP of the content rect is the SMALL y:
+                    // anchoring the grid there leaves the slack BELOW the last
+                    // row, iTerm-style. (Measured: the opposite formula parked
+                    // General's rows at the bottom with a 65pt void above row 0.)
+                    view.setFrame(NSRect::new(
+                        NSPoint::new(
+                            content.origin.x + GRID_BEZEL_MARGIN,
+                            content.origin.y + GRID_BEZEL_MARGIN,
+                        ),
+                        NSSize::new(
+                            (content.size.width - GRID_BEZEL_MARGIN * 2.0).max(1.0),
+                            fit.height,
+                        ),
+                    ));
+                    view.setNeedsLayout(true);
+                    view.layout();
+                }
             }
         }
 
@@ -627,92 +627,228 @@ impl SettingsOwner {
     /// the panel is already using. Every target cell is pushed into `cells`,
     /// which the owner keeps alive — the factories are unchanged, so every
     /// `SettingsCell::new` + `keep()` + `cells.push` still runs.
-    fn grid_for_section(&self, mtm: MainThreadMarker, view: &NotchView, settings: Settings, section: Section, cells: &mut Vec<Retained<SettingsCell>>) -> Retained<NSGridView> {
+    fn grid_for_section(
+        &self,
+        mtm: MainThreadMarker,
+        view: &NotchView,
+        settings: Settings,
+        section: Section,
+        cells: &mut Vec<Retained<SettingsCell>>,
+    ) -> Retained<NSGridView> {
         let rows: Retained<NSMutableArray<NSArray<NSView>>> = NSMutableArray::new();
 
         match section {
-          Section::General => {
-            push_row(&rows, &[
-                label(mtm, "Open height"),
-                slider(mtm, view, cells, KNOB_OPEN_HEIGHT, settings.open_height, HEIGHT_MIN, HEIGHT_MAX),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Open width"),
-                slider(mtm, view, cells, KNOB_OPEN_WIDTH, settings.open_width, WIDTH_MIN, width_max()),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Scrollback lines"),
-                popup(mtm, view, cells, KNOB_SCROLLBACK, scrollback_titles(), scrollback_index(settings.scrollback_lines)),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Bell enabled"),
-                switch(mtm, view, cells, KNOB_BELL, settings.bell_enabled),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Notify after (s)"),
-                slider(mtm, view, cells, KNOB_NOTIFY_SECS, settings.finished_notify_secs, SECS_MIN, SECS_MAX),
-            ]);
-          }
-
-          Section::Appearance => {
-            push_row(&rows, &[
-                label(mtm, "Font family"),
-                popup(mtm, view, cells, KNOB_FONT_FAMILY, family_titles(), family_index(settings.font_family)),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Font size"),
-                slider(mtm, view, cells, KNOB_FONT_SIZE, settings.font_size, FONT_MIN, FONT_MAX),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Ligatures"),
-                switch(mtm, view, cells, KNOB_LIGATURES, settings.ligatures),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Cursor shape"),
-                segmented(mtm, view, cells, KNOB_CURSOR_SHAPE, &CURSOR_SHAPES, cursor_shape_index(settings.cursor_shape)),
-            ]);
-          }
-
-          Section::Colors => {
-            push_row(&rows, &[
-                label(mtm, "Background"),
-                well(mtm, view, cells, KNOB_BACKGROUND, settings.background),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Foreground"),
-                well(mtm, view, cells, KNOB_FOREGROUND, settings.foreground),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "Cursor color"),
-                well(mtm, view, cells, KNOB_CURSOR_COLOR, settings.cursor_color),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "ANSI slot"),
-                popup(mtm, view, cells, KNOB_ANSI_SLOT, ansi_slot_titles(), ANSI_SLOT.load(Ordering::SeqCst)),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "ANSI color"),
-                popup(mtm, view, cells, KNOB_ANSI_COLOR, palette_titles(), ansi_color_index(settings)),
-            ]);
-            push_row(&rows, &swatch_row(mtm, settings));
-          }
-
-          Section::Keys => {
-            push_row(&rows, &[
-                label(mtm, "Toggle chord"),
-                popup(mtm, view, cells, KNOB_TOGGLE_CHORD, chord_titles(), chord_index(settings.toggle_chord)),
-            ]);
-            push_row(&rows, &[
-                label(mtm, "New tab chord"),
-                popup(mtm, view, cells, KNOB_NEW_TAB_CHORD, chord_titles(), chord_index(settings.new_tab_chord)),
-            ]);
-          }
-
-          Section::About => {
-            for text in about_rows(settings) {
-                push_row(&rows, &[label(mtm, &text)]);
+            Section::General => {
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Open height"),
+                        slider(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_OPEN_HEIGHT,
+                            settings.open_height,
+                            HEIGHT_MIN,
+                            HEIGHT_MAX,
+                        ),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Open width"),
+                        slider(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_OPEN_WIDTH,
+                            settings.open_width,
+                            WIDTH_MIN,
+                            width_max(),
+                        ),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Scrollback lines"),
+                        popup(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_SCROLLBACK,
+                            scrollback_titles(),
+                            scrollback_index(settings.scrollback_lines),
+                        ),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Bell enabled"),
+                        switch(mtm, view, cells, KNOB_BELL, settings.bell_enabled),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Notify after (s)"),
+                        slider(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_NOTIFY_SECS,
+                            settings.finished_notify_secs,
+                            SECS_MIN,
+                            SECS_MAX,
+                        ),
+                    ],
+                );
             }
-          }
+
+            Section::Appearance => {
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Font family"),
+                        popup(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_FONT_FAMILY,
+                            family_titles(),
+                            family_index(settings.font_family),
+                        ),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Font size"),
+                        slider(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_FONT_SIZE,
+                            settings.font_size,
+                            FONT_MIN,
+                            FONT_MAX,
+                        ),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Ligatures"),
+                        switch(mtm, view, cells, KNOB_LIGATURES, settings.ligatures),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Cursor shape"),
+                        segmented(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_CURSOR_SHAPE,
+                            &CURSOR_SHAPES,
+                            cursor_shape_index(settings.cursor_shape),
+                        ),
+                    ],
+                );
+            }
+
+            Section::Colors => {
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Background"),
+                        well(mtm, view, cells, KNOB_BACKGROUND, settings.background),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Foreground"),
+                        well(mtm, view, cells, KNOB_FOREGROUND, settings.foreground),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Cursor color"),
+                        well(mtm, view, cells, KNOB_CURSOR_COLOR, settings.cursor_color),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "ANSI slot"),
+                        popup(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_ANSI_SLOT,
+                            ansi_slot_titles(),
+                            ANSI_SLOT.load(Ordering::SeqCst),
+                        ),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "ANSI color"),
+                        popup(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_ANSI_COLOR,
+                            palette_titles(),
+                            ansi_color_index(settings),
+                        ),
+                    ],
+                );
+                push_row(&rows, &swatch_row(mtm, settings));
+            }
+
+            Section::Keys => {
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "Toggle chord"),
+                        popup(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_TOGGLE_CHORD,
+                            chord_titles(),
+                            chord_index(settings.toggle_chord),
+                        ),
+                    ],
+                );
+                push_row(
+                    &rows,
+                    &[
+                        label(mtm, "New tab chord"),
+                        popup(
+                            mtm,
+                            view,
+                            cells,
+                            KNOB_NEW_TAB_CHORD,
+                            chord_titles(),
+                            chord_index(settings.new_tab_chord),
+                        ),
+                    ],
+                );
+            }
+
+            Section::About => {
+                for text in about_rows(settings) {
+                    push_row(&rows, &[label(mtm, &text)]);
+                }
+            }
         }
 
         NSGridView::gridViewWithViews(&rows.into_super(), mtm)
@@ -741,7 +877,15 @@ fn label(mtm: MainThreadMarker, text: &str) -> Retained<NSView> {
 /// A slider for a continuous knob. `NSSlider::sliderWithValue:minValue:maxValue:target:action:`
 /// starts the knob at its current value; the cell reads the dragged value back
 /// from the slider (`NSControl::doubleValue`) when the action fires.
-fn slider(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<SettingsCell>>, knob: usize, value: CGFloat, lo: CGFloat, hi: CGFloat) -> Retained<NSView> {
+fn slider(
+    mtm: MainThreadMarker,
+    view: &NotchView,
+    cells: &mut Vec<Retained<SettingsCell>>,
+    knob: usize,
+    value: CGFloat,
+    lo: CGFloat,
+    hi: CGFloat,
+) -> Retained<NSView> {
     let cell = SettingsCell::new(mtm, knob, view);
     // Normalize the rail HERE so a runtime `hi` (the width rail is the live
     // display canvas, so `hi` can shrink between builds) can never invert the
@@ -759,7 +903,10 @@ fn slider(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<Sett
             mtm,
         )
     };
-    keep(&cell, ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref());
+    keep(
+        &cell,
+        ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref(),
+    );
     cells.push(cell);
     control.clone().into_super().into_super()
 }
@@ -767,16 +914,29 @@ fn slider(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<Sett
 /// A two-state switch for a boolean knob. `NSSwitch` has no target/action
 /// factory in objc2-app-kit 0.3.2, so the pair is set with the bound
 /// `NSControl::setTarget:`/`setAction:`.
-fn switch(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<SettingsCell>>, knob: usize, on: bool) -> Retained<NSView> {
+fn switch(
+    mtm: MainThreadMarker,
+    view: &NotchView,
+    cells: &mut Vec<Retained<SettingsCell>>,
+    knob: usize,
+    on: bool,
+) -> Retained<NSView> {
     let cell = SettingsCell::new(mtm, knob, view);
     let control: Retained<NSSwitch> = NSSwitch::new(mtm);
-    control.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
+    control.setState(if on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
     let target: &AnyObject = ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*cell).as_ref();
     unsafe {
         control.setTarget(Some(target));
         control.setAction(Some(sel!(applyKnob)));
     }
-    keep(&cell, ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref());
+    keep(
+        &cell,
+        ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref(),
+    );
     cells.push(cell);
     control.clone().into_super().into_super()
 }
@@ -790,7 +950,14 @@ fn switch(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<Sett
 /// control's current selection rather than an argument. `setPullsDown(true)`
 /// so the menu opens beside the button (a closed "choose" popup would otherwise
 /// snap back and show nothing).
-fn popup(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<SettingsCell>>, knob: usize, titles: Vec<Retained<NSString>>, selected: usize) -> Retained<NSView> {
+fn popup(
+    mtm: MainThreadMarker,
+    view: &NotchView,
+    cells: &mut Vec<Retained<SettingsCell>>,
+    knob: usize,
+    titles: Vec<Retained<NSString>>,
+    selected: usize,
+) -> Retained<NSView> {
     let cell = SettingsCell::new(mtm, knob, view);
     let menu: Retained<NSMenu> = NSMenu::new(mtm);
     let no_key: Retained<NSString> = NSString::from_str("");
@@ -818,7 +985,10 @@ fn popup(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<Setti
     };
     control.setPullsDown(true);
     control.selectItemAtIndex(selected as NSInteger);
-    keep(&cell, ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref());
+    keep(
+        &cell,
+        ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref(),
+    );
     cells.push(cell);
     control.clone().into_super().into_super().into_super()
 }
@@ -827,7 +997,14 @@ fn popup(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<Setti
 /// `NSSegmentedControl::segmentedControlWithLabels:trackingMode:target:action:`
 /// with `SelectOne` (the plan's "POINTING_MODE"): one click picks one label,
 /// and the cell reads it back with `selectedSegment`.
-fn segmented(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<SettingsCell>>, knob: usize, labels: &[&'static str], selected: usize) -> Retained<NSView> {
+fn segmented(
+    mtm: MainThreadMarker,
+    view: &NotchView,
+    cells: &mut Vec<Retained<SettingsCell>>,
+    knob: usize,
+    labels: &[&'static str],
+    selected: usize,
+) -> Retained<NSView> {
     let cell = SettingsCell::new(mtm, knob, view);
     let titles: Retained<NSMutableArray<NSString>> = NSMutableArray::new();
     for name in labels {
@@ -843,7 +1020,10 @@ fn segmented(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<S
         )
     };
     control.setSelectedSegment(selected as NSInteger);
-    keep(&cell, ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref());
+    keep(
+        &cell,
+        ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref(),
+    );
     cells.push(cell);
     control.clone().into_super().into_super()
 }
@@ -852,12 +1032,22 @@ fn segmented(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<S
 /// the `Minimal` style: a click shows a popover picker (the `Expanded`/`Default`
 /// styles drag an `NSColorPanel`, which needs app activation this app does
 /// not have). The cell reads the well back with `NSColorWell::color`.
-fn well(mtm: MainThreadMarker, view: &NotchView, cells: &mut Vec<Retained<SettingsCell>>, knob: usize, color: Color) -> Retained<NSView> {
+fn well(
+    mtm: MainThreadMarker,
+    view: &NotchView,
+    cells: &mut Vec<Retained<SettingsCell>>,
+    knob: usize,
+    color: Color,
+) -> Retained<NSView> {
     let cell = SettingsCell::new(mtm, knob, view);
-    let control: Retained<NSColorWell> = NSColorWell::colorWellWithStyle(NSColorWellStyle::Minimal, mtm);
+    let control: Retained<NSColorWell> =
+        NSColorWell::colorWellWithStyle(NSColorWellStyle::Minimal, mtm);
     control.setColor(&*srgb_color(color));
     control.setSupportsAlpha(false);
-    keep(&cell, ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref());
+    keep(
+        &cell,
+        ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref(),
+    );
     cells.push(cell);
     control.clone().into_super().into_super()
 }
@@ -879,7 +1069,10 @@ fn swatch(mtm: MainThreadMarker, color: Color) -> Retained<NSView> {
     swatch_box.setBorderWidth(0.0);
     swatch_box.setCornerRadius(3.0);
     swatch_box.setFillColor(&*srgb_color(color));
-    swatch_box.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(SWATCH, SWATCH)));
+    swatch_box.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(SWATCH, SWATCH),
+    ));
     swatch_box.clone().into_super()
 }
 
@@ -891,13 +1084,14 @@ fn ansi_color_index(settings: Settings) -> usize {
     let slot = ANSI_SLOT.load(Ordering::SeqCst).min(ANSI_SLOTS - 1);
     let current = settings.ansi[slot];
     let hex = current.hex();
-    let found = PALETTE_PRESETS.iter()
+    let found = PALETTE_PRESETS
+        .iter()
         .enumerate()
         .filter(|(_, color)| color.hex() == hex)
         .reduce(|best, other| if other.0 < best.0 { other } else { best });
     match found {
-      None => 0,
-      Some((index, _)) => index,
+        None => 0,
+        Some((index, _)) => index,
     }
 }
 
@@ -939,19 +1133,27 @@ fn family_titles() -> Vec<Retained<NSString>> {
 }
 
 fn scrollback_titles() -> Vec<Retained<NSString>> {
-    SCROLLBACK_PRESETS.map(|lines| NSString::from_str(&format!("{0}", lines))).to_vec()
+    SCROLLBACK_PRESETS
+        .map(|lines| NSString::from_str(&format!("{0}", lines)))
+        .to_vec()
 }
 
 fn chord_titles() -> Vec<Retained<NSString>> {
-    CHORD_PRESETS.map(|chord| NSString::from_str(&chord_name(chord))).to_vec()
+    CHORD_PRESETS
+        .map(|chord| NSString::from_str(&chord_name(chord)))
+        .to_vec()
 }
 
 fn palette_titles() -> Vec<Retained<NSString>> {
-    PALETTE_PRESETS.map(|color| NSString::from_str(&color.hex())).to_vec()
+    PALETTE_PRESETS
+        .map(|color| NSString::from_str(&color.hex()))
+        .to_vec()
 }
 
 fn ansi_slot_titles() -> Vec<Retained<NSString>> {
-    (0..ANSI_SLOTS).map(|i| NSString::from_str(&format!("{0}", i))).collect()
+    (0..ANSI_SLOTS)
+        .map(|i| NSString::from_str(&format!("{0}", i)))
+        .collect()
 }
 
 /// The About section: app name, version, the live chord names, the plist
@@ -960,10 +1162,10 @@ fn ansi_slot_titles() -> Vec<Retained<NSString>> {
 /// arbitrary chord.
 fn about_rows(settings: Settings) -> Vec<String> {
     vec![
-        "BNT — notch terminal, v0.1.0".to_string(),
+        "NotchQuake — notch terminal, v0.1-alpha".to_string(),
         format!("Toggle chord: {0}", chord_name(settings.toggle_chord)),
         format!("New tab chord: {0}", chord_name(settings.new_tab_chord)),
-        "Saved in ~/Library/Preferences/local.bnt.plist".to_string(),
+        "Saved in ~/Library/Preferences/local.notchquake.plist".to_string(),
         "Chords are limited to the registered presets above: the Carbon Event".to_string(),
         "Manager can only deliver chords it registered at launch, and recording".to_string(),
         "an arbitrary chord needs an Input Monitoring grant this app does not have.".to_string(),
@@ -977,10 +1179,14 @@ fn about_rows(settings: Settings) -> Vec<String> {
 ///
 /// `slot` is the `NotchViewIvars` `OnceCell` that keeps the owner alive for
 /// the process lifetime.
-pub fn open_or_focus(mtm: MainThreadMarker, slot: &OnceCell<Retained<SettingsOwner>>, view: &NotchView) {
+pub fn open_or_focus(
+    mtm: MainThreadMarker,
+    slot: &OnceCell<Retained<SettingsOwner>>,
+    view: &NotchView,
+) {
     if let Some(owner) = slot.get() {
         owner.show_or_focus();
-        return
+        return;
     }
     let owner = SettingsOwner::new(mtm);
     owner.build_and_show(mtm, view);
@@ -994,7 +1200,7 @@ pub fn open_or_focus(mtm: MainThreadMarker, slot: &OnceCell<Retained<SettingsOwn
 /// collapses from a click on any control.
 pub fn window_frame(slot: &OnceCell<Retained<SettingsOwner>>) -> Option<NSRect> {
     match slot.get() {
-      None => None,
-      Some(owner) => owner.window_frame(),
+        None => None,
+        Some(owner) => owner.window_frame(),
     }
 }

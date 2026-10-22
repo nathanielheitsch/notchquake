@@ -15,20 +15,13 @@
 //! (`CTFont::advances_for_glyphs`) on the space glyph, which is what keeps
 //! the grid monospace.
 
-use objc2_core_graphics::CGGlyph;
-use objc2_core_text::{CTFont, CTFontOrientation, CTLine, CTRun, kCTFontAttributeName, kCTFontFeatureSettingsAttribute};
 use objc2_core_foundation::{
-    CFArrayCallBacks,
-    CFComparisonResult,
-    CFMutableAttributedString,
-    CFRange,
-    CFString,
-    CFMutableArray,
-    CFStringCompareFlags,
-    CGSize,
-    CFRetained,
-    CGAffineTransform,
-    CGFloat,
+    CFArrayCallBacks, CFComparisonResult, CFMutableArray, CFMutableAttributedString, CFRange,
+    CFRetained, CFString, CFStringCompareFlags, CGAffineTransform, CGFloat, CGSize,
+};
+use objc2_core_graphics::CGGlyph;
+use objc2_core_text::{
+    CTFont, CTFontOrientation, CTLine, CTRun, kCTFontAttributeName, kCTFontFeatureSettingsAttribute,
 };
 
 use std::ptr::NonNull;
@@ -93,9 +86,8 @@ pub fn cell_advance(font: &CTFont) -> CGFloat {
     let glyph: CGGlyph = 0;
 
     // `CTFontGetGlyphsForCharacters` maps the code point to a glyph index.
-    let mapped = unsafe {
-        font.glyphs_for_characters(NonNull::from(&code_unit), NonNull::from(&glyph), 1)
-    };
+    let mapped =
+        unsafe { font.glyphs_for_characters(NonNull::from(&code_unit), NonNull::from(&glyph), 1) };
     if !mapped {
         return 0.0;
     }
@@ -113,7 +105,6 @@ pub fn cell_advance(font: &CTFont) -> CGFloat {
     };
     width as CGFloat
 }
-
 
 /// The (cell width, cell height) pair for the terminal grid at `size`.
 ///

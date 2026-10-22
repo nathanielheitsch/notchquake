@@ -13,32 +13,21 @@
 //! `row_rect` puts row 0 at the TOP (`y = PANEL_HEIGHT - cell_height`),
 //! decreasing with the row index; each row is drawn upright.
 
-use objc2_core_graphics::{CGContext, CGColor};
+use objc2_core_foundation::kCFBooleanTrue;
+use objc2_core_foundation::{
+    CFBoolean, CFMutableAttributedString, CFNumber, CFRange, CFRetained, CFString, CGFloat,
+    CGPoint, CGRect, CGSize,
+};
+use objc2_core_graphics::{CGColor, CGContext};
 use objc2_core_text::{
-    CTFont,
-    CTLine,
-    kCTFontAttributeName,
-    kCTForegroundColorFromContextAttributeName,
+    CTFont, CTLine, kCTFontAttributeName, kCTForegroundColorFromContextAttributeName,
     kCTLigatureAttributeName,
 };
-use objc2_core_foundation::{
-    CFBoolean,
-    CFMutableAttributedString,
-    CFNumber,
-    CFRange,
-    CFString,
-    CFRetained,
-    CGPoint,
-    CGRect,
-    CGSize,
-    CGFloat,
-};
-use objc2_core_foundation::kCFBooleanTrue;
 
 use std::ptr::null;
 
+use crate::consts::PANEL_HEIGHT;
 use crate::settings::{CursorShape, Settings};
-use crate::consts::{PANEL_HEIGHT};
 use crate::terminal::CellSnapshot;
 
 /// Horizontal padding of the grid inside the silhouette (each side).
@@ -75,7 +64,11 @@ pub fn draw_grid(
 ) {
     let ctx_opt = Some(ctx);
     let cols = if grid.is_empty() { 0 } else { grid[0].len() };
-    let used_cols = if cell_width > 0.0 { (usable / cell_width).floor() as usize } else { cols };
+    let used_cols = if cell_width > 0.0 {
+        (usable / cell_width).floor() as usize
+    } else {
+        cols
+    };
     let used_cols = if used_cols < cols { used_cols } else { cols };
 
     // y-up space: the baseline sits `descent` ABOVE the row rect's bottom
@@ -131,7 +124,10 @@ pub fn draw_grid(
                     col += 1;
                 }
 
-                let run_text: String = cells[start..col + 1].iter().map(|cell| cell.character).collect();
+                let run_text: String = cells[start..col + 1]
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect();
                 let text = CFString::from_str(&run_text);
                 let line = unsafe { run(font, &text, settings.ligatures) };
                 CGContext::save_g_state(ctx_opt);
@@ -160,24 +156,18 @@ pub fn draw_grid(
                 );
                 let x = x0 + column as CGFloat * cell_width;
                 match settings.cursor_shape {
-                  CursorShape::Block =>
-                    CGContext::fill_rect(
+                    CursorShape::Block => CGContext::fill_rect(
                         ctx_opt,
-                        CGRect::new(
-                            CGPoint::new(x, top),
-                            CGSize::new(cell_width, h),
-                        ),
+                        CGRect::new(CGPoint::new(x, top), CGSize::new(cell_width, h)),
                     ),
-                  CursorShape::Bar =>
-                    CGContext::fill_rect(
+                    CursorShape::Bar => CGContext::fill_rect(
                         ctx_opt,
                         CGRect::new(
                             CGPoint::new(x, top),
                             CGSize::new(cell_width * CURSOR_STROKE_FRACTION, h),
                         ),
                     ),
-                  CursorShape::Underline =>
-                    CGContext::fill_rect(
+                    CursorShape::Underline => CGContext::fill_rect(
                         ctx_opt,
                         CGRect::new(
                             CGPoint::new(x, top),
@@ -195,10 +185,15 @@ pub fn draw_grid(
 /// The (bottom, height) of grid row `row` in the y-up layer space: the grid
 /// hangs from the panel top, and rows below the silhouette bottom
 /// (`PANEL_HEIGHT - height`) are skipped.
-fn row_rect(row: usize, cell_height: CGFloat, height: CGFloat, header: CGFloat) -> Option<(CGFloat, CGFloat)> {
+fn row_rect(
+    row: usize,
+    cell_height: CGFloat,
+    height: CGFloat,
+    header: CGFloat,
+) -> Option<(CGFloat, CGFloat)> {
     let bottom = PANEL_HEIGHT - GRID_TOP_PAD - header - (row as CGFloat + 1.0) * cell_height;
     if bottom < PANEL_HEIGHT - height {
-        return None
+        return None;
     }
     Some((bottom, cell_height))
 }
@@ -227,9 +222,15 @@ fn srgb(rgb: (CGFloat, CGFloat, CGFloat)) -> CFRetained<CGColor> {
 /// with glyph NAMES, not glyph count, which stays 2 either way (lesson 1).
 unsafe fn run(font: &CTFont, text: &CFString, ligatures: bool) -> CFRetained<CTLine> {
     let attr = CFMutableAttributedString::new(None, 0).expect("an attributed string");
-    let insert = CFRange { location: 0, length: 0 };
+    let insert = CFRange {
+        location: 0,
+        length: 0,
+    };
     unsafe { CFMutableAttributedString::replace_string(Some(&*attr), insert, Some(text)) };
-    let full = CFRange { location: 0, length: text.length() };
+    let full = CFRange {
+        location: 0,
+        length: text.length(),
+    };
     unsafe {
         CFMutableAttributedString::set_attribute(
             Some(&*attr),

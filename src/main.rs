@@ -8,52 +8,36 @@
 
 pub mod consts;
 
-pub mod window;
-pub mod hotkey;
 pub mod animation;
 pub mod font;
+pub mod hotkey;
 pub mod notch_view;
-pub mod terminal;
 pub mod render;
 pub mod settings;
 pub mod settings_window;
-
+pub mod terminal;
+pub mod window;
 
 use std::cell::OnceCell;
 type Monitor = Option<Retained<AnyObject>>;
 use std::ptr::NonNull;
 
 use objc2::ClassType;
-use objc2::define_class;
 use objc2::DefinedClass;
+use objc2::MainThreadOnly;
+use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
-use objc2::MainThreadOnly;
+use objc2::sel;
 use objc2_app_kit::{
-    NSApplication,
-    NSApplicationActivationPolicy,
-    NSApplicationDelegate,
-    NSApplicationDidChangeScreenParametersNotification,
-    NSPanel,
-    NSEvent,
-    NSEventMask,
-    NSEventType,
-
-
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSApplicationDidChangeScreenParametersNotification, NSEvent, NSEventMask, NSEventType, NSPanel,
 };
 use objc2_foundation::{
-    MainThreadMarker,
-    NSObjectProtocol,
-    NSNotification,
-    NSNotificationCenter,
-    NSPoint,
-    NSRect,
-    NSSize,
-    NSTimer,
-    NSTimeInterval,
+    MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPoint, NSRect,
+    NSSize, NSTimeInterval, NSTimer,
 };
-use objc2::sel;
 
 use block2::RcBlock;
 
@@ -99,7 +83,8 @@ define_class!(
             let ivars = self.ivars();
 
             // The panel window and its content view.
-            let (panel, content_view) = create_panel(mtm);            let _ = ivars.panel.set(panel);
+            let (panel, content_view) = create_panel(mtm);
+            let _ = ivars.panel.set(panel);
 
             // The silhouette view: a layer-backed, flipped subview sized to
             // the whole panel, so its drawing uses a top-left origin, y-down
@@ -109,12 +94,10 @@ define_class!(
             // `updateLayer`, whose graphics context was nil here; the plain
             // `drawRect:` path (below) always has a current context.
             content_view.addSubview(view.as_super());
-            view.as_super().setFrame(
-                NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(crate::window::canvas_size(mtm), PANEL_HEIGHT),
-                ),
-            );
+            view.as_super().setFrame(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(crate::window::canvas_size(mtm), PANEL_HEIGHT),
+            ));
             let _ = ivars.view.set(view.clone());
             let screen = crate::window::notch_screen(mtm);
             if screen.is_some() {
@@ -151,17 +134,15 @@ define_class!(
             // claims focus); returning nil lets the event keep going to the
             // rest of the desktop.
             let view_for_keys = view.clone();
-            let key_block = RcBlock::new(
-                move |event: NonNull<NSEvent>| -> *mut NSEvent {
-                    if MainThreadMarker::new().is_some() {
-                        let event_ref = unsafe { event.as_ref() };
-                        if event_ref.r#type() == NSEventType::KeyDown {
-                            view_for_keys.handle_key(event_ref);
-                        }
+            let key_block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+                if MainThreadMarker::new().is_some() {
+                    let event_ref = unsafe { event.as_ref() };
+                    if event_ref.r#type() == NSEventType::KeyDown {
+                        view_for_keys.handle_key(event_ref);
                     }
-                    std::ptr::null_mut()
-                },
-            );
+                }
+                std::ptr::null_mut()
+            });
             let local_monitor = unsafe {
                 NSEvent::addLocalMonitorForEventsMatchingMask_handler(
                     NSEventMask::KeyDown,
@@ -178,13 +159,11 @@ define_class!(
             // via the absolute mouse location. The two paths don't double-fire
             // (a click either hits the panel or is dispatched elsewhere).
             let view_for_clicks = view.clone();
-            let click_block = RcBlock::new(
-                move |event: NonNull<NSEvent>| {
-                    if MainThreadMarker::new().is_some() {
-                        view_for_clicks.handle_click(unsafe { event.as_ref() });
-                    }
-                },
-            );
+            let click_block = RcBlock::new(move |event: NonNull<NSEvent>| {
+                if MainThreadMarker::new().is_some() {
+                    view_for_clicks.handle_click(unsafe { event.as_ref() });
+                }
+            });
             let click_monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
                 NSEventMask::LeftMouseDown,
                 &click_block,
@@ -194,13 +173,11 @@ define_class!(
             // silently drop this one (that was the old bug that killed the
             // wheel).
             let view_for_wheel = view.clone();
-            let wheel_block = RcBlock::new(
-                move |event: NonNull<NSEvent>| {
-                    if MainThreadMarker::new().is_some() {
-                        view_for_wheel.scroll_wheel(unsafe { event.as_ref() }.deltaY());
-                    }
-                },
-            );
+            let wheel_block = RcBlock::new(move |event: NonNull<NSEvent>| {
+                if MainThreadMarker::new().is_some() {
+                    view_for_wheel.scroll_wheel(unsafe { event.as_ref() }.deltaY());
+                }
+            });
             let wheel_monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
                 NSEventMask::ScrollWheel,
                 &wheel_block,
@@ -219,11 +196,9 @@ define_class!(
             // documented NSApplication notification instead.
             let center = NSNotificationCenter::defaultCenter();
             let view_for_screen = view.clone();
-            let screen_block = RcBlock::new(
-                move |_note: NonNull<NSNotification>| {
-                    view_for_screen.reposition();
-                },
-            );
+            let screen_block = RcBlock::new(move |_note: NonNull<NSNotification>| {
+                view_for_screen.reposition();
+            });
             let screen_observer = unsafe {
                 center.addObserverForName_object_queue_usingBlock(
                     Some(NSApplicationDidChangeScreenParametersNotification),
@@ -236,7 +211,8 @@ define_class!(
 
             // dirty from an ivar change, so a repeating timer drives the
             // animation passes. `tick` no-ops once the spring settles.
-            let tick_proto: &ProtocolObject<dyn NSObjectProtocol> = ProtocolObject::from_ref(&*view);
+            let tick_proto: &ProtocolObject<dyn NSObjectProtocol> =
+                ProtocolObject::from_ref(&*view);
             let tick_target: &AnyObject = tick_proto.as_ref();
             let tick_timer = unsafe {
                 NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
@@ -248,7 +224,9 @@ define_class!(
                 )
             };
             let _ = ivars.tick_timer.set(tick_timer);
-            let _ = ivars.monitors.set((local_monitor, click_monitor, wheel_monitor));
+            let _ = ivars
+                .monitors
+                .set((local_monitor, click_monitor, wheel_monitor));
             // Take over from any other app and activate. Required because
             // Cargo builds an unbundled binary (no .app bundle / no launch
             // request).

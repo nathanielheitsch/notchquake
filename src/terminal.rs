@@ -12,26 +12,26 @@
 //! would resolve `pw_shell` itself when `shell` is `None`, but it spawns
 //! `login -flp … /bin/zsh -fc …`, which is not the documented `-l -i` argv.)
 
+use libc::c_void;
 use libc::getpwuid;
 use libc::getuid;
 use libc::passwd;
-use libc::c_void;
 use libc::pid_t;
 use libc::proc_name;
 use libc::proc_pidpath;
 use libc::tcgetpgrp;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::collections::HashMap;
 use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
@@ -39,10 +39,12 @@ use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::color::{Colors};
-use alacritty_terminal::tty::{ChildEvent, EventedPty, EventedReadWrite, new as pty_new, Options, Pty, Shell};
+use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::tty::{
+    ChildEvent, EventedPty, EventedReadWrite, Options, Pty, Shell, new as pty_new,
+};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiRgb};
 use alacritty_terminal::vte::{Parser as VteParser, Perform};
 use polling::{Event as PollingEvent, PollMode, Poller};
@@ -129,7 +131,7 @@ struct OscHandler<'a> {
 impl Perform for OscHandler<'_> {
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         if params.is_empty() || params[0].is_empty() {
-            return
+            return;
         }
         // A poisoned lock here would mean a panic on the render thread; the
         // parse path must never panic or block, so treat poisoning as "drop
@@ -155,7 +157,8 @@ impl Perform for OscHandler<'_> {
                         state.exit_status = None;
                         state.command_started = Some(std::time::Instant::now());
                     } else if *kind == b"D" {
-                        let status = params.get(2)
+                        let status = params
+                            .get(2)
                             .and_then(|s| std::str::from_utf8(s).ok())
                             .and_then(|s| s.trim().parse::<i32>().ok())
                             .unwrap_or(0);
@@ -194,7 +197,8 @@ impl Perform for OscHandler<'_> {
                         state.tint = None;
                         state.tint_parts = (None, None, None);
                     } else if params.len() >= 6 && params[4] == b"brightness" {
-                        let value = std::str::from_utf8(params[5]).ok()
+                        let value = std::str::from_utf8(params[5])
+                            .ok()
                             .and_then(|s| s.trim().parse::<u8>().ok());
                         state.set_tint_channel(channel, value);
                     }
@@ -204,7 +208,8 @@ impl Perform for OscHandler<'_> {
             b"7501" => {
                 if let Some(body) = params.get(1) {
                     if let Ok(text) = std::str::from_utf8(body) {
-                        let (mut state_s, mut app, mut msg) = (String::new(), String::new(), String::new());
+                        let (mut state_s, mut app, mut msg) =
+                            (String::new(), String::new(), String::new());
                         for field in text.split(':') {
                             if let Some(v) = field.strip_prefix("state=") {
                                 state_s = v.to_string();
@@ -222,10 +227,14 @@ impl Perform for OscHandler<'_> {
             }
             // Progress (T2c): `OSC 9;4;<st>;<pr>`.
             b"9" if params.get(1) == Some(&b"4".as_slice()) => {
-                let st = params.get(2).and_then(|s| std::str::from_utf8(s).ok())
+                let st = params
+                    .get(2)
+                    .and_then(|s| std::str::from_utf8(s).ok())
                     .and_then(|s| s.trim().parse::<i32>().ok())
                     .unwrap_or(-1);
-                let pr = params.get(3).and_then(|s| std::str::from_utf8(s).ok())
+                let pr = params
+                    .get(3)
+                    .and_then(|s| std::str::from_utf8(s).ok())
                     .and_then(|s| s.trim().parse::<i32>().ok())
                     .unwrap_or(-1);
                 state.progress = if st < 0 { None } else { Some((st, pr)) };
@@ -260,7 +269,15 @@ pub(crate) struct TeePty {
 impl TeePty {
     fn new(inner: Pty, state: Arc<Mutex<OscState>>, activity: Arc<AtomicBool>) -> Self {
         let fd = inner.file().as_raw_fd();
-        Self { inner, reader: OscReader { fd, parser: VteParser::new(), state, activity } }
+        Self {
+            inner,
+            reader: OscReader {
+                fd,
+                parser: VteParser::new(),
+                state,
+                activity,
+            },
+        }
     }
 }
 
@@ -285,16 +302,18 @@ impl Read for OscReader {
         // `Pty`'s own `File::read` would do, so the terminal sees no change.
         let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
         if n < 0 {
-            return Err(io::Error::last_os_error())
+            return Err(io::Error::last_os_error());
         }
         let n = n as usize;
         if n > 0 {
             // Hand the EXACT bytes the caller is about to receive to the vte
             // processor; the real `Term` gets the same slice via the EventLoop
             // afterwards, so both parsers stay byte-synchronized.
-            let mut handler = OscHandler { state: &self.state, activity: &self.activity };
+            let mut handler = OscHandler {
+                state: &self.state,
+                activity: &self.activity,
+            };
             self.parser.advance(&mut handler, &buf[..n]);
-
         }
         Ok(n)
     }
@@ -541,14 +560,15 @@ static NEXT_SHIM_ID: AtomicUsize = AtomicUsize::new(0);
 fn install_zsh_integration(shell: &str) -> Option<(String, String)> {
     let base = Path::new(shell).file_name()?.to_str()?;
     if base != "zsh" {
-        return None
+        return None;
     }
     // The dir zsh WOULD have used: ZDOTDIR when set, else HOME.
-    let real = std::env::var("ZDOTDIR").ok()
+    let real = std::env::var("ZDOTDIR")
+        .ok()
         .filter(|d| !d.is_empty())
         .or_else(|| std::env::var("HOME").ok().filter(|d| !d.is_empty()))?;
     let id = NEXT_SHIM_ID.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("bnt-zdotdir-{}-{}", std::process::id(), id));
+    let dir = std::env::temp_dir().join(format!("nq-zdotdir-{}-{}", std::process::id(), id));
     std::fs::create_dir_all(&dir).ok()?;
 
     // The hook emitter, sourced at the TOP of the `.zshrc` loader so it
@@ -601,7 +621,7 @@ fn install_zsh_integration(shell: &str) -> Option<(String, String)> {
         );
         if std::fs::write(dir.join(name), loader).is_err() {
             let _ = std::fs::remove_dir_all(&dir);
-            return None
+            return None;
         }
     }
 
@@ -657,7 +677,14 @@ impl Session {
     /// cursor color) baked into this session; it is copied here on the MAIN
     /// thread and read back in `snapshot()`, so the reader thread never has
     /// to see it and the OSC tee path stays untouched.
-    pub fn new(rows: usize, columns: usize, cell_width: f64, cell_height: f64, scrollback: usize, palette: &Settings) -> Self {
+    pub fn new(
+        rows: usize,
+        columns: usize,
+        cell_width: f64,
+        cell_height: f64,
+        scrollback: usize,
+        palette: &Settings,
+    ) -> Self {
         let shell = login_shell().expect("the current user has a login shell");
         let listener = TitleListener::new();
 
@@ -667,16 +694,19 @@ impl Session {
         // so without this the tee parses nothing and T1c/T2a cannot fire.
         let mut env = HashMap::new();
         let shim_dir = match install_zsh_integration(&shell) {
-          Some((zdotdir, real)) => {
-              env.insert("ZDOTDIR".to_string(), zdotdir.clone());
-              env.insert("BNT_USER_ZDOTDIR".to_string(), real);
-              Some(PathBuf::from(zdotdir))
-          }
-          None => None,
+            Some((zdotdir, real)) => {
+                env.insert("ZDOTDIR".to_string(), zdotdir.clone());
+                env.insert("BNT_USER_ZDOTDIR".to_string(), real);
+                Some(PathBuf::from(zdotdir))
+            }
+            None => None,
         };
 
         let options = Options {
-            shell: Some(Shell::new(shell.clone(), ["-l", "-i"].map(|arg| arg.to_string()).to_vec())),
+            shell: Some(Shell::new(
+                shell.clone(),
+                ["-l", "-i"].map(|arg| arg.to_string()).to_vec(),
+            )),
             working_directory: None,
             drain_on_exit: true,
             env,
@@ -713,7 +743,10 @@ impl Session {
 
         let terminal = Arc::new(FairMutex::new(Term::new(
             config,
-            &NotchSize { screen_lines: rows, columns },
+            &NotchSize {
+                screen_lines: rows,
+                columns,
+            },
             listener.clone(),
         )));
 
@@ -768,12 +801,15 @@ impl Session {
     /// hands `pty_new`.
     pub fn resize(&mut self, rows: usize, columns: usize, cell_width: f64, cell_height: f64) {
         if rows == self.rows && columns == self.columns {
-            return
+            return;
         }
         self.rows = rows;
         self.columns = columns;
         let mut terminal = self.terminal.lock();
-        terminal.resize(NotchSize { screen_lines: rows, columns });
+        terminal.resize(NotchSize {
+            screen_lines: rows,
+            columns,
+        });
         let _ = self.sender.send(Msg::Resize(WindowSize {
             num_lines: rows as u16,
             num_cols: columns as u16,
@@ -794,23 +830,30 @@ impl Session {
     ///
     /// Rows are returned top to bottom; each row has exactly `columns` cells.
     pub fn snapshot(&self) -> Vec<Vec<CellSnapshot>> {
-    let terminal = self.terminal.lock();
-    let grid = terminal.grid();
-    let offset = grid.display_offset();
-    let colors = terminal.colors();
+        let terminal = self.terminal.lock();
+        let grid = terminal.grid();
+        let offset = grid.display_offset();
+        let colors = terminal.colors();
 
-    let rows = (0..self.rows).map(|line| {
-        (0..self.columns).map(|column| {
-                let cell = &grid[Line((offset + line) as i32)][Column(column)];
-                let inverse = cell.flags.intersects(Flags::INVERSE);
-                let (fg, bg) = (resolve(colors, cell.fg, &self.palette), resolve(colors, cell.bg, &self.palette));
-                CellSnapshot {
-                    character: cell.c,
-                    foreground: if inverse { bg } else { fg },
-                    background: if inverse { fg } else { bg },
-                }
-            }).collect()
-        }).collect();
+        let rows = (0..self.rows)
+            .map(|line| {
+                (0..self.columns)
+                    .map(|column| {
+                        let cell = &grid[Line((offset + line) as i32)][Column(column)];
+                        let inverse = cell.flags.intersects(Flags::INVERSE);
+                        let (fg, bg) = (
+                            resolve(colors, cell.fg, &self.palette),
+                            resolve(colors, cell.bg, &self.palette),
+                        );
+                        CellSnapshot {
+                            character: cell.c,
+                            foreground: if inverse { bg } else { fg },
+                            background: if inverse { fg } else { bg },
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
 
         rows
     }
@@ -821,9 +864,12 @@ impl Session {
         let terminal = self.terminal.lock();
         let grid = terminal.grid();
         if grid.display_offset() != 0 {
-            return None
+            return None;
         }
-        Some((grid.cursor.point.line.0 as usize, grid.cursor.point.column.0))
+        Some((
+            grid.cursor.point.line.0 as usize,
+            grid.cursor.point.column.0,
+        ))
     }
 
     /// Whether the child shell has exited (`Event::ChildExit` /
@@ -849,8 +895,8 @@ impl Session {
     pub fn title(&self) -> String {
         let base = self.base_title();
         match self.foreground_program() {
-          Some(prog) if !prog.is_empty() && base != prog => format!("{base} ({prog})"),
-          _ => base
+            Some(prog) if !prog.is_empty() && base != prog => format!("{base} ({prog})"),
+            _ => base,
         }
     }
 
@@ -863,16 +909,19 @@ impl Session {
         // suffix. `~`-collapse home and keep at most the last two components.
         if let Some(cwd) = self.cwd() {
             if let Some(short) = shorten_cwd(&cwd) {
-                return short
+                return short;
             }
         }
         if let Some(t) = self.listener.title() {
             if !t.trim().is_empty() {
-                return t
+                return t;
             }
         }
-        std::path::Path::new(&self.shell).file_name().and_then(|n| n.to_str())
-            .map(|s| s.to_string()).unwrap_or_else(|| "shell".to_string())
+        std::path::Path::new(&self.shell)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "shell".to_string())
     }
 
     /// The shell-integration cwd for this session (OSC 1337;CurrentDir), or
@@ -886,13 +935,13 @@ impl Session {
     /// small strings.
     pub fn osc(&self) -> OscSnapshot {
         match self.osc.lock() {
-          Ok(g) => OscSnapshot {
-              tint: g.tint,
-              exit_status: g.exit_status,
-              program: g.program.clone(),
-              progress: g.progress,
-          },
-          Err(_) => OscSnapshot::default(),
+            Ok(g) => OscSnapshot {
+                tint: g.tint,
+                exit_status: g.exit_status,
+                program: g.program.clone(),
+                progress: g.progress,
+            },
+            Err(_) => OscSnapshot::default(),
         }
     }
 
@@ -931,27 +980,26 @@ impl Session {
         let fg = unsafe { tcgetpgrp(self.master_fd) };
         let pid = if fg > 0 { fg } else { self.child_pid };
         if pid <= 0 {
-            return None
+            return None;
         }
 
         // SAFETY: `proc_pidpath` writes a NUL-terminated path into the
         // caller-owned buffer; 4096 >= PATH_MAX (1024 on macOS) so the path
         // always fits and the bytes we read below are NUL-terminated.
         let mut path = [0u8; 4096];
-        let written = unsafe {
-            proc_pidpath(pid, path.as_mut_ptr() as *mut c_void, path.len() as u32)
-        };
+        let written =
+            unsafe { proc_pidpath(pid, path.as_mut_ptr() as *mut c_void, path.len() as u32) };
         if written > 0 {
             let bytes = &path[..written as usize];
             let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
             let bytes = &bytes[..end];
             let name = match bytes.iter().rposition(|b| *b == b'/') {
-              Some(slash) => &bytes[slash + 1..],
-              _ => bytes
+                Some(slash) => &bytes[slash + 1..],
+                _ => bytes,
             };
             match String::from_utf8(name.to_vec()).ok() {
-              Some(name) if !name.is_empty() => return Some(name),
-              _ => {}
+                Some(name) if !name.is_empty() => return Some(name),
+                _ => {}
             }
         }
 
@@ -960,13 +1008,19 @@ impl Session {
         // SAFETY: same buffer contract — 256 exceeds `MAXCOMLEN` (15 on
         // macOS), so the NUL terminator is always inside the buffer.
         let mut name_buf = [0u8; 256];
-        let written = unsafe { proc_name(pid, name_buf.as_mut_ptr() as *mut c_void, name_buf.len() as u32) };
+        let written = unsafe {
+            proc_name(
+                pid,
+                name_buf.as_mut_ptr() as *mut c_void,
+                name_buf.len() as u32,
+            )
+        };
         if written > 0 {
             let bytes = &name_buf[..written as usize];
             let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
             match String::from_utf8(bytes[..end].to_vec()).ok() {
-              Some(string) if !string.is_empty() => return Some(string),
-              _ => {}
+                Some(string) if !string.is_empty() => return Some(string),
+                _ => {}
             }
         }
         None
@@ -990,7 +1044,10 @@ impl Session {
     /// view's notifier consumes it once, so a long command notifies its owner
     /// at most once (T2a).
     pub fn take_finished(&self) -> Option<(i32, f64)> {
-        self.osc.lock().ok().and_then(|mut g| g.pending_finish.take())
+        self.osc
+            .lock()
+            .ok()
+            .and_then(|mut g| g.pending_finish.take())
     }
 }
 
@@ -1013,14 +1070,18 @@ pub struct OscSnapshot {
 fn shorten_cwd(path: &str) -> Option<String> {
     let path = path.trim();
     if path.is_empty() {
-        return None
+        return None;
     }
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
     let collapsed = match &home {
         Some(home) => {
-            if path == home { "~".to_string() }
-            else if let Some(rest) = path.strip_prefix(&format!("{home}/")) { format!("~/{rest}") }
-            else { path.to_string() }
+            if path == home {
+                "~".to_string()
+            } else if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
+                format!("~/{rest}")
+            } else {
+                path.to_string()
+            }
         }
         None => path.to_string(),
     };
@@ -1028,12 +1089,34 @@ fn shorten_cwd(path: &str) -> Option<String> {
     // Keep the leading `~` (if any) plus the last two real components.
     let tail: Vec<&str> = if collapsed.starts_with('~') {
         let mut v = vec!["~"];
-        v.extend(parts.iter().copied().filter(|p| *p != "~").rev().take(2).collect::<Vec<_>>().into_iter().rev());
+        v.extend(
+            parts
+                .iter()
+                .copied()
+                .filter(|p| *p != "~")
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev(),
+        );
         v
     } else {
-        parts.iter().copied().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect()
+        parts
+            .iter()
+            .copied()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     };
-    let out = if collapsed.starts_with('~') { tail.join("/") } else { format!("/{}", tail.join("/")) };
+    let out = if collapsed.starts_with('~') {
+        tail.join("/")
+    } else {
+        format!("/{}", tail.join("/"))
+    };
     Some(out)
 }
 
@@ -1043,7 +1126,11 @@ fn shorten_cwd(path: &str) -> Option<String> {
 /// color operations, so a `None` entry falls back to our own default palette.
 fn resolve(colors: &Colors, color: AnsiColor, palette: &Settings) -> (f64, f64, f64) {
     match color {
-        AnsiColor::Spec(rgb) => (rgb.r as f64 / 255.0, rgb.g as f64 / 255.0, rgb.b as f64 / 255.0),
+        AnsiColor::Spec(rgb) => (
+            rgb.r as f64 / 255.0,
+            rgb.g as f64 / 255.0,
+            rgb.b as f64 / 255.0,
+        ),
         AnsiColor::Indexed(index) => palette_or(colors, index as usize, palette),
         AnsiColor::Named(named) => palette_or(colors, named as usize, palette),
     }
@@ -1053,7 +1140,11 @@ fn resolve(colors: &Colors, color: AnsiColor, palette: &Settings) -> (f64, f64, 
 /// the session's own default palette.
 fn palette_or(colors: &Colors, index: usize, palette: &Settings) -> (f64, f64, f64) {
     if let Some(rgb) = colors[index] {
-        return (rgb.r as f64 / 255.0, rgb.g as f64 / 255.0, rgb.b as f64 / 255.0)
+        return (
+            rgb.r as f64 / 255.0,
+            rgb.g as f64 / 255.0,
+            rgb.b as f64 / 255.0,
+        );
     }
     default_color(index, palette)
 }
@@ -1066,7 +1157,7 @@ fn palette_or(colors: &Colors, index: usize, palette: &Settings) -> (f64, f64, f
 fn default_color(index: usize, palette: &Settings) -> (f64, f64, f64) {
     if index < 16 {
         let (r, g, b) = palette.ansi[index].rgb();
-        return (r, g, b)
+        return (r, g, b);
     }
     // Named defaults (256..268): 256 foreground, 257 background, 258 cursor,
     // 259..267 dim variants, 267 bright foreground, 268 dim background.
@@ -1081,7 +1172,7 @@ fn default_color(index: usize, palette: &Settings) -> (f64, f64, f64) {
         } else {
             palette.foreground.rgb()
         };
-        return (r, g, b)
+        return (r, g, b);
     }
     // Color cube (16..232) and grayscale ramp (233..255): approximate.
     if index < 232 {
@@ -1090,7 +1181,7 @@ fn default_color(index: usize, palette: &Settings) -> (f64, f64, f64) {
         let r = steps[c / 36 % 6];
         let g = steps[c / 6 % 6];
         let b = steps[c % 6];
-        return (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
+        return (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
     }
     let v = 8 + (index - 233) * 10;
     (v as f64 / 255.0, v as f64 / 255.0, v as f64 / 255.0)
@@ -1110,7 +1201,10 @@ pub fn notify(title: &str, message: &str) {
         escape(title),
     );
     std::thread::spawn(move || {
-        let _ = std::process::Command::new("osascript").arg("-e").arg(script).status();
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
     });
 }
 
@@ -1118,12 +1212,12 @@ pub fn notify(title: &str, message: &str) {
 pub fn login_shell() -> Option<String> {
     let entry = unsafe { getpwuid(getuid()) };
     if entry.is_null() {
-        return None
+        return None;
     }
 
     let shell = unsafe { (*entry).pw_shell };
     if shell.is_null() {
-        return None
+        return None;
     }
 
     let mut bytes = Vec::new();
@@ -1131,7 +1225,7 @@ pub fn login_shell() -> Option<String> {
     loop {
         let byte = unsafe { *shell.add(offset) };
         if byte == 0 {
-            break
+            break;
         }
         bytes.push(byte as u8);
         offset += 1;
@@ -1151,7 +1245,10 @@ mod tests {
         let activity = AtomicBool::new(false);
         let mut parser = VteParser::new();
         for chunk in bytes.chunks(chunks) {
-            let mut handler = OscHandler { state: &state, activity: &activity };
+            let mut handler = OscHandler {
+                state: &state,
+                activity: &activity,
+            };
             parser.advance(&mut handler, chunk);
         }
         state.into_inner().unwrap()
@@ -1170,7 +1267,10 @@ mod tests {
         let state = parse(&bytes, 1);
         assert_eq!(state.cwd.as_deref(), Some("/Users/me/projects/rust"));
         assert_eq!(state.exit_status, Some(1));
-        assert!(state.pending_finish.is_some(), "a started+finished command queues a finish");
+        assert!(
+            state.pending_finish.is_some(),
+            "a started+finished command queues a finish"
+        );
     }
 
     #[test]
@@ -1181,7 +1281,10 @@ mod tests {
         bytes.extend_from_slice(b"\x1b]133;D;0\x07");
         let state = parse(&bytes, 3);
         assert_eq!(state.exit_status, Some(0));
-        assert!(state.pending_finish.is_none(), "no command start -> no finish event");
+        assert!(
+            state.pending_finish.is_none(),
+            "no command start -> no finish event"
+        );
     }
 
     #[test]
@@ -1206,7 +1309,10 @@ mod tests {
         bytes.extend_from_slice(b"\x1b]9;4;1;42\x1b\\");
         let state = parse(&bytes, 7);
         assert_eq!(state.tint, Some((1.0, 0.0, 128.0 / 255.0)));
-        assert_eq!(state.program.as_ref().map(|(s, _, _)| s.as_str()), Some("error"));
+        assert_eq!(
+            state.program.as_ref().map(|(s, _, _)| s.as_str()),
+            Some("error")
+        );
         assert_eq!(state.progress, Some((1, 42)));
     }
 
@@ -1245,9 +1351,8 @@ mod tests {
         // shifted bytes would be caught by the equality assertion.
         let payload = b"hello\x1b]133;D;7\x07world\x1b]1337;CurrentDir=/tmp/z\x07!";
         // SAFETY: `payload` is a valid buffer and `write_fd` a valid fd.
-        let written = unsafe {
-            libc::write(write_fd, payload.as_ptr() as *const c_void, payload.len())
-        };
+        let written =
+            unsafe { libc::write(write_fd, payload.as_ptr() as *const c_void, payload.len()) };
         assert_eq!(written, payload.len() as isize);
         unsafe { libc::close(write_fd) };
 
@@ -1274,8 +1379,14 @@ mod tests {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/nobody".to_string());
         assert_eq!(shorten_cwd(&home).as_deref(), Some("~"));
         assert_eq!(shorten_cwd(&format!("{home}/a")).as_deref(), Some("~/a"));
-        assert_eq!(shorten_cwd(&format!("{home}/a/b/c")).as_deref(), Some("~/b/c"));
-        assert_eq!(shorten_cwd("/usr/local/share").as_deref(), Some("/local/share"));
+        assert_eq!(
+            shorten_cwd(&format!("{home}/a/b/c")).as_deref(),
+            Some("~/b/c")
+        );
+        assert_eq!(
+            shorten_cwd("/usr/local/share").as_deref(),
+            Some("/local/share")
+        );
         assert_eq!(shorten_cwd(""), None);
     }
 }

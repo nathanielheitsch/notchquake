@@ -9,9 +9,9 @@
 //! without any TCC grant and without the app being frontmost. It sees only
 //! the registered chord, never other keystrokes.
 
+use objc2::ClassType;
 use objc2::msg_send;
 use objc2::sel;
-use objc2::ClassType;
 use objc2_foundation::MainThreadMarker;
 
 use crate::notch_view::NotchView;
@@ -72,8 +72,11 @@ struct EventHotKeyID {
 
 type EventTargetRef = *mut std::ffi::c_void;
 type EventHandlerRef = *mut std::ffi::c_void;
-type EventHandlerUPP =
-    unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u32;
+type EventHandlerUPP = unsafe extern "C" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+) -> u32;
 type EventHotKeyRef = *mut std::ffi::c_void;
 
 use std::sync::atomic::AtomicUsize;
@@ -146,7 +149,10 @@ unsafe extern "C" fn hot_key_handler(
     user_data: *mut std::ffi::c_void,
 ) -> u32 {
     // Confirm this is the hot-key event we registered, then dispatch on its id.
-    let mut hot_id = EventHotKeyID { signature: 0, id: 0 };
+    let mut hot_id = EventHotKeyID {
+        signature: 0,
+        id: 0,
+    };
     let status = unsafe {
         GetEventParameter(
             event,
@@ -170,7 +176,7 @@ unsafe extern "C" fn hot_key_handler(
         match hot_id.id {
             HOTKEY_ID_TOGGLE => view.toggle(),
             HOTKEY_ID_NEW_TAB => view.spawn_tab(),
-            _ => {},
+            _ => {}
         }
     }
     0
@@ -188,11 +194,18 @@ fn register_chord(target: EventTargetRef, id: u32, chord: Chord) {
     let modifiers = modifier_mask(chord.option, chord.cmd, chord.shift, chord.ctrl);
     let mut hot_ref: EventHotKeyRef = std::ptr::null_mut();
     let status = unsafe {
-        RegisterEventHotKey(chord.key_code as u32, modifiers, hotkey_id, target, 0, &mut hot_ref)
+        RegisterEventHotKey(
+            chord.key_code as u32,
+            modifiers,
+            hotkey_id,
+            target,
+            0,
+            &mut hot_ref,
+        )
     };
     if status != 0 {
         eprintln!("notch-terminal: RegisterEventHotKey (id {id}) failed: {status}");
-        return
+        return;
     }
     if slot == 0 {
         HOT_REFS.0.swap(hot_ref as usize, Ordering::SeqCst);
@@ -215,7 +228,7 @@ fn unregister_hotkeys() {
 fn unregister_one(stored: &AtomicUsize) {
     let raw = stored.swap(0, Ordering::SeqCst);
     if raw == 0 {
-        return
+        return;
     }
     let status = unsafe { UnregisterEventHotKey(raw as *mut std::ffi::c_void) };
     if status != 0 {
@@ -275,8 +288,10 @@ pub fn reregister_hotkeys(mtm: MainThreadMarker, view: &NotchView, settings: Set
     unregister_hotkeys();
     let target = unsafe { GetApplicationEventTarget() };
     if target.is_null() {
-        eprintln!("notch-terminal: GetApplicationEventTarget() returned null during re-registration");
-        return false
+        eprintln!(
+            "notch-terminal: GetApplicationEventTarget() returned null during re-registration"
+        );
+        return false;
     }
     register_chord(target, HOTKEY_ID_TOGGLE, settings.toggle_chord);
     register_chord(target, HOTKEY_ID_NEW_TAB, settings.new_tab_chord);

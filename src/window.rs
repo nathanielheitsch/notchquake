@@ -12,9 +12,9 @@
 //! WITHOUT activating the app, so the previous frontmost app keeps focus.
 //! `canBecomeMainWindow -> false` prevents us from ever taking over main.
 
-use objc2::{ClassType, define_class, DefinedClass, msg_send};
-use objc2::rc::Retained;
 use objc2::MainThreadOnly;
+use objc2::rc::Retained;
+use objc2::{ClassType, DefinedClass, define_class, msg_send};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSMainMenuWindowLevel, NSPanel, NSScreen, NSView,
     NSWindowCollectionBehavior, NSWindowStyleMask,
@@ -71,14 +71,26 @@ fn physical_notch(screen: &NSScreen) -> bool {
 /// (`safeAreaInsets.top > 0`), else the one with the lowest frame height.
 pub fn notch_screen(mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
     let screens = NSScreen::screens(mtm);
-    let notched = screens.iter().filter(|screen| physical_notch(screen))
-        .reduce(|best, other| if other.frame().size.height < best.frame().size.height { other } else { best });
+    let notched = screens
+        .iter()
+        .filter(|screen| physical_notch(screen))
+        .reduce(|best, other| {
+            if other.frame().size.height < best.frame().size.height {
+                other
+            } else {
+                best
+            }
+        });
     if notched.is_some() {
-        return notched
+        return notched;
     }
-    screens.iter().reduce(|best, other|
-        if other.frame().size.height < best.frame().size.height { other } else { best }
-    )
+    screens.iter().reduce(|best, other| {
+        if other.frame().size.height < best.frame().size.height {
+            other
+        } else {
+            best
+        }
+    })
 }
 
 /// The physical notch size in logical points: the gap between the two
@@ -151,7 +163,9 @@ pub fn create_panel(mtm: MainThreadMarker) -> (Retained<NSPanel>, Retained<NSVie
     // the API-faithful equivalent of the plan's re-assert.)
     panel.setFrame_display(NSRect::new(origin, NSSize::new(canvas, PANEL_HEIGHT)), true);
 
-    let content_view = panel.contentView().expect("a panel always has a content view");
+    let content_view = panel
+        .contentView()
+        .expect("a panel always has a content view");
     (panel, content_view)
 }
 
@@ -165,8 +179,8 @@ pub fn canvas_width(screen: &NSScreen) -> CGFloat {
 /// (mirrors `notch_screen_origin`'s `expect`).
 pub fn canvas_size(mtm: MainThreadMarker) -> CGFloat {
     match notch_screen(mtm) {
-      Some(screen) => canvas_width(&screen),
-      _ => PANEL_WIDTH_FALLBACK,
+        Some(screen) => canvas_width(&screen),
+        _ => PANEL_WIDTH_FALLBACK,
     }
 }
 
@@ -175,4 +189,3 @@ fn notch_screen_origin(mtm: MainThreadMarker) -> NSPoint {
     let screen = notch_screen(mtm).expect("there is always a screen");
     panel_origin(screen.frame(), canvas_width(&screen))
 }
-

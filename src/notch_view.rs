@@ -12,42 +12,38 @@
 //! settled, marks the view dirty so AppKit calls `drawRect:` again next
 //! pass (~60Hz).
 
+use crate::animation::Spring;
+use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, NOTCH_WIDTH, PANEL_HEIGHT, PANEL_WIDTH};
+use crate::font::{cell_metrics, monospace_with, ui_font};
+use crate::render::{GRID_PAD, GRID_TOP_PAD, draw_grid};
+use crate::settings::Settings;
+use crate::settings_window::SettingsOwner;
+use crate::terminal::{OscSnapshot, Session};
+use core::ffi::c_double;
+use objc2::AnyThread;
 use objc2::ClassType;
-use objc2::define_class;
 use objc2::DefinedClass;
+use objc2::MainThreadOnly;
+use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::MainThreadOnly;
 use objc2::runtime::AnyObject;
-use objc2::AnyThread;
-use objc2_app_kit::{NSGraphicsContext, NSView, NSEvent, NSEventModifierFlags, NSTrackingArea, NSTrackingAreaOptions};
-use objc2_core_text::{CTFont, CTLine, CTLineTruncationType, kCTFontAttributeName, kCTForegroundColorFromContextAttributeName};
+use objc2_app_kit::{
+    NSEvent, NSEventModifierFlags, NSGraphicsContext, NSTrackingArea, NSTrackingAreaOptions, NSView,
+};
 use objc2_core_foundation::kCFBooleanTrue;
 use objc2_core_foundation::{
-    CFAbsoluteTimeGetCurrent,
-    CGFloat,
-    CFRetained,
-    CGPoint,
-    CGRect,
-    CGSize,
+    CFAbsoluteTimeGetCurrent, CFRetained, CGFloat, CGPoint, CGRect, CGSize,
 };
-use objc2_core_graphics::{CGColorSpace, CGColor, CGGradient, CGGradientDrawingOptions, CGContext};
-use objc2_core_foundation::{
-    CFMutableAttributedString,
-    CFRange,
-    CFString,
+use objc2_core_foundation::{CFMutableAttributedString, CFRange, CFString};
+use objc2_core_graphics::{CGColor, CGColorSpace, CGContext, CGGradient, CGGradientDrawingOptions};
+use objc2_core_text::{
+    CTFont, CTLine, CTLineTruncationType, kCTFontAttributeName,
+    kCTForegroundColorFromContextAttributeName,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize};
 use std::cell::Cell;
 use std::cell::OnceCell;
-use core::ffi::c_double;
-use crate::animation::Spring;
-use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, NOTCH_WIDTH, PANEL_HEIGHT, PANEL_WIDTH};
-use crate::font::{monospace_with, cell_metrics, ui_font};
-use crate::settings::Settings;
-use crate::render::{draw_grid, GRID_PAD, GRID_TOP_PAD};
-use crate::terminal::{OscSnapshot, Session};
-use crate::settings_window::SettingsOwner;
 
 /// Tab-bar geometry: an iTerm-style strip hanging from the silhouette's
 /// bottom edge — tabs are rounded-top-corner rectangles flush with the chin
@@ -154,7 +150,6 @@ const SETTINGS_BTN_W: CGFloat = 22.0;
 const SETTINGS_GEAR_R: CGFloat = 5.0;
 const SETTINGS_TOOTH_OUT: CGFloat = 2.5;
 const SETTINGS_TOOTH_W: CGFloat = 2.0;
-
 
 /// Instance variables of [`NotchView`].
 ///
@@ -393,7 +388,6 @@ fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat, canvas: CGF
     let (min_x, min_y) = ((canvas - w) / 2.0, PANEL_HEIGHT - h);
     let (max_x, max_y) = ((canvas + w) / 2.0, PANEL_HEIGHT);
 
-
     // Square top corners: a straight top edge at the menu bar (`max_y`),
     // quarter-circle arcs only at the chin (`min_y`). Traced counter-clockwise
     // from the left edge, with proper quarter-circle control points (kappa).
@@ -433,19 +427,9 @@ fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat, canvas: CGF
 /// Paints one frame: the black silhouette, then (once open) the terminal
 /// grid and the tab bar, all clipped to the silhouette.
 
-
-
 fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchViewIvars) {
-    let h = if height < 1.0 {
-        1.0
-    } else {
-        height
-    };
-    let w = if width < 1.0 {
-        1.0
-    } else {
-        width
-    };
+    let h = if height < 1.0 { 1.0 } else { height };
+    let w = if width < 1.0 { 1.0 } else { width };
 
     // The layer-backed view's context is already top-left, y-down (AppKit
     // flips layer-backed views), so drawing uses panel-local coordinates
@@ -504,7 +488,9 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
             let count = if ivars.spawned.get() { 1 } else { INITIAL_TABS };
             ivars.spawned.set(true);
             let (rows, columns, scrollback) = grid_dims(cell, header, settings);
-            sessions = (0..count).map(|_| Session::new(rows, columns, cell.0, cell.1, scrollback, &settings)).collect();
+            sessions = (0..count)
+                .map(|_| Session::new(rows, columns, cell.0, cell.1, scrollback, &settings))
+                .collect();
             // Select the new tab — `selected` starts as None and collapse
             // sets it None, so a fresh spawn must always own the selection
             // or `draw_grid` matches `_ => {}` and the terminal renders blank.
@@ -533,29 +519,29 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         // The grid, unconditional: the settings surface is a separate window
         // now, so the panel only ever draws the terminal.
         match ivars.selected.get().and_then(|i| sessions.get(i)) {
-          Some(session) => {
-            let grid = session.snapshot();
-            // The grid is laid out inside the LIVE silhouette: `grid_x0` is
-            // canvas-relative (the silhouette's left edge plus `GRID_PAD`), and
-            // `grid_usable` is the silhouette's inner width — the columns the
-            // session baked from `settings.open_width` are centred in it.
-            let grid_x0 = (canvas - w) / 2.0 + GRID_PAD;
-            let grid_usable = w - 2.0 * GRID_PAD;
-            draw_grid(
-                ctx.expect("a current context"),
-                &grid,
-                session.cursor(),
-                &font,
-                cell.0,
-                cell.1,
-                h,
-                header,
-                &settings,
-                grid_x0,
-                grid_usable,
-            )
-          }
-          _ => {}
+            Some(session) => {
+                let grid = session.snapshot();
+                // The grid is laid out inside the LIVE silhouette: `grid_x0` is
+                // canvas-relative (the silhouette's left edge plus `GRID_PAD`), and
+                // `grid_usable` is the silhouette's inner width — the columns the
+                // session baked from `settings.open_width` are centred in it.
+                let grid_x0 = (canvas - w) / 2.0 + GRID_PAD;
+                let grid_usable = w - 2.0 * GRID_PAD;
+                draw_grid(
+                    ctx.expect("a current context"),
+                    &grid,
+                    session.cursor(),
+                    &font,
+                    cell.0,
+                    cell.1,
+                    h,
+                    header,
+                    &settings,
+                    grid_x0,
+                    grid_usable,
+                )
+            }
+            _ => {}
         }
         // The shadow fade: a band of the TERMINAL background color, opaque
         // at the header's bottom edge and fading to transparent ~32pt down,
@@ -576,163 +562,177 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     // source of truth for strip geometry, the `+` rect and the `×` rect.
     let count = sessions.len();
     match tab_strip(h, w, count, canvas) {
-      Some((left, tab_w)) => {
-        let selected = ivars.selected.get();
-        let hovered = ivars.hovered.get();
-        for index in 0..count {
-            let x = left + index as CGFloat * tab_w;
-            // One OSC snapshot per tab, reused for the fill tint AND the dot,
-            // so both read a consistent state within the frame.
-            let osc = sessions.get(index).map(|s| s.osc()).unwrap_or_default();
-            let base = if Some(index) == selected { TAB_FILL_ACTIVE } else { TAB_FILL };
-            let fill = mix_tint(base, osc.tint);
-            CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(fill)));
-            CGContext::fill_rect(
-                ctx,
-                CGRect::new(CGPoint::new(x, chin_y), CGSize::new(tab_w, TAB_HEIGHT)),
-            );
-            // The attention dot: this tab wants the user's eyes (iTerm's "go
-            // look at that tab" marker). Colour precedence, most urgent first:
-            // error (7501 `error` or 9;4 `st=2`) > done (7501 `done`) > blue
-            // activity (a command finished / 133;D). ONE dot only, so a tab
-            // with several states still shows a single marker. Drawn only when
-            // the tab is neither selected nor hovered: the `×` occupies the same
-            // gutter on a hovered tab, and the selected tab is the one being
-            // looked at. The dot is a FILL (never a stroke: fill and stroke
-            // colour are separate CGContext state).
-            let looking = Some(index) == selected || hovered == Some(index);
-            let active = sessions.get(index).map(|s| s.has_activity()).unwrap_or(false);
-            if !looking {
-                if let Some(color) = attention_dot(&osc, active) {
-                    // y-up space: vertically centered in the tab, and centered
-                    // in the `×` gutter (`TAB_CLOSE_W` = 23pt) so it sits where
-                    // the title band's reservation already leaves room.
-                    let cx = x + TAB_CLOSE_W / 2.0;
-                    let cy = chin_y + TAB_HEIGHT / 2.0;
-                    CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(color)));
-                    CGContext::fill_ellipse_in_rect(
-                        ctx,
-                        CGRect::new(
-                            CGPoint::new(cx - DOT_D / 2.0, cy - DOT_D / 2.0),
-                            CGSize::new(DOT_D, DOT_D),
-                        ),
-                    );
-                }
-            }
-        }
-        // Separators between tabs + the active tab's side borders, one
-        // stroke pass in LINE color.
-        CGContext::begin_path(ctx);
-        for index in 1..count {
-            let x = left + index as CGFloat * tab_w;
-            CGContext::move_to_point(ctx, x, chin_y);
-            CGContext::add_line_to_point(ctx, x, chin_y + TAB_HEIGHT);
-        }
-        if let Some(sel) = selected {
-            if sel < count {
-                let x = left + sel as CGFloat * tab_w;
-                for bx in [x, x + tab_w] {
-                    CGContext::move_to_point(ctx, bx, chin_y);
-                    CGContext::add_line_to_point(ctx, bx, chin_y + TAB_HEIGHT);
-                }
-            }
-        }
-        CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(LINE)));
-        CGContext::set_line_width(ctx, 1.0);
-        CGContext::stroke_path(ctx);
-        // The `+` button at the right end: a real click target (spawns a
-        // session, see `spawn_tab`). Its rect derives from `tab_strip`'s
-        // outputs — same math as the hit-test in `click_at_screen_point`.
-        let px = left + count as CGFloat * tab_w;
-        CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TAB_FILL)));
-        CGContext::fill_rect(
-            ctx,
-            CGRect::new(CGPoint::new(px, chin_y), CGSize::new(TAB_PLUS_W, TAB_HEIGHT)),
-        );
-        let cx = px + TAB_PLUS_W / 2.0;
-        let cy = chin_y + TAB_HEIGHT * 0.55;
-        CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TEXT_ACTIVE)));
-        CGContext::fill_rect(
-            ctx,
-            CGRect::new(
-                CGPoint::new(cx - 5.0, cy - 0.75),
-                CGSize::new(10.0, 1.5),
-            ),
-        );
-        CGContext::fill_rect(
-            ctx,
-            CGRect::new(
-                CGPoint::new(cx - 0.75, cy - 5.0),
-                CGSize::new(1.5, 10.0),
-            ),
-        );
-
-        // The tab labels: the shell's OSC title, truncated so the right-aligned
-        // `⌘<n>` hint always stays visible. Active TEXT_ACTIVE, inactive
-        // TEXT_INACTIVE; ellipsis-truncated when too wide.
-        let label_font = ivars.label_font.get_or_init(|| ui_font(TAB_LABEL_SIZE));
-        let hint_font = ivars.hint_font.get_or_init(|| ui_font(TAB_HINT_SIZE));
-        for index in 0..count {
-            let x = left + index as CGFloat * tab_w;
-            let label = sessions.get(index)
-                .map(|s| s.title())
-                .unwrap_or_else(|| format!("Tab {}", index + 1));
-            // A nonzero `133;D` exit status tints the title red (T2a): the
-            // minimal render that reads at tab size — a red dot lives in the
-            // `×` gutter already used by attention, and a red label is
-            // unmistakable without a second affordance. Cleared on select,
-            // alongside the dot.
-            let failed = sessions.get(index)
-                .map(|s| s.osc().exit_status.map(|st| st != 0).unwrap_or(false))
-                .unwrap_or(false);
-            let color = if failed {
-                DOT_ERROR
-            } else if Some(index) == selected {
-                TEXT_ACTIVE
-            } else {
-                TEXT_INACTIVE
-            };
-            // The title band is `x + TAB_CLOSE_W + TAB_TITLE_PAD .. x +
-            // tab_w - TAB_HINT_W`. The `×` footprint and the hint reservation
-            // are BOTH reserved on EVERY tab, whether or not that tab currently
-            // draws a `×` (hover/selection only): the band is therefore
-            // identical for all tabs, so the title never re-centres — and thus
-            // never shifts or retruncates — when the pointer enters the strip.
-            let left_pad = TAB_CLOSE_W + TAB_TITLE_PAD;
-            draw_tab_label(ctx, Some(label_font), &label, x + left_pad, chin_y, tab_w - left_pad - TAB_HINT_W, color);
-            let hint = format!("\u{2318}{}", index + 1);
-            draw_tab_hint(ctx, Some(hint_font), &hint, x, chin_y, tab_w, HINT_ACCENT);
-        }
-        // The `×` close affordance: shown ONLY on a HOVERED tab (not the
-        // active one) — the pointer has to be on the tab to see/close it. LEFT-
-        // aligned in the tab (reference style). Drawn AFTER the labels so a
-        // long title cannot overpaint it.
-        for index in 0..count {
-            if hovered == Some(index) {
+        Some((left, tab_w)) => {
+            let selected = ivars.selected.get();
+            let hovered = ivars.hovered.get();
+            for index in 0..count {
                 let x = left + index as CGFloat * tab_w;
-                let (cx, cy) = close_center(x, chin_y);
-                // The reference style puts the `×` inside a rounded dark
-                // square button (gray fill, ~2x glyph size).
-                let b = CLOSE_R + CLOSE_BUTTON_PAD;
-                CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(LINE)));
+                // One OSC snapshot per tab, reused for the fill tint AND the dot,
+                // so both read a consistent state within the frame.
+                let osc = sessions.get(index).map(|s| s.osc()).unwrap_or_default();
+                let base = if Some(index) == selected {
+                    TAB_FILL_ACTIVE
+                } else {
+                    TAB_FILL
+                };
+                let fill = mix_tint(base, osc.tint);
+                CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(fill)));
                 CGContext::fill_rect(
                     ctx,
-                    CGRect::new(CGPoint::new(cx - b, cy - b), CGSize::new(b * 2.0, b * 2.0)),
+                    CGRect::new(CGPoint::new(x, chin_y), CGSize::new(tab_w, TAB_HEIGHT)),
                 );
-                CGContext::begin_path(ctx);
-                CGContext::move_to_point(ctx, cx - CLOSE_R, cy - CLOSE_R);
-                CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy + CLOSE_R);
-                CGContext::move_to_point(ctx, cx - CLOSE_R, cy + CLOSE_R);
-                CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy - CLOSE_R);
-                // Stroke color is separate state from fill — set it BEFORE
-                // `stroke_path` or the default opaque black is invisible.
-                CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(TEXT_ACTIVE)));
-                CGContext::set_line_width(ctx, 1.5);
-                CGContext::stroke_path(ctx);
+                // The attention dot: this tab wants the user's eyes (iTerm's "go
+                // look at that tab" marker). Colour precedence, most urgent first:
+                // error (7501 `error` or 9;4 `st=2`) > done (7501 `done`) > blue
+                // activity (a command finished / 133;D). ONE dot only, so a tab
+                // with several states still shows a single marker. Drawn only when
+                // the tab is neither selected nor hovered: the `×` occupies the same
+                // gutter on a hovered tab, and the selected tab is the one being
+                // looked at. The dot is a FILL (never a stroke: fill and stroke
+                // colour are separate CGContext state).
+                let looking = Some(index) == selected || hovered == Some(index);
+                let active = sessions
+                    .get(index)
+                    .map(|s| s.has_activity())
+                    .unwrap_or(false);
+                if !looking {
+                    if let Some(color) = attention_dot(&osc, active) {
+                        // y-up space: vertically centered in the tab, and centered
+                        // in the `×` gutter (`TAB_CLOSE_W` = 23pt) so it sits where
+                        // the title band's reservation already leaves room.
+                        let cx = x + TAB_CLOSE_W / 2.0;
+                        let cy = chin_y + TAB_HEIGHT / 2.0;
+                        CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(color)));
+                        CGContext::fill_ellipse_in_rect(
+                            ctx,
+                            CGRect::new(
+                                CGPoint::new(cx - DOT_D / 2.0, cy - DOT_D / 2.0),
+                                CGSize::new(DOT_D, DOT_D),
+                            ),
+                        );
+                    }
+                }
+            }
+            // Separators between tabs + the active tab's side borders, one
+            // stroke pass in LINE color.
+            CGContext::begin_path(ctx);
+            for index in 1..count {
+                let x = left + index as CGFloat * tab_w;
+                CGContext::move_to_point(ctx, x, chin_y);
+                CGContext::add_line_to_point(ctx, x, chin_y + TAB_HEIGHT);
+            }
+            if let Some(sel) = selected {
+                if sel < count {
+                    let x = left + sel as CGFloat * tab_w;
+                    for bx in [x, x + tab_w] {
+                        CGContext::move_to_point(ctx, bx, chin_y);
+                        CGContext::add_line_to_point(ctx, bx, chin_y + TAB_HEIGHT);
+                    }
+                }
+            }
+            CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(LINE)));
+            CGContext::set_line_width(ctx, 1.0);
+            CGContext::stroke_path(ctx);
+            // The `+` button at the right end: a real click target (spawns a
+            // session, see `spawn_tab`). Its rect derives from `tab_strip`'s
+            // outputs — same math as the hit-test in `click_at_screen_point`.
+            let px = left + count as CGFloat * tab_w;
+            CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TAB_FILL)));
+            CGContext::fill_rect(
+                ctx,
+                CGRect::new(
+                    CGPoint::new(px, chin_y),
+                    CGSize::new(TAB_PLUS_W, TAB_HEIGHT),
+                ),
+            );
+            let cx = px + TAB_PLUS_W / 2.0;
+            let cy = chin_y + TAB_HEIGHT * 0.55;
+            CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(TEXT_ACTIVE)));
+            CGContext::fill_rect(
+                ctx,
+                CGRect::new(CGPoint::new(cx - 5.0, cy - 0.75), CGSize::new(10.0, 1.5)),
+            );
+            CGContext::fill_rect(
+                ctx,
+                CGRect::new(CGPoint::new(cx - 0.75, cy - 5.0), CGSize::new(1.5, 10.0)),
+            );
+
+            // The tab labels: the shell's OSC title, truncated so the right-aligned
+            // `⌘<n>` hint always stays visible. Active TEXT_ACTIVE, inactive
+            // TEXT_INACTIVE; ellipsis-truncated when too wide.
+            let label_font = ivars.label_font.get_or_init(|| ui_font(TAB_LABEL_SIZE));
+            let hint_font = ivars.hint_font.get_or_init(|| ui_font(TAB_HINT_SIZE));
+            for index in 0..count {
+                let x = left + index as CGFloat * tab_w;
+                let label = sessions
+                    .get(index)
+                    .map(|s| s.title())
+                    .unwrap_or_else(|| format!("Tab {}", index + 1));
+                // A nonzero `133;D` exit status tints the title red (T2a): the
+                // minimal render that reads at tab size — a red dot lives in the
+                // `×` gutter already used by attention, and a red label is
+                // unmistakable without a second affordance. Cleared on select,
+                // alongside the dot.
+                let failed = sessions
+                    .get(index)
+                    .map(|s| s.osc().exit_status.map(|st| st != 0).unwrap_or(false))
+                    .unwrap_or(false);
+                let color = if failed {
+                    DOT_ERROR
+                } else if Some(index) == selected {
+                    TEXT_ACTIVE
+                } else {
+                    TEXT_INACTIVE
+                };
+                // The title band is `x + TAB_CLOSE_W + TAB_TITLE_PAD .. x +
+                // tab_w - TAB_HINT_W`. The `×` footprint and the hint reservation
+                // are BOTH reserved on EVERY tab, whether or not that tab currently
+                // draws a `×` (hover/selection only): the band is therefore
+                // identical for all tabs, so the title never re-centres — and thus
+                // never shifts or retruncates — when the pointer enters the strip.
+                let left_pad = TAB_CLOSE_W + TAB_TITLE_PAD;
+                draw_tab_label(
+                    ctx,
+                    Some(label_font),
+                    &label,
+                    x + left_pad,
+                    chin_y,
+                    tab_w - left_pad - TAB_HINT_W,
+                    color,
+                );
+                let hint = format!("\u{2318}{}", index + 1);
+                draw_tab_hint(ctx, Some(hint_font), &hint, x, chin_y, tab_w, HINT_ACCENT);
+            }
+            // The `×` close affordance: shown ONLY on a HOVERED tab (not the
+            // active one) — the pointer has to be on the tab to see/close it. LEFT-
+            // aligned in the tab (reference style). Drawn AFTER the labels so a
+            // long title cannot overpaint it.
+            for index in 0..count {
+                if hovered == Some(index) {
+                    let x = left + index as CGFloat * tab_w;
+                    let (cx, cy) = close_center(x, chin_y);
+                    // The reference style puts the `×` inside a rounded dark
+                    // square button (gray fill, ~2x glyph size).
+                    let b = CLOSE_R + CLOSE_BUTTON_PAD;
+                    CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(LINE)));
+                    CGContext::fill_rect(
+                        ctx,
+                        CGRect::new(CGPoint::new(cx - b, cy - b), CGSize::new(b * 2.0, b * 2.0)),
+                    );
+                    CGContext::begin_path(ctx);
+                    CGContext::move_to_point(ctx, cx - CLOSE_R, cy - CLOSE_R);
+                    CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy + CLOSE_R);
+                    CGContext::move_to_point(ctx, cx - CLOSE_R, cy + CLOSE_R);
+                    CGContext::add_line_to_point(ctx, cx + CLOSE_R, cy - CLOSE_R);
+                    // Stroke color is separate state from fill — set it BEFORE
+                    // `stroke_path` or the default opaque black is invisible.
+                    CGContext::set_stroke_color_with_color(ctx, Some(&rgb_color(TEXT_ACTIVE)));
+                    CGContext::set_line_width(ctx, 1.5);
+                    CGContext::stroke_path(ctx);
+                }
             }
         }
-      }
-      _ => {}
+        _ => {}
     }
 
     put_sessions(ivars, sessions);
@@ -762,7 +762,7 @@ fn chin_radius(h: CGFloat) -> CGFloat {
 /// renderer and the click hit-test so they cannot drift.
 fn tab_strip(h: CGFloat, w: CGFloat, count: usize, canvas: CGFloat) -> Option<(CGFloat, CGFloat)> {
     if h <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT || count == 0 {
-        return None
+        return None;
     }
     let inset = TAB_INSET;
     let left = (canvas - w) / 2.0 + inset;
@@ -770,14 +770,17 @@ fn tab_strip(h: CGFloat, w: CGFloat, count: usize, canvas: CGFloat) -> Option<(C
     let span = right - left - TAB_PLUS_W;
     let tab_w = span / count as CGFloat;
     if span <= 0.0 || tab_w < MIN_TAB_W {
-        return None
+        return None;
     }
     Some((left, tab_w))
 }
 
 /// Mix `tint` into `base` at [`TINT_MIX`] (T1b). `None` tint returns `base`
 /// unchanged, so an untinted tab is byte-identical to the pre-feature render.
-fn mix_tint(base: (CGFloat, CGFloat, CGFloat), tint: Option<(f64, f64, f64)>) -> (CGFloat, CGFloat, CGFloat) {
+fn mix_tint(
+    base: (CGFloat, CGFloat, CGFloat),
+    tint: Option<(f64, f64, f64)>,
+) -> (CGFloat, CGFloat, CGFloat) {
     match tint {
         None => base,
         Some((r, g, b)) => (
@@ -795,13 +798,13 @@ fn attention_dot(osc: &OscSnapshot, active: bool) -> Option<(CGFloat, CGFloat, C
     let program_state = osc.program.as_ref().map(|(s, _, _)| s.as_str());
     let progress_error = matches!(osc.progress, Some((2, _)));
     if program_state == Some("error") || progress_error {
-        return Some(DOT_ERROR)
+        return Some(DOT_ERROR);
     }
     if program_state == Some("done") {
-        return Some(DOT_DONE)
+        return Some(DOT_DONE);
     }
     if active {
-        return Some(DOT_ACTIVE)
+        return Some(DOT_ACTIVE);
     }
     None
 }
@@ -820,7 +823,12 @@ fn close_center(x: CGFloat, chin_y: CGFloat) -> (CGFloat, CGFloat) {
 fn gear_rect(w: CGFloat, header: CGFloat, canvas: CGFloat) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
     let right = (canvas + w) / 2.0;
     let cy = PANEL_HEIGHT - header / 2.0;
-    (right - SETTINGS_BTN_W, cy - SETTINGS_BTN_W / 2.0, right, cy + SETTINGS_BTN_W / 2.0)
+    (
+        right - SETTINGS_BTN_W,
+        cy - SETTINGS_BTN_W / 2.0,
+        right,
+        cy + SETTINGS_BTN_W / 2.0,
+    )
 }
 
 /// The gear glyph: an outline circle with four tick teeth — the affordance
@@ -844,10 +852,30 @@ fn draw_gear(ctx: Option<&CGContext>, cx: CGFloat, cy: CGFloat) {
     let out = SETTINGS_GEAR_R + SETTINGS_TOOTH_OUT;
     let half = SETTINGS_TOOTH_W / 2.0;
     for (x0, y0, w, h) in [
-        (cx - half, cy + SETTINGS_GEAR_R - 0.5, SETTINGS_TOOTH_W, out - SETTINGS_GEAR_R + 0.5),
-        (cx - half, cy - out, SETTINGS_TOOTH_W, out - SETTINGS_GEAR_R + 0.5),
-        (cx + SETTINGS_GEAR_R - 0.5, cy - half, out - SETTINGS_GEAR_R + 0.5, SETTINGS_TOOTH_W),
-        (cx - out, cy - half, out - SETTINGS_GEAR_R + 0.5, SETTINGS_TOOTH_W),
+        (
+            cx - half,
+            cy + SETTINGS_GEAR_R - 0.5,
+            SETTINGS_TOOTH_W,
+            out - SETTINGS_GEAR_R + 0.5,
+        ),
+        (
+            cx - half,
+            cy - out,
+            SETTINGS_TOOTH_W,
+            out - SETTINGS_GEAR_R + 0.5,
+        ),
+        (
+            cx + SETTINGS_GEAR_R - 0.5,
+            cy - half,
+            out - SETTINGS_GEAR_R + 0.5,
+            SETTINGS_TOOTH_W,
+        ),
+        (
+            cx - out,
+            cy - half,
+            out - SETTINGS_GEAR_R + 0.5,
+            SETTINGS_TOOTH_W,
+        ),
     ] {
         CGContext::add_rect(ctx, CGRect::new(CGPoint::new(x0, y0), CGSize::new(w, h)));
     }
@@ -858,13 +886,9 @@ fn draw_gear(ctx: Option<&CGContext>, cx: CGFloat, cy: CGFloat) {
     CGContext::set_fill_color_with_color(ctx, Some(&rgb_color(color)));
     CGContext::fill_ellipse_in_rect(
         ctx,
-        CGRect::new(
-            CGPoint::new(cx - 1.5, cy - 1.5),
-            CGSize::new(3.0, 3.0),
-        ),
+        CGRect::new(CGPoint::new(cx - 1.5, cy - 1.5), CGSize::new(3.0, 3.0)),
     );
 }
-
 
 /// The header bar height while open: the measured notch height (the panel
 /// top hugs the notch). Refreshed by `reposition` via `set_notch`.
@@ -878,17 +902,23 @@ fn header_height(ivars: &NotchViewIvars) -> CGFloat {
 /// pt down, drawn AFTER the grid so the top text rows fade away under it. The
 /// header itself is filled with the same background color, so the bar reads as
 /// a soft shadow over the terminal rather than a hard-edged block.
-fn draw_header_shadow(ctx: Option<&CGContext>, w: CGFloat, header: CGFloat, bg: (CGFloat, CGFloat, CGFloat), canvas: CGFloat) {
+fn draw_header_shadow(
+    ctx: Option<&CGContext>,
+    w: CGFloat,
+    header: CGFloat,
+    bg: (CGFloat, CGFloat, CGFloat),
+    canvas: CGFloat,
+) {
     let (r, g, b) = bg;
     let space = CGColorSpace::new_device_rgb();
     // Two stops: opaque terminal-bg at the top, fully clear at the bottom.
     let components = [r, g, b, 1.0, r, g, b, 0.0];
     let stops = [0.0, 1.0];
     let gradient = match space {
-      None => None,
-      Some(space) => unsafe {
-        CGGradient::with_color_components(Some(&*space), components.as_ptr(), stops.as_ptr(), 2)
-      },
+        None => None,
+        Some(space) => unsafe {
+            CGGradient::with_color_components(Some(&*space), components.as_ptr(), stops.as_ptr(), 2)
+        },
     };
     // y-up space: the band hangs from the header's bottom edge (y = PANEL_HEIGHT
     // - header) down `SHADOW_FADE` pt. Opaque at the START point (top), clear at
@@ -897,7 +927,13 @@ fn draw_header_shadow(ctx: Option<&CGContext>, w: CGFloat, header: CGFloat, bg: 
     let x0 = (canvas - w) / 2.0;
     CGContext::save_g_state(ctx);
     CGContext::begin_path(ctx);
-    CGContext::add_rect(ctx, CGRect::new(CGPoint::new(x0, PANEL_HEIGHT - header - SHADOW_FADE), CGSize::new(w, SHADOW_FADE)));
+    CGContext::add_rect(
+        ctx,
+        CGRect::new(
+            CGPoint::new(x0, PANEL_HEIGHT - header - SHADOW_FADE),
+            CGSize::new(w, SHADOW_FADE),
+        ),
+    );
     CGContext::clip(ctx);
     CGContext::draw_linear_gradient(
         ctx,
@@ -978,19 +1014,27 @@ fn draw_tab_label(
     color: (CGFloat, CGFloat, CGFloat),
 ) {
     if label.is_empty() || w <= 0.0 {
-        return
+        return;
     }
     let font = font.expect("a label font");
     let text = CFString::from_str(label);
     let line = unsafe { shaped_line(font, &text) };
 
-    let line_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) } as CGFloat;
+    let line_width = unsafe {
+        line.typographic_bounds(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } as CGFloat;
     let line = if line_width > w {
         let ellipsis = CFString::from_str("\u{2026}");
         let token = unsafe { shaped_line(font, &ellipsis) };
-        match unsafe { line.truncated_line(w as c_double, CTLineTruncationType::End, Some(&*token)) } {
-          Some(truncated) => truncated,
-          _ => return,
+        match unsafe {
+            line.truncated_line(w as c_double, CTLineTruncationType::End, Some(&*token))
+        } {
+            Some(truncated) => truncated,
+            _ => return,
         }
     } else {
         line
@@ -998,7 +1042,13 @@ fn draw_tab_label(
 
     // Measure the line we will actually draw (a truncated line is narrower
     // than the original), so the label centers on its own width.
-    let drawn_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) } as CGFloat;
+    let drawn_width = unsafe {
+        line.typographic_bounds(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } as CGFloat;
 
     // Center the visible ink, not the EM box: San Francisco's `ascent`
     // includes accent/diacritic headroom far above the cap height, so
@@ -1032,12 +1082,18 @@ fn draw_tab_hint(
     color: (CGFloat, CGFloat, CGFloat),
 ) {
     if hint.is_empty() || w <= 0.0 {
-        return
+        return;
     }
     let font = font.expect("a hint font");
     let text = CFString::from_str(hint);
     let line = unsafe { shaped_line(font, &text) };
-    let line_width = unsafe { line.typographic_bounds(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    let line_width = unsafe {
+        line.typographic_bounds(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
     let drawn_width = if line_width as CGFloat > w {
         w
     } else {
@@ -1066,12 +1122,18 @@ fn rgb_color(rgb: (CGFloat, CGFloat, CGFloat)) -> CFRetained<CGColor> {
 /// the whole string range.
 unsafe fn shaped_line(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
     let attr = CFMutableAttributedString::new(None, 0).expect("an attributed string");
-    let insert = CFRange { location: 0, length: 0 };
+    let insert = CFRange {
+        location: 0,
+        length: 0,
+    };
     unsafe { CFMutableAttributedString::replace_string(Some(&*attr), insert, Some(text)) };
     unsafe {
         CFMutableAttributedString::set_attribute(
             Some(&*attr),
-            CFRange { location: 0, length: text.length() },
+            CFRange {
+                location: 0,
+                length: text.length(),
+            },
             Some(kCTFontAttributeName),
             Some(&**font),
         );
@@ -1080,7 +1142,10 @@ unsafe fn shaped_line(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
         // tab titles/hints paint black-on-black and are invisible.
         CFMutableAttributedString::set_attribute(
             Some(&*attr),
-            CFRange { location: 0, length: text.length() },
+            CFRange {
+                location: 0,
+                length: text.length(),
+            },
             Some(kCTForegroundColorFromContextAttributeName),
             Some(&*kCFBooleanTrue.expect("a boolean")),
         );
@@ -1095,7 +1160,10 @@ unsafe fn shaped_line(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
 /// size/family. Reads the settings bundle for exactly that reason: a cached
 /// `OnceCell` keeps the FIRST size it was created at, which is why the old
 /// hardcoded `FONT_SIZE` argument could never become a runtime knob.
-fn ensure_font(ivars: &NotchViewIvars, settings: Settings) -> (CFRetained<CTFont>, (CGFloat, CGFloat)) {
+fn ensure_font(
+    ivars: &NotchViewIvars,
+    settings: Settings,
+) -> (CFRetained<CTFont>, (CGFloat, CGFloat)) {
     let font = ivars.font.replace(None);
     let font = match font {
         Some(font) => font,
@@ -1124,18 +1192,24 @@ fn font_invalidate(ivars: &NotchViewIvars) {
 /// every spawn path (initial batch in `draw`, `spawn_tab`) so grid sizes
 /// cannot drift. Must stay in sync with `row_rect`'s header reservation.
 ///
-    /// The grid reflows to `settings.open_width` — NOT the live spring width:
-    /// sessions spawn on the FIRST open frame, while the width spring is still
-    /// flying at the ~212pt notch, so baking columns from live `w` would silently
-    /// create half-width sessions. `draw_grid` gets the live width (x0/usable) for
-    /// painting; a session's row/col count is baked at spawn and then kept in step
-    /// with the knob by `apply_settings`' live `Session::resize` (see that seam).
-fn grid_dims(cell: (CGFloat, CGFloat), header: CGFloat, settings: Settings) -> (usize, usize, usize) {
+/// The grid reflows to `settings.open_width` — NOT the live spring width:
+/// sessions spawn on the FIRST open frame, while the width spring is still
+/// flying at the ~212pt notch, so baking columns from live `w` would silently
+/// create half-width sessions. `draw_grid` gets the live width (x0/usable) for
+/// painting; a session's row/col count is baked at spawn and then kept in step
+/// with the knob by `apply_settings`' live `Session::resize` (see that seam).
+fn grid_dims(
+    cell: (CGFloat, CGFloat),
+    header: CGFloat,
+    settings: Settings,
+) -> (usize, usize, usize) {
     let (cell_width, cell_height) = cell;
     let usable = settings.open_width - 2.0 * GRID_PAD;
     let columns = ((usable / cell_width).floor() as usize).max(1);
     let rows = (((settings.open_height - header - GRID_TOP_PAD - TAB_HEIGHT - 2.0 * TAB_INSET)
-                 / cell_height).floor() as usize).max(1);
+        / cell_height)
+        .floor() as usize)
+        .max(1);
     // Scrollback is a settings knob now (plan A #12): the `BNT_SCROLLBACK`
     // env override it replaces is gone, so the panel is the only control.
     (rows, columns, settings.scrollback_lines)
@@ -1154,14 +1228,14 @@ fn key_bytes(event: &NSEvent) -> Vec<u8> {
     // the letter's byte with bit 6 set (h -> 0x08, a -> 0x01).
     if ctrl {
         match event.characters() {
-          Some(chars) => {
-              let text = chars.to_string();
-              match text.as_bytes().first() {
-                Some(b) if *b >= 0x40 && *b < 0x7f => return vec![*b & 0x1f],
-                _ => {}
-              }
-          }
-          _ => {}
+            Some(chars) => {
+                let text = chars.to_string();
+                match text.as_bytes().first() {
+                    Some(b) if *b >= 0x40 && *b < 0x7f => return vec![*b & 0x1f],
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1171,34 +1245,34 @@ fn key_bytes(event: &NSEvent) -> Vec<u8> {
     // — those are the LETTERS C/W/F/7 in that table, so typing `w` sent CR (a
     // newline), `c` sent Backspace, `f` sent Enter, `7` sent Tab.
     match keyCode {
-        53 => return vec![0x1b],          // kVK_Escape
-        51 => return vec![0x7f],          // kVK_Delete (Backspace)
-        36 => return vec![0x0d],          // kVK_Return
-        76 => return vec![0x0d],          // kVK_ANSI_KeypadEnter
-        48 => return vec![0x09],          // kVK_Tab
+        53 => return vec![0x1b], // kVK_Escape
+        51 => return vec![0x7f], // kVK_Delete (Backspace)
+        36 => return vec![0x0d], // kVK_Return
+        76 => return vec![0x0d], // kVK_ANSI_KeypadEnter
+        48 => return vec![0x09], // kVK_Tab
         // Arrows / ForwardDelete: the PTY wants ANSI escape sequences, NOT the
         // NSFunctionKey unicode chars `characters()` returns for these
         // (\u{F700}+ would reach the shell as UTF-8 garbage).
-        126 => return b"\x1b[A".to_vec(), // kVK_UpArrow
-        125 => return b"\x1b[B".to_vec(), // kVK_DownArrow
-        124 => return b"\x1b[C".to_vec(), // kVK_RightArrow
-        123 => return b"\x1b[D".to_vec(), // kVK_LeftArrow
-        117 => return b"\x1b[3~".to_vec(),// kVK_ForwardDelete
+        126 => return b"\x1b[A".to_vec(),  // kVK_UpArrow
+        125 => return b"\x1b[B".to_vec(),  // kVK_DownArrow
+        124 => return b"\x1b[C".to_vec(),  // kVK_RightArrow
+        123 => return b"\x1b[D".to_vec(),  // kVK_LeftArrow
+        117 => return b"\x1b[3~".to_vec(), // kVK_ForwardDelete
         _ => {}
     }
 
     // Printable characters, with the Option-prefixed (M-x) form when Alt is
     // held and the character is ASCII.
     match event.characters() {
-      Some(chars) => {
-        let text = chars.to_string();
-        let bytes = text.as_bytes().to_vec();
-        if alt && bytes.len() == 1 && bytes[0] >= 0x20 && bytes[0] < 0x80 {
-            return vec![0x1b, bytes[0]]
+        Some(chars) => {
+            let text = chars.to_string();
+            let bytes = text.as_bytes().to_vec();
+            if alt && bytes.len() == 1 && bytes[0] >= 0x20 && bytes[0] < 0x80 {
+                return vec![0x1b, bytes[0]];
+            }
+            return bytes;
         }
-        return bytes
-      }
-      _ => {}
+        _ => {}
     }
     vec![]
 }
@@ -1206,32 +1280,30 @@ fn key_bytes(event: &NSEvent) -> Vec<u8> {
 impl NotchView {
     /// Creates a closed notch view.
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(
-            NotchViewIvars {
-                spring: Spring::new(CLOSED_HEIGHT),
-                width_spring: Spring::new(NOTCH_WIDTH),
-                height: Cell::new(CLOSED_HEIGHT),
-                width: Cell::new(NOTCH_WIDTH),
-                notch: Cell::new((NOTCH_WIDTH, CLOSED_HEIGHT)),
-                last_time: Cell::new(0.0),
-                font: Cell::new(None),
-                cell: Cell::new(None),
-                sessions: Cell::new(vec![]),
-                spawned: Cell::new(false),
-                tab_count: Cell::new(0),
-                selected: Cell::new(None),
-                hovered: Cell::new(None),
-                label_font: OnceCell::new(),
-                hint_font: OnceCell::new(),
-                tracking: Cell::new(vec![]),
-                tracking_canvas: Cell::new(0.0),
-                canvas: Cell::new(crate::window::canvas_size(mtm)),
-                scroll: Cell::new(0),
-                scroll_pts: Cell::new(0.0),
-                settings: Cell::new(Settings::load()),
-                settings_owner: OnceCell::new(),
-            },
-        );
+        let this = Self::alloc(mtm).set_ivars(NotchViewIvars {
+            spring: Spring::new(CLOSED_HEIGHT),
+            width_spring: Spring::new(NOTCH_WIDTH),
+            height: Cell::new(CLOSED_HEIGHT),
+            width: Cell::new(NOTCH_WIDTH),
+            notch: Cell::new((NOTCH_WIDTH, CLOSED_HEIGHT)),
+            last_time: Cell::new(0.0),
+            font: Cell::new(None),
+            cell: Cell::new(None),
+            sessions: Cell::new(vec![]),
+            spawned: Cell::new(false),
+            tab_count: Cell::new(0),
+            selected: Cell::new(None),
+            hovered: Cell::new(None),
+            label_font: OnceCell::new(),
+            hint_font: OnceCell::new(),
+            tracking: Cell::new(vec![]),
+            tracking_canvas: Cell::new(0.0),
+            canvas: Cell::new(crate::window::canvas_size(mtm)),
+            scroll: Cell::new(0),
+            scroll_pts: Cell::new(0.0),
+            settings: Cell::new(Settings::load()),
+            settings_owner: OnceCell::new(),
+        });
         // SAFETY: `NSObject`'s `init` signature is correct.
         unsafe { msg_send![super(this), init] }
     }
@@ -1252,9 +1324,13 @@ impl NotchView {
         let ivars = self.ivars();
         ivars.spring.retarget(target);
         let settings = ivars.settings.get();
-        ivars.width_spring.retarget(
-            if target > CLOSED_HEIGHT + 1.0 { settings.open_width } else { ivars.notch.get().0 }
-        );
+        ivars
+            .width_spring
+            .retarget(if target > CLOSED_HEIGHT + 1.0 {
+                settings.open_width
+            } else {
+                ivars.notch.get().0
+            });
         ivars.last_time.set(0.0);
         self.mark_dirty();
         // Claim key-window focus when opening, so a hotkey-open needs no
@@ -1273,12 +1349,11 @@ impl NotchView {
     /// height-% change takes effect on the very next toggle.
     pub fn toggle(&self) {
         let open = self.ivars().settings.get().open_height;
-        let target =
-            if self.ivars().spring.target_value() > (CLOSED_HEIGHT + open) / 2.0 {
-                CLOSED_HEIGHT
-            } else {
-                open
-            };
+        let target = if self.ivars().spring.target_value() > (CLOSED_HEIGHT + open) / 2.0 {
+            CLOSED_HEIGHT
+        } else {
+            open
+        };
         self.set_target(target);
     }
 
@@ -1354,11 +1429,14 @@ impl NotchView {
                 let (rows, columns, _) = grid_dims(cell, header_height(ivars), after);
                 // Move the vec out and back (lesson 17); `resize` mutates in place.
                 let mut sessions = take_sessions(ivars);
-                for session in &mut sessions { session.resize(rows, columns, cell.0, cell.1) }
+                for session in &mut sessions {
+                    session.resize(rows, columns, cell.0, cell.1)
+                }
                 put_sessions(ivars, sessions);
             }
         }
-        if after.toggle_chord != before.toggle_chord || after.new_tab_chord != before.new_tab_chord {
+        if after.toggle_chord != before.toggle_chord || after.new_tab_chord != before.new_tab_chord
+        {
             let _ = self.reregister_hotkeys(after);
         }
         self.mark_dirty();
@@ -1371,13 +1449,13 @@ impl NotchView {
         let ivars = self.ivars();
         let bytes = key_bytes(event);
         if bytes.is_empty() {
-            return
+            return;
         }
         let sessions = take_sessions(ivars);
         let selected = ivars.selected.get();
         match selected.and_then(|i| sessions.get(i)) {
-          Some(session) => session.send_input(bytes),
-          _ => {}
+            Some(session) => session.send_input(bytes),
+            _ => {}
         }
         put_sessions(ivars, sessions);
     }
@@ -1402,7 +1480,7 @@ impl NotchView {
             let bell = session.take_bell();
             let finished = session.take_finished();
             if looking {
-                continue
+                continue;
             }
             let name = session.base_title();
             if bell && settings.bell_enabled {
@@ -1429,17 +1507,25 @@ impl NotchView {
     pub fn spawn_tab(&self) {
         let ivars = self.ivars();
         if ivars.height.get() <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
-            return
+            return;
         }
         let mut sessions = take_sessions(ivars);
         if sessions.len() >= MAX_TABS {
             put_sessions(ivars, sessions);
-            return
+            return;
         }
         let cell = ivars.cell.get().expect("a cell metric exists once open");
-        let (rows, columns, scrollback) = grid_dims(cell, header_height(ivars), ivars.settings.get());
+        let (rows, columns, scrollback) =
+            grid_dims(cell, header_height(ivars), ivars.settings.get());
         ivars.hovered.set(None); // session indices are about to shift
-        sessions.push(Session::new(rows, columns, cell.0, cell.1, scrollback, &ivars.settings.get()));
+        sessions.push(Session::new(
+            rows,
+            columns,
+            cell.0,
+            cell.1,
+            scrollback,
+            &ivars.settings.get(),
+        ));
         put_sessions(ivars, sessions);
         self.mark_dirty();
     }
@@ -1452,7 +1538,7 @@ impl NotchView {
         let mut sessions = take_sessions(ivars);
         if index >= sessions.len() {
             put_sessions(ivars, sessions);
-            return
+            return;
         }
         let doomed = sessions.remove(index);
         doomed.destroy();
@@ -1470,11 +1556,11 @@ impl NotchView {
             // one LEFT of the selection shifts the index down so the same
             // tab stays selected; closing one RIGHT leaves it alone.
             match ivars.selected.get() {
-              Some(sel) if index == sel => {
-                  self.select_tab(if index < len { index } else { len - 1 });
-              }
-              Some(sel) if index < sel => self.select_tab(sel - 1),
-              _ => {}
+                Some(sel) if index == sel => {
+                    self.select_tab(if index < len { index } else { len - 1 });
+                }
+                Some(sel) if index < sel => self.select_tab(sel - 1),
+                _ => {}
             }
             self.mark_dirty();
         }
@@ -1489,7 +1575,7 @@ impl NotchView {
         let sessions = take_sessions(ivars);
         if !sessions.iter().any(|s| s.dead()) {
             put_sessions(ivars, sessions);
-            return
+            return;
         }
         let mut survivors: Vec<Session> = vec![];
         let mut first_removed: Option<usize> = None;
@@ -1498,8 +1584,12 @@ impl NotchView {
         for (index, s) in sessions.into_iter().enumerate() {
             if s.dead() {
                 s.destroy();
-                if first_removed.is_none() { first_removed = Some(index); }
-                if index < sel_at_entry { removed_before_sel += 1; }
+                if first_removed.is_none() {
+                    first_removed = Some(index);
+                }
+                if index < sel_at_entry {
+                    removed_before_sel += 1;
+                }
             } else {
                 survivors.push(s);
             }
@@ -1516,16 +1606,18 @@ impl NotchView {
             // selection at/past a removed tab moves to the tab that
             // followed the first removal, clamped to the end.
             match ivars.selected.get() {
-              Some(sel) => {
-                  let shifted = sel - removed_before_sel;
-                  let target = if shifted >= ivars.tab_count.get() {
-                      first_removed.unwrap_or(0).min(ivars.tab_count.get() - 1)
-                  } else {
-                      shifted
-                  };
-                  if target != sel { self.select_tab(target); }
-              }
-              _ => {}
+                Some(sel) => {
+                    let shifted = sel - removed_before_sel;
+                    let target = if shifted >= ivars.tab_count.get() {
+                        first_removed.unwrap_or(0).min(ivars.tab_count.get() - 1)
+                    } else {
+                        shifted
+                    };
+                    if target != sel {
+                        self.select_tab(target);
+                    }
+                }
+                _ => {}
             }
             self.mark_dirty();
         }
@@ -1556,8 +1648,8 @@ impl NotchView {
         // The panel must exist for a view-local point to mean anything; the
         // frame itself is not needed (the view fills the panel).
         match self.as_super().window() {
-          Some(_) => {}
-          None => return,
+            Some(_) => {}
+            None => return,
         }
         let loc = event.locationInWindow();
         let px = loc.x;
@@ -1565,22 +1657,22 @@ impl NotchView {
         let ivars = self.ivars();
         let h = ivars.height.get();
         if h <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
-            return
+            return;
         }
         let w = ivars.width.get();
         let new = match tab_strip(h, w, ivars.tab_count.get(), ivars.canvas.get()) {
-          Some((left, tab_w)) => {
-            let chin_y = PANEL_HEIGHT - h;
-            if py < chin_y || py > chin_y + TAB_HEIGHT {
-                None
-            } else {
-                (0..ivars.tab_count.get()).find(|&i| {
-                    let x0 = left + i as CGFloat * tab_w;
-                    px >= x0 && px <= x0 + tab_w
-                })
+            Some((left, tab_w)) => {
+                let chin_y = PANEL_HEIGHT - h;
+                if py < chin_y || py > chin_y + TAB_HEIGHT {
+                    None
+                } else {
+                    (0..ivars.tab_count.get()).find(|&i| {
+                        let x0 = left + i as CGFloat * tab_w;
+                        px >= x0 && px <= x0 + tab_w
+                    })
+                }
             }
-          }
-          None => None
+            None => None,
         };
         if ivars.hovered.get() != new {
             ivars.hovered.set(new);
@@ -1595,7 +1687,10 @@ impl NotchView {
     /// `mouseDown:` only ever delivers points inside the panel, so it can
     /// never collapse; the global monitor delivers the outside clicks.
     pub fn click_at_screen_point(&self, screen: &NSPoint) {
-        let panel = self.as_super().window().expect("a view always lives in a window");
+        let panel = self
+            .as_super()
+            .window()
+            .expect("a view always lives in a window");
         let panel_frame = panel.frame();
         let x = screen.x - panel_frame.origin.x;
         let y = screen.y - panel_frame.origin.y;
@@ -1615,7 +1710,7 @@ impl NotchView {
                 && screen.y >= frame.origin.y
                 && screen.y <= frame.origin.y + frame.size.height
             {
-                return
+                return;
             }
         }
 
@@ -1624,7 +1719,7 @@ impl NotchView {
             if open {
                 self.collapse();
             }
-            return
+            return;
         }
 
         // Inside the frame but off the silhouette (transparent margin): same
@@ -1643,13 +1738,13 @@ impl NotchView {
             if open {
                 self.collapse();
             }
-            return
+            return;
         }
 
         if !open {
             // Closed pill: a click inside it opens (same as the hotkey).
             self.expand();
-            return
+            return;
         }
 
         // `canvas` is the ivar (not the panel frame width): `reposition` keeps
@@ -1671,7 +1766,7 @@ impl NotchView {
             // closes the window: the user closes it with its own ✕.
             let mtm = MainThreadMarker::new().expect("the view is main-thread-only");
             crate::settings_window::open_or_focus(mtm, &ivars.settings_owner, self);
-            return
+            return;
         }
 
         // `count` mirrors `sessions.len()` (see invariant comment on
@@ -1679,38 +1774,39 @@ impl NotchView {
         // outputs — same math as the renderer in `draw`.
         let count = ivars.tab_count.get();
         match tab_strip(h, w, count, canvas) {
-          Some((left, tab_w)) => {
-            let chin_y = PANEL_HEIGHT - h;
-            if y < chin_y || y > chin_y + TAB_HEIGHT {
-                return
-            }
-            // 1) The `+` button — spawn a new session/tab.
-            let px = left + count as CGFloat * tab_w;
-            if x >= px && x <= px + TAB_PLUS_W {
-                self.spawn_tab();
-                return
-            }
-            // 2) A tab: the `×` first (only on the hovered tab), else select.
-            for index in 0..count {
-                let x0 = left + index as CGFloat * tab_w;
-                if x >= x0 && x <= x0 + tab_w {
-                    let (cx, cy) = close_center(x0, chin_y);
-                    // The `×` exists only on a HOVERED tab (the pointer got
-                    // there via `mouseMoved:` before the click), so the hit-
-                    // test matches the draw: a click in an un-hovered tab's
-                    // gutter just selects the tab.
-                    let on_close = ivars.hovered.get() == Some(index)
-                        && (x - cx).abs() <= CLOSE_HIT && (y - cy).abs() <= CLOSE_HIT;
-                    if on_close {
-                        self.close_tab(index);
-                    } else {
-                        self.select_tab(index);
+            Some((left, tab_w)) => {
+                let chin_y = PANEL_HEIGHT - h;
+                if y < chin_y || y > chin_y + TAB_HEIGHT {
+                    return;
+                }
+                // 1) The `+` button — spawn a new session/tab.
+                let px = left + count as CGFloat * tab_w;
+                if x >= px && x <= px + TAB_PLUS_W {
+                    self.spawn_tab();
+                    return;
+                }
+                // 2) A tab: the `×` first (only on the hovered tab), else select.
+                for index in 0..count {
+                    let x0 = left + index as CGFloat * tab_w;
+                    if x >= x0 && x <= x0 + tab_w {
+                        let (cx, cy) = close_center(x0, chin_y);
+                        // The `×` exists only on a HOVERED tab (the pointer got
+                        // there via `mouseMoved:` before the click), so the hit-
+                        // test matches the draw: a click in an un-hovered tab's
+                        // gutter just selects the tab.
+                        let on_close = ivars.hovered.get() == Some(index)
+                            && (x - cx).abs() <= CLOSE_HIT
+                            && (y - cy).abs() <= CLOSE_HIT;
+                        if on_close {
+                            self.close_tab(index);
+                        } else {
+                            self.select_tab(index);
+                        }
+                        return;
                     }
-                    return
                 }
             }
-          }
-          _ => {}
+            _ => {}
         }
     }
 
@@ -1723,8 +1819,8 @@ impl NotchView {
         ivars.selected.set(Some(index));
         let sessions = take_sessions(ivars);
         match sessions.get(index) {
-          Some(session) => session.take_attention(),
-          _ => {}
+            Some(session) => session.take_attention(),
+            _ => {}
         }
         put_sessions(ivars, sessions);
         self.mark_dirty();
@@ -1736,37 +1832,46 @@ impl NotchView {
     /// from the screen-change monitor.
     pub fn reposition(&self) {
         let mtm = MainThreadMarker::new().expect("main thread");
-        let panel = self.as_super().window().expect("a view always lives in a window");
+        let panel = self
+            .as_super()
+            .window()
+            .expect("a view always lives in a window");
         let ivars = self.ivars();
         match crate::window::notch_screen(mtm) {
-          Some(screen) => {
-            let frame = screen.frame();
-            let canvas = crate::window::canvas_width(&screen);
-            panel.setFrameOrigin(crate::window::panel_origin(frame, canvas));
-            // The canvas follows the display width: re-pin the window frame
-            // (origin + size in the same call, so the two can never disagree)
-            // and hand the same value to the view and its content view, since
-            // every centring expression reads `ivars.canvas`.
-            panel.setFrame_display(NSRect::new(crate::window::panel_origin(frame, canvas), NSSize::new(canvas, PANEL_HEIGHT)), true);
-            ivars.canvas.set(canvas);
-            // Re-set the view's own frame (it fills the canvas, parent-relative),
-            // mirroring `main.rs`'s initial `setFrame`.
-            self.as_super().setFrame(
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(canvas, PANEL_HEIGHT)),
-            );
-            // The tracking area sized to the OLD canvas is stale at the new
-            // edges, but it is NOT removed here: `drawRect:` sees
-            // `tracking_canvas != canvas` and does the remove+reinstall pair
-            // on the next frame, so only ONE place owns that swap. Hover is
-            // not driver-verifiable (lesson 47), so this is correctness-by
-            // construction.
-            let (w, h) = crate::window::notch_size(&screen);
-            self.set_notch((w, h));
-          }
-          _ => {}
+            Some(screen) => {
+                let frame = screen.frame();
+                let canvas = crate::window::canvas_width(&screen);
+                panel.setFrameOrigin(crate::window::panel_origin(frame, canvas));
+                // The canvas follows the display width: re-pin the window frame
+                // (origin + size in the same call, so the two can never disagree)
+                // and hand the same value to the view and its content view, since
+                // every centring expression reads `ivars.canvas`.
+                panel.setFrame_display(
+                    NSRect::new(
+                        crate::window::panel_origin(frame, canvas),
+                        NSSize::new(canvas, PANEL_HEIGHT),
+                    ),
+                    true,
+                );
+                ivars.canvas.set(canvas);
+                // Re-set the view's own frame (it fills the canvas, parent-relative),
+                // mirroring `main.rs`'s initial `setFrame`.
+                self.as_super().setFrame(NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(canvas, PANEL_HEIGHT),
+                ));
+                // The tracking area sized to the OLD canvas is stale at the new
+                // edges, but it is NOT removed here: `drawRect:` sees
+                // `tracking_canvas != canvas` and does the remove+reinstall pair
+                // on the next frame, so only ONE place owns that swap. Hover is
+                // not driver-verifiable (lesson 47), so this is correctness-by
+                // construction.
+                let (w, h) = crate::window::notch_size(&screen);
+                self.set_notch((w, h));
+            }
+            _ => {}
         }
     }
-
 
     /// Open the panel (idempotent: already-open stays open) at the settings
     /// open height.
@@ -1799,23 +1904,24 @@ impl NotchView {
     pub fn scroll_wheel(&self, delta_y: CGFloat) {
         let ivars = self.ivars();
         if ivars.height.get() <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
-            return
+            return;
         }
         let cell_height = ivars.cell.get().expect("a cell metric exists once open").1;
         ivars.scroll_pts.set(ivars.scroll_pts.get() - delta_y);
         let lines = (ivars.scroll_pts.get() / cell_height).trunc() as i32;
         if lines == 0 {
-            return
+            return;
         }
-        ivars.scroll_pts.set(ivars.scroll_pts.get() - lines as f64 * cell_height);
+        ivars
+            .scroll_pts
+            .set(ivars.scroll_pts.get() - lines as f64 * cell_height);
         ivars.scroll.set(ivars.scroll.get() + lines);
         let sessions = take_sessions(ivars);
         match ivars.selected.get().and_then(|i| sessions.get(i)) {
-          Some(session) => session.scroll_display(lines),
-          _ => {}
+            Some(session) => session.scroll_display(lines),
+            _ => {}
         }
         put_sessions(ivars, sessions);
         self.mark_dirty();
     }
 }
-

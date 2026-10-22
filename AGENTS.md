@@ -1,7 +1,14 @@
 # AGENTS.md — Rust Quake-Notch Terminal
 
+**Official product name: NotchQuake** (Barnstorm LLC). The shipped bundle is
+`NotchQuake.app`, bundle id `local.notchquake`, binary `notchquake`. Historical text
+below still says `BNT` / `local.bnt` in places: that is the OLD prefs domain — renaming
+the product was a one-time prefs reset, so old settings do not carry over. The internal
+prefs KEY prefix `BNT.` and the env var `BNT_DEFAULTS_SUITE` are UNCHANGED and must stay
+exactly as written in the lessons.
+
 Development notes for agents working in this repo (`rust-notch-terminal`,
-shipped as `BNT.app`). macOS-only, arm64. This is a **standalone Rust app**,
+shipped as `NotchQuake.app`). macOS-only, arm64. This is a **standalone Rust app**,
 not part of `boring.notch` — the plan lives in the sibling worktree at
 `../emdash/worktrees/boring.notch-*/issue-quake-terminal-k605g/docs/rust-notch-terminal-plan.md`.
 
@@ -9,12 +16,12 @@ not part of `boring.notch` — the plan lives in the sibling worktree at
 
 ```bash
 cargo build                                    # the gate — there is no LSP
-./scripts/launch.sh                            # build + kill stale + relaunch BNT.app
-# BNT.app is a signed bundle at ./BNT.app; launch it with `open -n BNT.app`
+./scripts/launch.sh                            # build + kill stale + relaunch NotchQuake.app
+# NotchQuake.app is a signed bundle at ./NotchQuake.app; launch it with `open -n NotchQuake.app`
 ```
 
 `launch.sh` kills any running instance first (a stale binary reuses the
-running process via `open`), rebuilds, copies the binary into `BNT.app`,
+running process via `open`), rebuilds, copies the binary into `NotchQuake.app`,
 and relaunches. **Always kill before relaunch** or you test a stale binary.
 
 The app writes debug files to `/tmp/bnt-*.txt` (notch geometry, shape, grid,

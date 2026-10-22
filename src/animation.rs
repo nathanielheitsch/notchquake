@@ -62,7 +62,7 @@ impl Spring {
     /// Advance by `delta` seconds of wall clock and return the new value.
     pub fn advance(&self, delta: f64) -> f64 {
         if self.settled.get() {
-            return self.target.get()
+            return self.target.get();
         }
 
         let elapsed = self.elapsed.get() + delta;
@@ -74,14 +74,11 @@ impl Spring {
         let angle = omega_d * elapsed;
 
         let amplitude = self.start.get() - self.target.get();
-        let value =
-            self.target.get()
-                + amplitude * decay * (angle.cos() + zeta * omega0 / omega_d * angle.sin());
+        let value = self.target.get()
+            + amplitude * decay * (angle.cos() + zeta * omega0 / omega_d * angle.sin());
         let velocity = -amplitude * (zeta * omega0 + omega_d) * decay * angle.sin();
 
-        if (self.target.get() - value).abs() < SETTLE_EPSILON
-            && velocity.abs() < SETTLE_EPSILON
-        {
+        if (self.target.get() - value).abs() < SETTLE_EPSILON && velocity.abs() < SETTLE_EPSILON {
             self.settled.set(true);
             return self.target.get();
         }
@@ -94,7 +91,7 @@ impl Spring {
     /// last one we drew.
     fn value_at(&self, t: f64) -> f64 {
         if self.settled.get() {
-            return self.target.get()
+            return self.target.get();
         }
 
         let (omega0, zeta) = omegas();
@@ -110,7 +107,10 @@ impl Spring {
 
 /// `(omega0, zeta)` for the configured response and damping fraction.
 fn omegas() -> (f64, f64) {
-    (2.0 * std::f64::consts::PI / SPRING_RESPONSE, SPRING_DAMPING_FRACTION)
+    (
+        2.0 * std::f64::consts::PI / SPRING_RESPONSE,
+        SPRING_DAMPING_FRACTION,
+    )
 }
 
 /// `sqrt(1 - zeta^2)`, the underdamped-spring denominator. Zero when the

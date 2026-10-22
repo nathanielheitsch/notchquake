@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: read
+  release: write
+
+jobs:
+  ship:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@1
+
+      - run: cargo build --release
+
+      - name: Assemble NotchQuake.app bundle
+        run: |
+          mkdir -p NotchQuake.app/Contents/MacOS
+          cp target/release/notchquake NotchQuake.app/Contents/MacOS/notchquake
+          chmod +x NotchQuake.app/Contents/MacOS/notchquake
+          cat > NotchQuake.app/Contents/Info.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleIdentifier</key><string>local.notchquake</string>
+          <key>CFBundleExecutable</key><string>notchquake</string>
+          <key>CFBundleName</key><string>NotchQuake</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          </dict></plist>
+          PLIST
+
+      - name: Zip the bundle
+        run: zip -r -q notchquake.zip NotchQuake.app
+
+      - name: Publish the release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: gh release create "$TAG" --title "NotchQuake $TAG" --generate-notes notchquake.zip
