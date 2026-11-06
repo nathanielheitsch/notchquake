@@ -7,10 +7,10 @@ the product was a one-time prefs reset, so old settings do not carry over. The i
 prefs KEY prefix `BNT.` and the env var `BNT_DEFAULTS_SUITE` are UNCHANGED and must stay
 exactly as written in the lessons.
 
-Development notes for agents working in this repo (`rust-notch-terminal`,
-shipped as `NotchQuake.app`). macOS-only, arm64. This is a **standalone Rust app**,
-not part of `boring.notch` — the plan lives in the sibling worktree at
-`../emdash/worktrees/boring.notch-*/issue-quake-terminal-k605g/docs/rust-notch-terminal-plan.md`.
+Development notes for agents working in `~/projects/barnstorm/notchquake`,
+shipped as `NotchQuake.app`. macOS-only, arm64. This is a **standalone Rust app**
+with its own Git repository; it does not depend on emdash or its worktrees.
+See `README.md` and `docs/project-state.md` for the current project baseline.
 
 ## Build / run / verify
 
@@ -701,5 +701,5 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
 - macOS-only, arm64. `cargo build` is the gate; no LSP.
 - `BNT.app/` is gitignored (built binary bundle — never commit). `/tmp/bnt-*.txt`
   debug writes were all stripped at ship time; none remain in `src/`.
-- The plan doc (sibling worktree) is the spec; this AGENTS.md is the
-  machine-specific how-to.
+- Keep project documentation in this repository, not in external worktrees.
+  `docs/project-state.md` records the baseline; this file is the machine-specific how-to.
