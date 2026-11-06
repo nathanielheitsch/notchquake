@@ -646,26 +646,15 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     alpha capture shows tab titles out to ~1746pt, closed pill unchanged at
     189pt/33pt. Live x-gate click test NOT run (see notes).
 
-57. **Signing pipeline (v0.2): Developer ID is the ONLY distributable identity.**
-    Facts measured on this machine: (a) `syspolicy_check notary-submission
-    NotchQuake.app --json` flags the adhoc inner binary as "Code has no
-    resources but signature indicates they must be present" (Fatal) plus
-    "Adhoc Signed App" (Warning) — the exact message that made `open -n`
-    refuse after the bundle rename (lesson 56); (b) `security import` grammar
-    is `-k <keychain> [-P pass]` — no `-o`, no `-T app` (that man page is
-    legacy); (c) `notarytool`/`signer` do NOT exist on this macOS —
-    notarization primitives are `stapler staple|validate` (needs an Apple-
-    issued ticket from https://developer.apple.com/submit-binary/, a WEB
-    step, there is no CLI uploader) and `syspolicy_check` gates readiness;
-    (d) `security` has no delete verb — Keychain.app deletes stray items;
-    (e) a self-signed `codesign -s "<CN>"` identity verifies Signature=adhoc
-    and is NOT distributable — never fabricate one when the user has a real
-    Developer group. `scripts/setup-developer-id.sh` (cert import + verify
-    gate + GH-Secrets hints), `scripts/launch.sh` (sign inner binary+bundle
-    with Developer ID, WARN+adhoc fallback), `scripts/release.sh` (release
-    build → sign BOTH (codesign on a .app dir does not re-sign the inner
-    binary) → syspolicy gate → zip → gh release publish → signed tag push).
-    LOGIN keychain path is ~/Library/Keychains/login.keychain-db.
+57. **Signing/release correction:** the earlier pipeline claims were incorrect.
+    `xcrun --find notarytool` locates Xcode's CLI; notarization is automatable.
+    `security import -T /usr/bin/codesign` is supported, and certificate/key
+    deletion commands exist. A self-signed certificate is not an ad-hoc signature,
+    but neither provides Apple Developer ID distribution trust. The existing
+    signing scripts are unverified scaffolding with incorrect identity checks
+    and must not publish releases yet. See `docs/project-state.md` for the
+    authoritative current status and release blockers. The release workflow
+    is manual/build-only until these are resolved.
 
 56. **Renaming the bundle broke execution in three ways** (v0.1-alpha rename
     BNT.app→NotchQuake.app, id `local.bnt`→`local.notchquake`, binary `BNT`→

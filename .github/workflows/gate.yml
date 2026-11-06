@@ -2,19 +2,18 @@ name: gate
 
 on:
   push:
-    branches: [master]
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
   gate:
-    runs-on: macos-latest
-    # apt-none: this app is macOS-arm64 only, so there is no distro packaging or
-    # apt-get step — the Rust toolchain ships with the macos-latest image.
+    runs-on: macos-14
     steps:
-      - uses: actions/checkout@1
-      # fail-fast: any failing step stops the job (no continue-on-error).
+      - uses: actions/checkout@v4
       - run: cargo fmt --all --check
-      - run: cargo build
-      - run: cargo test
+      - run: cargo build --locked
+      - run: cargo test --locked

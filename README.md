@@ -52,8 +52,8 @@ an arbitrary chord needs an Input Monitoring grant this app does not have.
 ## Settings persistence
 
 Settings live in `~/Library/Preferences/local.notchquake.plist`, named after the
-bundle id. Bumping the version renames the domain, so **a rename is a one-time
-prefs reset**: old values do not carry over.
+bundle id. The BNT → NotchQuake bundle-id change reset preferences once;
+ordinary version updates do not change the preferences domain.
 
 ## License
 
@@ -66,30 +66,11 @@ surface it is written against.
 
 ## Signing & releases (Barnstorm LLC Developer ID)
 
-One-time setup — `scripts/setup-developer-id.sh` walks through getting the
-Developer ID Application certificate from developer.apple.com, importing the
-`.p12` into your login keychain (verify gate proves `Signature=Developer`, not
-adhoc), and setting the two GH Secrets. Until then `scripts/launch.sh` falls
-back to adhoc with a loud WARN (runs locally, not distributable).
+**Not production-ready yet.** See [the current project state](docs/project-state.md)
+for implemented features, validation, and signing/release blockers. The existing
+setup and release scripts are scaffolding, not a verified publishing pipeline.
+Notarization can be automated with `xcrun notarytool`; the earlier claim that
+it required a web-only submission was incorrect.
 
-```
-./scripts/setup-developer-id.sh    # one-time: import cert + set GH Secrets
-./scripts/launch.sh                # dev loop; auto-signs once the cert is in
-./scripts/release.sh v0.2-alpha    # cut+publish one release (see below)
-```
-
-A release = `scripts/release.sh <tag>`: builds `--release`, rebuilds the
-bundle, Developer-ID-signs inner binary AND bundle (aborts if not
-Developer-signed), runs `syspolicy_check notary-submission` as the
-notarization gate, zips, publishes via `gh release create` with the
-CHANGELOG section as notes, and pushes the signed tag.
-
-Optional notarization: upload the signed binary at
-<https://developer.apple.com/submit-binary/> and `stapler staple` the
-returned notarized copy into the bundle before zipping; `stapler validate`
-proves the ticket. Without a ticket the first user launch needs the
-right-click-open Smart-X step — fine for an alpha.
-
-CI: `gate.yml` runs fmt/build/test on every master push; `release.yml`
-builds on `v*` tags. Actual signing+publishing lives in `scripts/release.
-sh` (the keychain and the one manual Apple notarization step are local).
+CI checks `main` pushes and pull requests. The release workflow is manual and
+build-only until Developer ID signing, notarization, and stapling are verified.
