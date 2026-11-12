@@ -9,8 +9,10 @@
 pub mod consts;
 
 pub mod animation;
+pub mod effects;
 pub mod font;
 pub mod hotkey;
+pub mod input;
 pub mod notch_view;
 pub mod render;
 pub mod settings;
@@ -32,16 +34,17 @@ use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::sel;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationDidChangeScreenParametersNotification, NSEvent, NSEventMask, NSEventType, NSPanel,
+    NSApplicationDidChangeScreenParametersNotification, NSEvent, NSEventMask, NSEventType, NSMenu,
+    NSMenuItem, NSPanel, NSWorkspace, NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSTimeInterval, NSTimer,
+    NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 
 use block2::RcBlock;
 
-use crate::consts::{PANEL_HEIGHT, SPACE_KEY_CODE};
+use crate::consts::PANEL_HEIGHT;
 use crate::notch_view::NotchView;
 use crate::window::create_panel;
 
@@ -58,6 +61,7 @@ struct AppDelegateIvars {
     // silently unregisters the block.
     screen_observer: OnceCell<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     tick_timer: OnceCell<Retained<NSTimer>>,
+    motion_observer: OnceCell<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
 }
 
 define_class!(
@@ -109,39 +113,33 @@ define_class!(
             // always marked dirty by AppKit.
             view.as_super().setNeedsDisplay(true);
 
-            // The Option+Space global hotkey. A non-activating panel can never
-            // take key focus, so the hotkey is observed system-wide. We use
-            // the Carbon Event Manager (`RegisterEventHotKey`): it delivers a
-            // dedicated hotkey event to this app on the main run loop with NO
-            // Accessibility / Input Monitoring grant and without being
-            // frontmost. `NSEvent::addGlobalMonitorForEvents` cannot see key
-            // events without an accessibility grant, which an adhoc-signed dev
-            // bundle does not get — so the NSEvent monitor silently receives
-            // zero callbacks. The Carbon path sees only this chord, never
-            // other keystrokes.
-            let view_ptr: *const crate::notch_view::NotchView = &*view;
-            // The chords come from the stored settings (read once in
-            // `NotchView::new`), so a preference saved on a previous run is
-            // what launch registers — the settings panel can then change them
-            // at runtime via `NotchView::reregister_hotkeys`.
-            let hotkey_ok = crate::hotkey::register_hotkeys(mtm, &*view, view.current_settings());
-            let _ = view_ptr;
-            if !hotkey_ok {
-                eprintln!("notch-terminal: global Option+Space hotkey not registered");
+            // Only toggle is global, and only the EFFECTIVE one is registered:
+            // a stored chord that cannot be registered stays stored (reported by
+            // `Settings::load_with_status`) and never becomes active.
+            for warning in crate::hotkey::register_hotkeys(
+                mtm,
+                &view,
+                view.current_settings().effective_chords().0,
+            ) {
+                view.record_status(warning);
             }
-            // Keystrokes: a LOCAL monitor on the panel. A local monitor only
-            // fires while the panel window has key focus (clicking inside it
-            // claims focus); returning nil lets the event keep going to the
-            // rest of the desktop.
+            install_menus(mtm, self);
+            // Startup warnings (malformed prefs, font/hotkey fallbacks) are logged, never
+            // shown with a modal here: `NSAlert::runModal` before `app.run()` blocks the run
+            // loop until dismissed, which hangs launch. The recorded status stays available
+            // through `NotchView::settings_status` for the settings UI to surface.
+            for warning in view.settings_status() {
+                eprintln!("NotchQuake: {warning}");
+            }
             let view_for_keys = view.clone();
             let key_block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
                 if MainThreadMarker::new().is_some() {
                     let event_ref = unsafe { event.as_ref() };
-                    if event_ref.r#type() == NSEventType::KeyDown {
-                        view_for_keys.handle_key(event_ref);
+                    if event_ref.r#type() == NSEventType::KeyDown && view_for_keys.handle_key(event_ref) {
+                        return std::ptr::null_mut();
                     }
                 }
-                std::ptr::null_mut()
+                event.as_ptr()
             });
             let local_monitor = unsafe {
                 NSEvent::addLocalMonitorForEventsMatchingMask_handler(
@@ -209,8 +207,16 @@ define_class!(
             };
             let _ = ivars.screen_observer.set(screen_observer);
 
-            // dirty from an ivar change, so a repeating timer drives the
-            // animation passes. `tick` no-ops once the spring settles.
+            let motion_view = view.clone();
+            let motion_block = RcBlock::new(move |_note: NonNull<NSNotification>| {
+                motion_view.update_reduce_motion();
+            });
+            let workspace = NSWorkspace::sharedWorkspace();
+            let observer = unsafe { workspace.notificationCenter().addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification), None, None, &motion_block,
+            ) };
+            let _ = ivars.motion_observer.set(observer);
+            // Cheap common-mode pump: still wakes at 60Hz, but does not repaint idle terminals.
             let tick_proto: &ProtocolObject<dyn NSObjectProtocol> =
                 ProtocolObject::from_ref(&*view);
             let tick_target: &AnyObject = tick_proto.as_ref();
@@ -223,6 +229,7 @@ define_class!(
                     true,
                 )
             };
+            unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&tick_timer, NSRunLoopCommonModes) };
             let _ = ivars.tick_timer.set(tick_timer);
             let _ = ivars
                 .monitors
@@ -234,6 +241,22 @@ define_class!(
             app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
+        }
+
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _notification: &NSNotification) {
+            if let Some(view) = self.ivars().view.get()
+                && let Err(error) = view.flush_settings()
+            {
+                view.record_status(error.to_string());
+            }
+        }
+    }
+
+    impl AppDelegate {
+        #[unsafe(method(showSettings:))]
+        fn show_settings_action(&self, _sender: Option<&AnyObject>) {
+            if let Some(view) = self.ivars().view.get() { view.show_settings(); }
         }
     }
 );
@@ -254,4 +277,65 @@ fn main() {
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     app.run();
+}
+
+fn install_menus(mtm: MainThreadMarker, delegate: &AppDelegate) {
+    let app = NSApplication::sharedApplication(mtm);
+    let root = NSMenu::new(mtm);
+    let app_menu = NSMenu::new(mtm);
+    let app_item = NSMenuItem::new(mtm);
+    app_item.setSubmenu(Some(&app_menu));
+    root.addItem(&app_item);
+    for (title, action, key) in [
+        ("About NotchQuake", sel!(orderFrontStandardAboutPanel:), ""),
+        ("Settings…", sel!(showSettings:), ","),
+        ("Quit NotchQuake", sel!(terminate:), "q"),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        if key == "," {
+            unsafe { item.setTarget(Some(delegate)) };
+        } else {
+            unsafe { item.setTarget(Some(&app)) };
+        }
+        app_menu.addItem(&item);
+    }
+    let edit_menu = NSMenu::new(mtm);
+    edit_menu.setTitle(&NSString::from_str("Edit"));
+    let edit_item = NSMenuItem::new(mtm);
+    edit_item.setTitle(&NSString::from_str("Edit"));
+    edit_item.setSubmenu(Some(&edit_menu));
+    root.addItem(&edit_item);
+    for (title, action, key) in [
+        ("Undo", sel!(undo:), "z"),
+        ("Redo", sel!(redo:), "Z"),
+        ("Cut", sel!(cut:), "x"),
+        ("Copy", sel!(copy:), "c"),
+        ("Paste", sel!(paste:), "v"),
+        ("Select All", sel!(selectAll:), "a"),
+        ("Close Window", sel!(performClose:), "w"),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        if key == "Z" {
+            item.setKeyEquivalentModifierMask(
+                objc2_app_kit::NSEventModifierFlags::Command
+                    | objc2_app_kit::NSEventModifierFlags::Shift,
+            );
+        }
+        edit_menu.addItem(&item);
+    }
+    app.setMainMenu(Some(&root));
 }

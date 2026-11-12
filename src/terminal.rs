@@ -1,10 +1,8 @@
 //! One terminal session: an `alacritty_terminal` state machine driven by a
 //! login-shell PTY, plus a snapshot of its cell grid the renderer can paint.
 //!
-//! The PTY is spawned exactly once, at startup. The grid size is fixed for
-//! the whole process — it is computed from the OPEN panel height and the font
-//! cell metrics — so the reveal/collapse animation never resizes the PTY and
-//! nothing reflows (the panel's clip wipes the grid instead).
+//! Reveal/collapse clips a stable grid. Accepted settings reflow every live grid
+//! and send the complete character/pixel size through the reader's message channel.
 //!
 //! Shell resolution: the required `getpwuid(getuid()).pw_shell` rule is
 //! implemented here and handed to `alacritty_terminal` as
@@ -15,7 +13,6 @@
 use libc::c_void;
 use libc::getpwuid;
 use libc::getuid;
-use libc::passwd;
 use libc::pid_t;
 use libc::proc_name;
 use libc::proc_pidpath;
@@ -39,17 +36,19 @@ use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{
     ChildEvent, EventedPty, EventedReadWrite, Options, Pty, Shell, new as pty_new,
 };
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiRgb};
+use alacritty_terminal::vte::ansi::Color as AnsiColor;
+#[cfg(test)]
+use alacritty_terminal::vte::ansi::{NamedColor, Rgb as AnsiRgb};
 use alacritty_terminal::vte::{Parser as VteParser, Perform};
 use polling::{Event as PollingEvent, PollMode, Poller};
 
-use crate::settings::Settings;
+use crate::settings::Palette;
 
 /// Per-session OSC state harvested by the PTY tee's side-channel parser.
 ///
@@ -392,6 +391,14 @@ pub struct TitleListener {
     /// Set by `Event::Bell` (a raw BEL byte, `Term::bell`). Taken once by the
     /// view's notifier so one bell posts one notification (T1a).
     bell: Arc<AtomicBool>,
+    dirty: Arc<AtomicBool>,
+    suppress_config_title: Arc<AtomicBool>,
+}
+
+impl Default for TitleListener {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TitleListener {
@@ -402,6 +409,8 @@ impl TitleListener {
             dead: Arc::new(AtomicBool::new(false)),
             activity: Arc::new(AtomicBool::new(false)),
             bell: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(true)),
+            suppress_config_title: Arc::new(AtomicBool::new(false)),
         }
     }
     /// Wire the PTY writer channel once the `EventLoop` exists. Called after
@@ -425,8 +434,15 @@ impl TitleListener {
 
 impl EventListener for TitleListener {
     fn send_event(&self, event: Event) {
+        if self.suppress_config_title.load(Ordering::SeqCst)
+            && matches!(&event, Event::Title(_) | Event::ResetTitle)
+        {
+            return;
+        }
         match event {
+            Event::Wakeup => self.dirty.store(true, Ordering::SeqCst),
             Event::Title(t) => {
+                self.dirty.store(true, Ordering::SeqCst);
                 if let Ok(mut g) = self.title.lock() {
                     *g = Some(t);
                 }
@@ -442,6 +458,7 @@ impl EventListener for TitleListener {
                 self.activity.store(true, Ordering::SeqCst);
             }
             Event::ResetTitle => {
+                self.dirty.store(true, Ordering::SeqCst);
                 if let Ok(mut g) = self.title.lock() {
                     *g = None;
                 }
@@ -502,10 +519,51 @@ impl Dimensions for NotchSize {
 }
 
 /// One cell of the rendered grid, copied out under the terminal lock.
+#[derive(Clone)]
 pub struct CellSnapshot {
     pub character: char,
     pub foreground: (f64, f64, f64),
     pub background: (f64, f64, f64),
+}
+
+/// Full PTY size, including pixel dimensions when row/column counts are unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridSize {
+    pub rows: u16,
+    pub columns: u16,
+    pub cell_width: u16,
+    pub cell_height: u16,
+}
+impl GridSize {
+    pub fn new(rows: usize, columns: usize, width: f64, height: f64) -> Self {
+        Self {
+            rows: rows.clamp(1, u16::MAX as usize) as u16,
+            columns: columns.clamp(1, u16::MAX as usize) as u16,
+            cell_width: width.ceil().clamp(1.0, u16::MAX as f64) as u16,
+            cell_height: height.ceil().clamp(1.0, u16::MAX as f64) as u16,
+        }
+    }
+    fn window_size(self) -> WindowSize {
+        WindowSize {
+            num_lines: self.rows,
+            num_cols: self.columns,
+            cell_width: self.cell_width,
+            cell_height: self.cell_height,
+        }
+    }
+}
+
+/// Caller holds the terminal lock: only synchronous set_options title echoes are suppressed.
+fn set_history_options(term: &mut Term<TitleListener>, listener: &TitleListener, config: Config) {
+    struct Reset<'a>(&'a AtomicBool);
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    listener.suppress_config_title.store(true, Ordering::SeqCst);
+    let _reset = Reset(&listener.suppress_config_title);
+    term.set_options(config);
 }
 
 /// A live session: the terminal state machine, the input channel to the PTY,
@@ -532,15 +590,8 @@ pub struct Session {
     shim_dir: Option<PathBuf>,
     rows: usize,
     columns: usize,
-    /// The color palette this session was built with: a `Copy` snapshot of
-    /// the live `Settings`, taken at `Session::new` on the MAIN thread and
-    /// read back only in `snapshot()` (also the MAIN thread). `Term.colors()`
-    /// only holds colors an OSC/SGR sequence wrote, so every unset index
-    /// resolves through this bundle — which is why the palette is threaded
-    /// through the `Session` instead of living in a `static Cell<Settings>`
-    /// (not `Sync`) or a `thread_local!` (the PTY reader thread would read a
-    /// different value).
-    palette: Settings,
+    size: GridSize,
+    config: Config,
 }
 
 /// Monotonic id mixed into the shim-dir name so parallel sessions in one
@@ -671,19 +722,14 @@ impl Drop for Session {
 }
 
 impl Session {
-    /// Spawn the PTY once and start the PTY reader thread. `scrollback` is
-    /// the history cutoff in lines (0 disables scrolling history). `palette`
-    /// is the color bundle (ANSI 16, default foreground, default background,
-    /// cursor color) baked into this session; it is copied here on the MAIN
-    /// thread and read back in `snapshot()`, so the reader thread never has
-    /// to see it and the OSC tee path stays untouched.
+    /// Spawn a PTY and its reader thread. History and dimensions can change live.
+    /// Palette defaults are supplied to snapshot(), never frozen into the session.
     pub fn new(
         rows: usize,
         columns: usize,
         cell_width: f64,
         cell_height: f64,
         scrollback: usize,
-        palette: &Settings,
     ) -> Self {
         let shell = login_shell().expect("the current user has a login shell");
         let listener = TitleListener::new();
@@ -738,11 +784,13 @@ impl Session {
 
         // The scrollback cutoff: alacritty's `Config.scrolling_history` is the
         // history size in lines; the grid keeps total = screen + history.
-        let mut config = Config::default();
-        config.scrolling_history = scrollback;
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
 
         let terminal = Arc::new(FairMutex::new(Term::new(
-            config,
+            config.clone(),
             &NotchSize {
                 screen_lines: rows,
                 columns,
@@ -770,17 +818,38 @@ impl Session {
             shim_dir,
             rows,
             columns,
-            // Copy the palette bundle out of the settings cell (a `Copy` read,
-            // taken on the MAIN thread here) so `snapshot()` resolves every
-            // unset color index against the settings this session was built
-            // with.
-            palette: *palette,
+            size: GridSize::new(rows, columns, cell_width, cell_height),
+            config,
         }
     }
 
     /// Write user input (a keystroke, pasted text, …) to the PTY.
     pub fn send_input(&self, bytes: Vec<u8>) {
-        let _ = self.sender.send(Msg::Input(Cow::from(bytes)));
+        if self.sender.send(Msg::Input(Cow::from(bytes))).is_err() {
+            self.listener.dead.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn take_dirty(&self) -> bool {
+        self.listener.dirty.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.terminal
+            .lock()
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+    }
+
+    /// History shrink discards oldest lines immediately; it cannot be undone.
+    pub fn set_scrollback(&mut self, lines: usize) {
+        if self.config.scrolling_history == lines || self.dead() {
+            return;
+        }
+        self.config.scrolling_history = lines;
+        let mut terminal = self.terminal.lock();
+        set_history_options(&mut terminal, &self.listener, self.config.clone());
+        self.listener.dirty.store(true, Ordering::SeqCst);
     }
 
     /// Reflow this session to new grid dimensions. Two halves, both cheap
@@ -800,22 +869,24 @@ impl Session {
     /// realistic character cell, matching the `WindowSize` `Session::new`
     /// hands `pty_new`.
     pub fn resize(&mut self, rows: usize, columns: usize, cell_width: f64, cell_height: f64) {
-        if rows == self.rows && columns == self.columns {
+        let size = GridSize::new(rows, columns, cell_width, cell_height);
+        if size == self.size || self.dead() {
+            return;
+        }
+        {
+            let mut terminal = self.terminal.lock();
+            terminal.resize(NotchSize {
+                screen_lines: rows,
+                columns,
+            });
+        }
+        if self.sender.send(Msg::Resize(size.window_size())).is_err() {
+            self.listener.dead.store(true, Ordering::SeqCst);
             return;
         }
         self.rows = rows;
         self.columns = columns;
-        let mut terminal = self.terminal.lock();
-        terminal.resize(NotchSize {
-            screen_lines: rows,
-            columns,
-        });
-        let _ = self.sender.send(Msg::Resize(WindowSize {
-            num_lines: rows as u16,
-            num_cols: columns as u16,
-            cell_width: cell_width.ceil() as u16,
-            cell_height: cell_height.ceil() as u16,
-        }));
+        self.size = size;
     }
     /// Scroll the display through the scrollback history. `lines` > 0 shows
     /// older content (scroll up), < 0 returns toward the live viewport. The
@@ -829,7 +900,7 @@ impl Session {
     /// Copy the visible grid out under one short lock.
     ///
     /// Rows are returned top to bottom; each row has exactly `columns` cells.
-    pub fn snapshot(&self) -> Vec<Vec<CellSnapshot>> {
+    pub fn snapshot(&self, palette: &Palette) -> Vec<Vec<CellSnapshot>> {
         let terminal = self.terminal.lock();
         let grid = terminal.grid();
         let offset = grid.display_offset();
@@ -842,8 +913,8 @@ impl Session {
                         let cell = &grid[Line((offset + line) as i32)][Column(column)];
                         let inverse = cell.flags.intersects(Flags::INVERSE);
                         let (fg, bg) = (
-                            resolve(colors, cell.fg, &self.palette),
-                            resolve(colors, cell.bg, &self.palette),
+                            resolve(colors, cell.fg, palette),
+                            resolve(colors, cell.bg, palette),
                         );
                         CellSnapshot {
                             character: cell.c,
@@ -1124,7 +1195,7 @@ fn shorten_cwd(path: &str) -> Option<String> {
 ///
 /// `Term.colors()` starts as `[None; 269]` and is only written by OSC/SGR
 /// color operations, so a `None` entry falls back to our own default palette.
-fn resolve(colors: &Colors, color: AnsiColor, palette: &Settings) -> (f64, f64, f64) {
+fn resolve(colors: &Colors, color: AnsiColor, palette: &Palette) -> (f64, f64, f64) {
     match color {
         AnsiColor::Spec(rgb) => (
             rgb.r as f64 / 255.0,
@@ -1136,9 +1207,8 @@ fn resolve(colors: &Colors, color: AnsiColor, palette: &Settings) -> (f64, f64, 
     }
 }
 
-/// Indexed palette fallback: the terminal's `colors()` table when set, else
-/// the session's own default palette.
-fn palette_or(colors: &Colors, index: usize, palette: &Settings) -> (f64, f64, f64) {
+/// OSC overrides take priority over the current settings palette.
+fn palette_or(colors: &Colors, index: usize, palette: &Palette) -> (f64, f64, f64) {
     if let Some(rgb) = colors[index] {
         return (
             rgb.r as f64 / 255.0,
@@ -1149,12 +1219,8 @@ fn palette_or(colors: &Colors, index: usize, palette: &Settings) -> (f64, f64, f
     default_color(index, palette)
 }
 
-/// The default palette for an index, read from the session's baked `Settings`
-/// (`Settings.ansi` for the 16 named colors, `Settings.foreground`/`background`
-/// /`cursor_color` for the named defaults) and falling back to alacritty's
-/// dark-theme ramp for whatever the settings bundle does not carry (the color
-/// cube and the grayscale ramp).
-fn default_color(index: usize, palette: &Settings) -> (f64, f64, f64) {
+/// Current palette defaults, plus the standard 256-color cube and grayscale ramp.
+fn default_color(index: usize, palette: &Palette) -> (f64, f64, f64) {
     if index < 16 {
         let (r, g, b) = palette.ansi[index].rgb();
         return (r, g, b);
@@ -1183,7 +1249,7 @@ fn default_color(index: usize, palette: &Settings) -> (f64, f64, f64) {
         let b = steps[c % 6];
         return (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
     }
-    let v = 8 + (index - 233) * 10;
+    let v = 8 + (index - 232) * 10;
     (v as f64 / 255.0, v as f64 / 255.0, v as f64 / 255.0)
 }
 
@@ -1388,5 +1454,89 @@ mod tests {
             Some("/local/share")
         );
         assert_eq!(shorten_cwd(""), None);
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+    use crate::settings::{Color, Settings};
+    use alacritty_terminal::vte::ansi::Handler;
+
+    #[test]
+    fn live_palette_preserves_osc_override() {
+        let mut colors = Colors::default();
+        let mut palette = Settings::default().palette();
+        let before = resolve(&colors, AnsiColor::Named(NamedColor::Foreground), &palette);
+        palette.foreground = Color::new(1.0, 0.0, 0.0);
+        assert_ne!(
+            resolve(&colors, AnsiColor::Named(NamedColor::Foreground), &palette),
+            before
+        );
+        colors[NamedColor::Foreground as usize] = Some(AnsiRgb { r: 1, g: 2, b: 3 });
+        assert_eq!(
+            resolve(&colors, AnsiColor::Named(NamedColor::Foreground), &palette),
+            (1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0)
+        );
+        assert_eq!(
+            default_color(232, &palette),
+            (8.0 / 255.0, 8.0 / 255.0, 8.0 / 255.0)
+        );
+    }
+
+    #[test]
+    fn pixels_participate_in_resize_equality() {
+        assert_ne!(
+            GridSize::new(20, 80, 8.0, 16.0),
+            GridSize::new(20, 80, 9.0, 16.0)
+        );
+        assert_eq!(
+            GridSize::new(20, 80, 8.1, 16.0),
+            GridSize::new(20, 80, 8.9, 16.0)
+        );
+    }
+
+    #[test]
+    fn history_changes_suppress_only_config_title_echo() {
+        let listener = TitleListener::new();
+        let mut config = Config::default();
+        let mut term = Term::new(
+            config.clone(),
+            &NotchSize {
+                screen_lines: 3,
+                columns: 8,
+            },
+            listener.clone(),
+        );
+        term.set_title(Some("real".into()));
+        assert!(listener.activity.swap(false, Ordering::SeqCst));
+        for _ in 0..12 {
+            term.input('x');
+            term.linefeed();
+        }
+        assert!(term.grid().history_size() > 0);
+        config.scrolling_history = 0;
+        set_history_options(&mut term, &listener, config);
+        assert_eq!(term.grid().history_size(), 0);
+        assert_eq!(listener.title().as_deref(), Some("real"));
+        assert!(!listener.activity.load(Ordering::SeqCst));
+        term.set_title(Some("later".into()));
+        assert!(listener.activity.load(Ordering::SeqCst));
+        assert_eq!(listener.title().as_deref(), Some("later"));
+        term.set_title(None);
+        listener.activity.store(false, Ordering::SeqCst);
+        set_history_options(&mut term, &listener, Config::default());
+        assert_eq!(listener.title(), None);
+        assert!(!listener.activity.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn wakeup_is_repaint_not_attention() {
+        let listener = TitleListener::new();
+        listener.dirty.store(false, Ordering::SeqCst);
+        listener.send_event(Event::Wakeup);
+        assert!(listener.dirty.load(Ordering::SeqCst));
+        assert!(!listener.activity.load(Ordering::SeqCst));
+        assert!(!listener.dead.load(Ordering::SeqCst));
     }
 }

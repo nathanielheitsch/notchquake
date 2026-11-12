@@ -13,10 +13,14 @@
 //! pass (~60Hz).
 
 use crate::animation::Spring;
-use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, NOTCH_WIDTH, PANEL_HEIGHT, PANEL_WIDTH};
-use crate::font::{cell_metrics, monospace_with, ui_font};
+use crate::consts::{BOTTOM_CORNER_RADIUS, CLOSED_HEIGHT, NOTCH_WIDTH, PANEL_HEIGHT};
+use crate::effects::{
+    SettingsState, animation_active, displayed, motion_frame, selection_after_removal,
+};
+use crate::font::{metrics, monospace_with, resolve_monospace, ui_font};
+use crate::input::{self, Command, Context, Modifiers, Route};
 use crate::render::{GRID_PAD, GRID_TOP_PAD, draw_grid};
-use crate::settings::Settings;
+use crate::settings::{EditPhase, PersistenceError, Settings, SettingsError, SettingsSnapshot};
 use crate::settings_window::SettingsOwner;
 use crate::terminal::{OscSnapshot, Session};
 use core::ffi::c_double;
@@ -29,7 +33,8 @@ use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSEvent, NSEventModifierFlags, NSGraphicsContext, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSApplication, NSEvent, NSEventModifierFlags, NSGraphicsContext, NSPasteboard,
+    NSPasteboardTypeString, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWorkspace,
 };
 use objc2_core_foundation::kCFBooleanTrue;
 use objc2_core_foundation::{
@@ -42,8 +47,8 @@ use objc2_core_text::{
     kCTForegroundColorFromContextAttributeName,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize};
-use std::cell::Cell;
 use std::cell::OnceCell;
+use std::cell::{Cell, RefCell};
 
 /// Tab-bar geometry: an iTerm-style strip hanging from the silhouette's
 /// bottom edge — tabs are rounded-top-corner rectangles flush with the chin
@@ -199,15 +204,18 @@ pub struct NotchViewIvars {
     /// re-set by `reposition` on a display change. Every centring expression is
     /// `(canvas ± w) / 2`, so draw and hit-testing share one geometry source.
     canvas: Cell<f64>,
+    backing_scale: Cell<f64>,
     // Wheel-scroll state: `scroll` is the whole lines already applied to the
     // selected session's display_offset; `scroll_pts` carries the leftover
     // fractional wheel points between events. Reset on collapse.
     scroll: Cell<i32>,
     scroll_pts: Cell<f64>,
-    /// The live settings bundle, read once from `NSUserDefaults` at creation
-    /// (`Settings::load()`). `Copy` plain data, so a control click takes a
-    /// copy out, mutates one knob, and `replace`s it back.
-    settings: Cell<Settings>,
+    /// Immutable snapshots; no borrow may cross an AppKit callback.
+    settings: RefCell<SettingsState>,
+    reduce_motion: Cell<bool>,
+    foreground_poll: Cell<f64>,
+    foreground_titles: RefCell<Vec<String>>,
+    settings_was_visible: Cell<bool>,
     /// The settings WINDOW (a separate normal titled `NSWindow`, not this
     /// panel), created lazily on a gear click and retained here for the
     /// whole process lifetime. AppKit does not retain the window tree for us
@@ -241,9 +249,8 @@ define_class!(
         fn draw_rect(&self, dirty_rect: NSRect) {
             let ivars = self.ivars();
 
-            // Wall-clock delta since the previous draw pass. A zero
-            // `last_time` means "the spring was just retargeted": the next
-            // pass starts the curve at its beginning.
+            // Integrate frame time; retargeting preserves position and velocity.
+            // Zero denotes the first frame after idle, not an animation restart.
             let now = CFAbsoluteTimeGetCurrent();
             let previous = ivars.last_time.get();
             let delta = if previous == 0.0 {
@@ -253,9 +260,12 @@ define_class!(
             };
             ivars.last_time.set(now);
 
-            let height = ivars.spring.advance(delta);
+            let (height, width) = motion_frame(
+                &ivars.spring, &ivars.width_spring, delta, ivars.reduce_motion.get(),
+                ivars.notch.get(), (ivars.canvas.get(), PANEL_HEIGHT),
+            );
             ivars.height.set(height);
-            ivars.width.set(ivars.width_spring.advance(delta));
+            ivars.width.set(width);
             if let Some(graphics) = NSGraphicsContext::currentContext() {
                 let ctx = graphics.CGContext();
                 draw(Some(&ctx), height, ivars.width.get(), ivars);
@@ -266,8 +276,10 @@ define_class!(
 
             // Keep the view dirty while the spring is still flying so AppKit
             // re-invokes `drawRect:` next pass.
-            if !ivars.spring.settled() {
+            if animation_active(ivars.spring.settled(), ivars.width_spring.settled()) {
                 self.mark_dirty();
+            } else {
+                ivars.last_time.set(0.0);
             }
 
             // The hover tracking area, installed over the whole panel.
@@ -357,13 +369,26 @@ define_class!(
             // the user is NOT looking at. Runs even while closed (every tab is
             // then non-selected), so a background tab can still alert.
             self.drain_notifications();
-            // Redraw while the spring is animating OR while the panel is open,
-            // so PTY output (processed on the reader thread) is painted. The
-            // spring-only redraw left the grid frozen once the open animation
-            // settled — the terminal never updated even as the shell wrote its
-            // prompt. A terminal is meant to redraw continuously while open.
-            let open = ivars.height.get() > CLOSED_HEIGHT + 1.0;
-            if !ivars.spring.settled() || open {
+            self.pump_settings(false).unwrap_or_else(|error| self.record_status(error.to_string()));
+            let visible = crate::settings_window::window_frame(&ivars.settings_owner).is_some();
+            if ivars.settings_was_visible.replace(visible) && !visible
+                && let Err(error) = self.flush_settings() {
+                self.record_status(error.to_string());
+            }
+            let now = CFAbsoluteTimeGetCurrent();
+            let sessions = take_sessions(ivars);
+            let mut changed = false;
+            for session in &sessions { changed |= session.take_dirty(); }
+            if now >= ivars.foreground_poll.get() {
+                ivars.foreground_poll.set(now + 0.5);
+                let titles: Vec<_> = sessions.iter().map(Session::title).collect();
+                let mut old = ivars.foreground_titles.borrow_mut();
+                changed |= *old != titles;
+                *old = titles;
+            }
+            put_sessions(ivars, sessions);
+            let open = self.is_open();
+            if animation_active(ivars.spring.settled(), ivars.width_spring.settled()) || (open && changed) {
                 self.mark_dirty();
                 if let Some(window) = self.as_super().window() {
                     window.update();
@@ -426,19 +451,13 @@ fn trace_silhouette(ctx: Option<&CGContext>, h: CGFloat, w: CGFloat, canvas: CGF
 
 /// Paints one frame: the black silhouette, then (once open) the terminal
 /// grid and the tab bar, all clipped to the silhouette.
-
 fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchViewIvars) {
     let h = if height < 1.0 { 1.0 } else { height };
     let w = if width < 1.0 { 1.0 } else { width };
 
-    // The layer-backed view's context is already top-left, y-down (AppKit
-    // flips layer-backed views), so drawing uses panel-local coordinates
-    // measured down from the panel top.
-
-    // The live settings bundle, read once per frame: a `Cell` get of `Copy`
-    // plain data is free, and every consumer in the frame (silhouette fill,
-    // grid colors, session palette, the settings overlay) must agree.
-    let settings = ivars.settings.get();
+    // This non-layer-backed view uses y-up canvas coordinates.
+    // Clone the immutable snapshot, then release the state borrow before drawing.
+    let settings = ivars.settings.borrow().current.clone();
 
     // The canvas (panel window) width: the other half of every centring
     // expression `(canvas ± w) / 2`. Read from the ivar so draw, hit-testing
@@ -470,10 +489,11 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     let mut sessions = take_sessions(ivars);
 
     // The terminal grid, once the panel is open. Sessions spawn on the
-    // first open frame; the grid keeps its FIXED size (computed from the
-    // OPEN height minus the header), so the reveal is a pure clip wipe —
-    // no PTY resize. After the last tab is closed (`spawned` set),
-    // reopening spawns ONE fresh tab.
+    // first open frame at the size `grid_dims` computes from the OPEN height
+    // minus the header, so the reveal itself is a pure clip wipe; an ACCEPTED
+    // geometry/font change reflows the live sessions separately through
+    // `pump_settings` → `Session::resize` (see that seam). After the last tab
+    // is closed (`spawned` set), reopening spawns ONE fresh tab.
     //
     // Gate on the spring TARGET, not just the current height: closing the
     // LAST tab empties `sessions` and starts a collapse, and the collapse
@@ -482,18 +502,22 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
     // panel would never actually collapse (the bug behind "closing the only
     // tab leaves the panel open").
     if h > CLOSED_HEIGHT + 1.0 {
-        let (font, cell) = ensure_font(ivars, settings);
+        let (font, cell) = ensure_font(ivars, &settings);
         let header = header_height(ivars);
         if sessions.is_empty() && ivars.spring.target_value() > CLOSED_HEIGHT + 1.0 {
             let count = if ivars.spawned.get() { 1 } else { INITIAL_TABS };
             ivars.spawned.set(true);
-            let (rows, columns, scrollback) = grid_dims(cell, header, settings);
+            let (rows, columns, scrollback) = grid_dims(cell, header, &settings, canvas);
+            let pixels = cell_pixels(cell, ivars.backing_scale.get());
             sessions = (0..count)
-                .map(|_| Session::new(rows, columns, cell.0, cell.1, scrollback, &settings))
+                .map(|_| Session::new(rows, columns, pixels.0, pixels.1, scrollback))
                 .collect();
-            // Select the new tab — `selected` starts as None and collapse
-            // sets it None, so a fresh spawn must always own the selection
-            // or `draw_grid` matches `_ => {}` and the terminal renders blank.
+            // Select the new tab directly (not via `select_tab`): `tab_count`
+            // is still the pre-spawn mirror here because `put_sessions` runs at
+            // the end of the frame, so the guard in `select_tab` would reject
+            // the index. `selected` starts None and stays None across a collapse,
+            // so a fresh spawn must own the selection or `draw_grid` matches
+            // `_ => {}` and the terminal renders blank.
             ivars.selected.set(Some(count - 1));
         }
         // The header bar: filled with the TERMINAL background color (settings
@@ -520,7 +544,7 @@ fn draw(ctx: Option<&CGContext>, height: CGFloat, width: CGFloat, ivars: &NotchV
         // now, so the panel only ever draws the terminal.
         match ivars.selected.get().and_then(|i| sessions.get(i)) {
             Some(session) => {
-                let grid = session.snapshot();
+                let grid = session.snapshot(&settings.palette());
                 // The grid is laid out inside the LIVE silhouette: `grid_x0` is
                 // canvas-relative (the silhouette's left edge plus `GRID_PAD`), and
                 // `grid_usable` is the silhouette's inner width — the columns the
@@ -958,42 +982,6 @@ fn put_sessions(ivars: &NotchViewIvars, sessions: Vec<Session>) {
     ivars.sessions.replace(sessions);
 }
 
-/// An iTerm tab path: square bottom flush with `y`, rounded top corners at
-/// `y + h` (the rounded part faces up into the panel).
-fn trace_tab_rect(
-    ctx: Option<&CGContext>,
-    x: CGFloat,
-    y: CGFloat,
-    w: CGFloat,
-    h: CGFloat,
-    r: CGFloat,
-) {
-    let r = if r < w / 2.0 { r } else { w / 2.0 };
-    CGContext::move_to_point(ctx, x, y);
-    CGContext::add_line_to_point(ctx, x, y + h - r);
-    CGContext::add_curve_to_point(
-        ctx,
-        x,
-        y + h - r * (1.0 - KAPPA),
-        x + r * (1.0 - KAPPA),
-        y + h,
-        x + r,
-        y + h,
-    );
-    CGContext::add_line_to_point(ctx, x + w - r, y + h);
-    CGContext::add_curve_to_point(
-        ctx,
-        x + w - r * (1.0 - KAPPA),
-        y + h,
-        x + w,
-        y + h - r * (1.0 - KAPPA),
-        x + w,
-        y + h - r,
-    );
-    CGContext::add_line_to_point(ctx, x + w, y);
-    CGContext::close_path(ctx);
-}
-
 /// Draw one tab label centered in the band `(x, y, w)`, ellipsis-truncated
 /// when it does not fit. The ellipsis is a real `…` glyph shaped with the
 /// SAME font: `CTLineCreateTruncatedLine` with a NULL truncation token just
@@ -1162,19 +1150,14 @@ unsafe fn shaped_line(font: &CTFont, text: &CFString) -> CFRetained<CTLine> {
 /// hardcoded `FONT_SIZE` argument could never become a runtime knob.
 fn ensure_font(
     ivars: &NotchViewIvars,
-    settings: Settings,
+    settings: &Settings,
 ) -> (CFRetained<CTFont>, (CGFloat, CGFloat)) {
-    let font = ivars.font.replace(None);
-    let font = match font {
-        Some(font) => font,
-        None => monospace_with(settings.font_size, Some(settings.font_family)),
-    };
+    let font = ivars
+        .font
+        .replace(None)
+        .unwrap_or_else(|| monospace_with(settings.font_size, Some(&settings.font_family)));
+    let cell = ivars.cell.get().unwrap_or_else(|| metrics(&font));
     ivars.font.set(Some(font.clone()));
-    let cell = ivars.cell.replace(None);
-    let cell = match cell {
-        Some(cell) => cell,
-        None => cell_metrics(settings.font_size),
-    };
     ivars.cell.set(Some(cell));
     (font, cell)
 }
@@ -1187,24 +1170,42 @@ fn font_invalidate(ivars: &NotchViewIvars) {
     ivars.cell.set(None);
 }
 
+/// Split accumulated wheel points into `(whole lines to scroll, points to keep)`.
+///
+/// Pure and panic-free: a non-finite or non-positive `cell_height` — which is
+/// what a font-size preview leaves behind, because `font_invalidate` drops the
+/// cached cell while the grid resize waits for its deadline — yields no motion
+/// and preserves the accumulated points for the next event instead of dividing
+/// by zero or unwrapping an empty cache.
+fn scroll_lines(cell_height: CGFloat, pts: CGFloat) -> (i32, CGFloat) {
+    if cell_height.is_finite() && cell_height > 0.0 {
+        let lines = (pts / cell_height).trunc() as i32;
+        (lines, pts - lines as f64 * cell_height)
+    } else {
+        (0, pts)
+    }
+}
+
 /// The (rows, columns, scrollback) every `Session` must be built with at
 /// `cell` metrics and `header` reservation — the single formula shared by
 /// every spawn path (initial batch in `draw`, `spawn_tab`) so grid sizes
 /// cannot drift. Must stay in sync with `row_rect`'s header reservation.
 ///
-/// The grid reflows to `settings.open_width` — NOT the live spring width:
-/// sessions spawn on the FIRST open frame, while the width spring is still
-/// flying at the ~212pt notch, so baking columns from live `w` would silently
-/// create half-width sessions. `draw_grid` gets the live width (x0/usable) for
+/// The grid reflows to the EFFECTIVE open width — the user's stored preference
+/// clamped into the live canvas — and NOT to the live spring width: sessions
+/// spawn on the FIRST open frame, while the width spring is still flying at the
+/// ~212pt notch, so baking columns from live `w` would silently create
+/// half-width sessions. `draw_grid` gets the live width (x0/usable) for
 /// painting; a session's row/col count is baked at spawn and then kept in step
 /// with the knob by `apply_settings`' live `Session::resize` (see that seam).
 fn grid_dims(
     cell: (CGFloat, CGFloat),
     header: CGFloat,
-    settings: Settings,
+    settings: &Settings,
+    canvas: CGFloat,
 ) -> (usize, usize, usize) {
     let (cell_width, cell_height) = cell;
-    let usable = settings.open_width - 2.0 * GRID_PAD;
+    let usable = settings.effective_open_width(canvas) - 2.0 * GRID_PAD;
     let columns = ((usable / cell_width).floor() as usize).max(1);
     let rows = (((settings.open_height - header - GRID_TOP_PAD - TAB_HEIGHT - 2.0 * TAB_INSET)
         / cell_height)
@@ -1215,71 +1216,18 @@ fn grid_dims(
     (rows, columns, settings.scrollback_lines)
 }
 
-/// Translate an `NSEvent` keydown into PTY bytes.
-fn key_bytes(event: &NSEvent) -> Vec<u8> {
-    let keyCode = event.keyCode();
-    let flags = event.modifierFlags();
-    let alt = flags.contains(NSEventModifierFlags::Option);
-    let ctrl = flags.contains(NSEventModifierFlags::Control);
-
-    // Control chords: derive from the CHARACTER, not the keyCode — keyCode
-    // numbers are NOT letters (keyCode 4 is H, 2 is D, 13 is W, 10 is Q), so
-    // the old `keyCode - 1` mapping sent Ctrl-D for every H. Ctrl+letter is
-    // the letter's byte with bit 6 set (h -> 0x08, a -> 0x01).
-    if ctrl {
-        match event.characters() {
-            Some(chars) => {
-                let text = chars.to_string();
-                match text.as_bytes().first() {
-                    Some(b) if *b >= 0x40 && *b < 0x7f => return vec![*b & 0x1f],
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Special keys by keyCode (these ARE keyCode-space, not letters). Numbers
-    // from Carbon's virtual-key table (Events.h): Esc=53, Backspace(Delete)=51,
-    // Return=36, keypad Enter=76, Tab=48. An earlier table here used 8/13/3/26
-    // — those are the LETTERS C/W/F/7 in that table, so typing `w` sent CR (a
-    // newline), `c` sent Backspace, `f` sent Enter, `7` sent Tab.
-    match keyCode {
-        53 => return vec![0x1b], // kVK_Escape
-        51 => return vec![0x7f], // kVK_Delete (Backspace)
-        36 => return vec![0x0d], // kVK_Return
-        76 => return vec![0x0d], // kVK_ANSI_KeypadEnter
-        48 => return vec![0x09], // kVK_Tab
-        // Arrows / ForwardDelete: the PTY wants ANSI escape sequences, NOT the
-        // NSFunctionKey unicode chars `characters()` returns for these
-        // (\u{F700}+ would reach the shell as UTF-8 garbage).
-        126 => return b"\x1b[A".to_vec(),  // kVK_UpArrow
-        125 => return b"\x1b[B".to_vec(),  // kVK_DownArrow
-        124 => return b"\x1b[C".to_vec(),  // kVK_RightArrow
-        123 => return b"\x1b[D".to_vec(),  // kVK_LeftArrow
-        117 => return b"\x1b[3~".to_vec(), // kVK_ForwardDelete
-        _ => {}
-    }
-
-    // Printable characters, with the Option-prefixed (M-x) form when Alt is
-    // held and the character is ASCII.
-    match event.characters() {
-        Some(chars) => {
-            let text = chars.to_string();
-            let bytes = text.as_bytes().to_vec();
-            if alt && bytes.len() == 1 && bytes[0] >= 0x20 && bytes[0] < 0x80 {
-                return vec![0x1b, bytes[0]];
-            }
-            return bytes;
-        }
-        _ => {}
-    }
-    vec![]
+fn cell_pixels(cell: (CGFloat, CGFloat), scale: CGFloat) -> (CGFloat, CGFloat) {
+    ((cell.0 * scale).ceil(), (cell.1 * scale).ceil())
 }
 
 impl NotchView {
     /// Creates a closed notch view.
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let (mut settings, mut status) = Settings::load_with_status();
+        if let Err(warning) = resolve_monospace(&settings.font_family, settings.font_size) {
+            status.push(format!("{warning}; using Menlo"));
+            settings.font_family = "Menlo".into();
+        }
         let this = Self::alloc(mtm).set_ivars(NotchViewIvars {
             spring: Spring::new(CLOSED_HEIGHT),
             width_spring: Spring::new(NOTCH_WIDTH),
@@ -1299,9 +1247,16 @@ impl NotchView {
             tracking: Cell::new(vec![]),
             tracking_canvas: Cell::new(0.0),
             canvas: Cell::new(crate::window::canvas_size(mtm)),
+            backing_scale: Cell::new(1.0),
             scroll: Cell::new(0),
             scroll_pts: Cell::new(0.0),
-            settings: Cell::new(Settings::load()),
+            settings: RefCell::new(SettingsState::new(settings, status)),
+            reduce_motion: Cell::new(
+                NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion(),
+            ),
+            foreground_poll: Cell::new(0.0),
+            foreground_titles: RefCell::new(vec![]),
+            settings_was_visible: Cell::new(false),
             settings_owner: OnceCell::new(),
         });
         // SAFETY: `NSObject`'s `init` signature is correct.
@@ -1310,37 +1265,87 @@ impl NotchView {
 
     /// Sets the measured physical notch size, used as the closed size.
     pub fn set_notch(&self, size: (CGFloat, CGFloat)) {
-        self.ivars().notch.set(size);
-        self.ivars().spring.retarget(size.1);
-        self.ivars().width_spring.retarget(size.0);
+        let ivars = self.ivars();
+        let open = self.is_open();
+        ivars.notch.set(size);
+        if let Some(window) = self.as_super().window() {
+            ivars.backing_scale.set(window.backingScaleFactor());
+        }
+        let target = if open {
+            self.current_settings().open_height
+        } else {
+            size.1
+        };
+        self.set_target(target);
     }
 
-    /// Retargets the spring to `target` (the current value becomes the new
-    /// start, so an interrupted animation reverses from wherever it is). The
-    /// width spring retargets to the settings `open_width` when opening, so a
-    /// width-% change animates on the next open without any window resize
-    /// (the panel canvas is fixed at `window::canvas_size` x PANEL_HEIGHT).
+    /// Retarget both springs without resetting position or velocity.
     pub fn set_target(&self, target: f64) {
         let ivars = self.ivars();
-        ivars.spring.retarget(target);
-        let settings = ivars.settings.get();
+        let was_open = self.is_open();
+        let open = target > ivars.notch.get().1 + 1.0;
+        let height = displayed(target, ivars.notch.get().1, PANEL_HEIGHT);
+        let width = if open {
+            self.current_settings()
+                .effective_open_width(ivars.canvas.get())
+        } else {
+            ivars.notch.get().0
+        };
+        ivars.spring.retarget(height);
         ivars
             .width_spring
-            .retarget(if target > CLOSED_HEIGHT + 1.0 {
-                settings.open_width
-            } else {
-                ivars.notch.get().0
-            });
-        ivars.last_time.set(0.0);
-        self.mark_dirty();
-        // Claim key-window focus when opening, so a hotkey-open needs no
-        // follow-up click before typing. `canBecomeKeyWindow -> true` makes
-        // this legal for a NonactivatingPanel; we never activate the app, so
-        // the previous frontmost app stays visually frontmost.
-        if target > CLOSED_HEIGHT + 1.0 {
-            if let Some(window) = self.as_super().window() {
+            .retarget(displayed(width, ivars.notch.get().0, ivars.canvas.get()));
+        ivars.height.set(displayed(
+            ivars.height.get(),
+            ivars.notch.get().1,
+            PANEL_HEIGHT,
+        ));
+        ivars.width.set(displayed(
+            ivars.width.get(),
+            ivars.notch.get().0,
+            ivars.canvas.get(),
+        ));
+        if ivars.reduce_motion.get() {
+            self.snap_motion();
+        }
+        if open {
+            ivars
+                .settings
+                .borrow_mut()
+                .require_resize(CFAbsoluteTimeGetCurrent());
+            self.pump_settings(false)
+                .unwrap_or_else(|error| self.record_status(error.to_string()));
+            if !was_open && let Some(window) = self.as_super().window() {
                 window.makeKeyWindow();
             }
+        }
+        self.mark_dirty();
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.ivars().spring.target_value() > self.ivars().notch.get().1 + 1.0
+    }
+
+    fn snap_motion(&self) {
+        let ivars = self.ivars();
+        let (h, w) = motion_frame(
+            &ivars.spring,
+            &ivars.width_spring,
+            0.0,
+            true,
+            ivars.notch.get(),
+            (ivars.canvas.get(), PANEL_HEIGHT),
+        );
+        ivars.height.set(h);
+        ivars.width.set(w);
+    }
+
+    pub fn update_reduce_motion(&self) {
+        let enabled = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        self.ivars().reduce_motion.set(enabled);
+        if enabled {
+            self.snap_motion();
+            self.mark_dirty();
         }
     }
 
@@ -1348,13 +1353,11 @@ impl NotchView {
     /// target is the settings knob (whose default is `OPEN_HEIGHT`), so a
     /// height-% change takes effect on the very next toggle.
     pub fn toggle(&self) {
-        let open = self.ivars().settings.get().open_height;
-        let target = if self.ivars().spring.target_value() > (CLOSED_HEIGHT + open) / 2.0 {
-            CLOSED_HEIGHT
+        if self.is_open() {
+            self.collapse();
         } else {
-            open
-        };
-        self.set_target(target);
+            self.expand();
+        }
     }
 
     /// The height the silhouette was last drawn at.
@@ -1372,92 +1375,190 @@ impl NotchView {
         self.ivars().height.get()
     }
 
-    /// The live settings bundle. `main.rs` reads it at launch so the chords
-    /// Carbon registers are the stored ones (the ivars are private to this
-    /// module, so the accessor is the seam).
-    pub fn current_settings(&self) -> Settings {
-        self.ivars().settings.get()
+    pub fn current_settings(&self) -> SettingsSnapshot {
+        self.ivars().settings.borrow().current.clone()
     }
 
-    /// Re-register both Carbon hotkey chords from the live settings bundle,
-    /// forwarding to [`crate::hotkey::reregister_hotkeys`]. The settings panel
-    /// calls this after a hotkey row steps to a different preset, so the new
-    /// chord takes effect without a relaunch.
-    pub fn reregister_hotkeys(&self, settings: Settings) -> bool {
-        let mtm = MainThreadMarker::new().expect("the view is main-thread-only");
-        crate::hotkey::reregister_hotkeys(mtm, self, settings)
+    pub fn settings_status(&self) -> Vec<String> {
+        self.ivars().settings.borrow().status.clone()
     }
 
-    /// THE LIVE-APPLY SEAM: write a changed settings bundle back into the
-    /// view and make it take effect immediately. Every settings change goes
-    /// through here — the settings window's control callbacks call it, so the
-    /// window and the panel cannot drift on what a change means.
-    ///
-    /// The order mirrors what a change actually needs:
-    /// 1. store the bundle and persist it (`Settings::save()` writes
-    ///    `NSUserDefaults`, cheap at click rate),
-    /// 2. drop the cached grid font + cell metrics when a font knob moved
-    ///    (a `OnceCell` keeps the FIRST size it was created at),
-    /// 3. retarget the springs when a geometry knob moved, so the panel
-    ///    animates to the new size without a relaunch — and reflow the LIVE
-    ///    sessions for that new size (`Session::resize`: the `Term` grid under
-    ///    the `FairMutex` plus `Msg::Resize` so the PTY gets `TIOCSWINSZ`),
-    /// 4. re-register both Carbon chords when a chord moved, so the new one
-    ///    works right away and the old one stops.
-    pub fn apply_settings(&self, after: Settings) {
+    pub fn record_status(&self, message: String) {
+        eprintln!("NotchQuake: {message}");
+        self.ivars().settings.borrow_mut().status.push(message);
+    }
+
+    pub fn show_settings(&self) {
+        crate::settings_window::open_or_focus(self.mtm(), &self.ivars().settings_owner, self);
+    }
+
+    /// Validate and register before acceptance. Rejection never writes preferences.
+    pub fn apply_settings(
+        &self,
+        mut after: Settings,
+        phase: EditPhase,
+    ) -> Result<SettingsSnapshot, SettingsError> {
         let ivars = self.ivars();
-        let before = ivars.settings.get();
-        ivars.settings.replace(after);
-        after.save();
-        if after.font_size != before.font_size || after.font_family != before.font_family {
+        ivars
+            .settings
+            .borrow()
+            .validate_proposal(&after, phase, ivars.canvas.get())?;
+        let resolved = resolve_monospace(&after.font_family, after.font_size)
+            .map_err(SettingsError::Validation)?;
+        after.font_family = resolved.family;
+        let before = self.current_settings();
+        if after.toggle_chord != before.toggle_chord {
+            crate::hotkey::change_toggle(self.mtm(), after.toggle_chord)
+                .map_err(|e| SettingsError::Hotkey(e.to_string()))?;
+        }
+        let font_changed =
+            after.font_size != before.font_size || after.font_family != before.font_family;
+        let geometry_changed =
+            after.open_height != before.open_height || after.open_width != before.open_width;
+        let changed = ivars
+            .settings
+            .borrow_mut()
+            .accept(after, phase, CFAbsoluteTimeGetCurrent());
+        if font_changed {
             font_invalidate(ivars);
         }
-        if after.open_height != before.open_height || after.open_width != before.open_width {
-            self.set_target(after.open_height);
-            // Reflow the LIVE sessions to the new open size, so the grid the user
-            // is looking at re-wraps instead of only reflowing for tabs spawned
-            // later. Only while the panel is OPEN (gate on the spring target, the
-            // same rule as `draw`'s spawn gate): a closed-panel settings change
-            // must not resize/SIGWINCH a session mid-collapse, and a closed panel
-            // re-spawns on the next open anyway.
-            if ivars.spring.target_value() > CLOSED_HEIGHT + 1.0 {
-                // Cell metrics come from the same cache `draw` uses (`ensure_font`,
-                // which also fills the ivars so the next frame does not recompute),
-                // and rows/cols come from the existing `grid_dims` formula — never
-                // a copy of it.
-                let (_, cell) = ensure_font(ivars, after);
-                let (rows, columns, _) = grid_dims(cell, header_height(ivars), after);
-                // Move the vec out and back (lesson 17); `resize` mutates in place.
-                let mut sessions = take_sessions(ivars);
-                for session in &mut sessions {
-                    session.resize(rows, columns, cell.0, cell.1)
+        if changed {
+            if geometry_changed && self.is_open() {
+                // Retarget without stealing focus from native controls. The
+                // width is the EFFECTIVE one, so a proposal carrying a stored
+                // preference wider than the canvas cannot aim the spring past
+                // the display.
+                let settings = self.current_settings();
+                ivars.spring.retarget(settings.open_height);
+                ivars
+                    .width_spring
+                    .retarget(settings.effective_open_width(ivars.canvas.get()));
+                if ivars.reduce_motion.get() {
+                    self.snap_motion();
                 }
-                put_sessions(ivars, sessions);
             }
+            self.mark_dirty();
         }
-        if after.toggle_chord != before.toggle_chord || after.new_tab_chord != before.new_tab_chord
-        {
-            let _ = self.reregister_hotkeys(after);
-        }
-        self.mark_dirty();
+        self.pump_settings(phase == EditPhase::Commit)
+            .map_err(SettingsError::Persistence)?;
+        Ok(self.current_settings())
     }
 
-    /// Route a keystroke event to the selected session's PTY (a no-op when
-    /// no tab is selected). Every key reaches the PTY: the settings surface is
-    /// a separate window now, so the panel intercepts nothing.
-    pub fn handle_key(&self, event: &NSEvent) {
+    pub fn flush_settings(&self) -> Result<(), PersistenceError> {
+        self.pump_settings(true)
+    }
+
+    fn pump_settings(&self, flush: bool) -> Result<(), PersistenceError> {
         let ivars = self.ivars();
-        let bytes = key_bytes(event);
-        if bytes.is_empty() {
-            return;
+        let now = CFAbsoluteTimeGetCurrent();
+        let (resize, save) = {
+            let mut state = ivars.settings.borrow_mut();
+            if flush {
+                state.flush(now);
+            }
+            (state.resize_due(now, self.is_open()), state.save_due(now))
+        };
+        if resize {
+            let settings = self.current_settings();
+            let (_, cell) = ensure_font(ivars, &settings);
+            let (rows, columns, _) =
+                grid_dims(cell, header_height(ivars), &settings, ivars.canvas.get());
+            let mut sessions = take_sessions(ivars);
+            let pixels = cell_pixels(cell, ivars.backing_scale.get());
+            for session in &mut sessions {
+                session.resize(rows, columns, pixels.0, pixels.1);
+                session.set_scrollback(settings.scrollback_lines);
+            }
+            put_sessions(ivars, sessions);
+            self.mark_dirty();
         }
-        let sessions = take_sessions(ivars);
-        let selected = ivars.selected.get();
-        match selected.and_then(|i| sessions.get(i)) {
-            Some(session) => session.send_input(bytes),
-            _ => {}
+        if let Some(snapshot) = save {
+            // Submission only; NSUserDefaults exposes no durable-transaction result.
+            snapshot.save()?;
+            ivars.settings.borrow_mut().saved(snapshot);
         }
-        put_sessions(ivars, sessions);
+        Ok(())
+    }
+
+    /// True only when consumed. The monitor returns the original event otherwise.
+    pub fn handle_key(&self, event: &NSEvent) -> bool {
+        let panel = self.as_super().window();
+        let event_window = event.window(self.mtm());
+        let app = NSApplication::sharedApplication(self.mtm());
+        let key_window = app.keyWindow();
+        let same = |other: &Option<Retained<objc2_app_kit::NSWindow>>| {
+            panel
+                .as_ref()
+                .zip(other.as_ref())
+                .is_some_and(|(p, o)| std::ptr::eq(&**p, &**o))
+        };
+        let flags = event.modifierFlags();
+        let text = event
+            .characters()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let route = input::classify(
+            Context {
+                terminal_open: self.is_open(),
+                panel_is_key: same(&key_window),
+                event_is_panel: same(&event_window),
+            },
+            event.keyCode(),
+            &text,
+            Modifiers {
+                command: flags.contains(NSEventModifierFlags::Command),
+                option: flags.contains(NSEventModifierFlags::Option),
+                control: flags.contains(NSEventModifierFlags::Control),
+                shift: flags.contains(NSEventModifierFlags::Shift),
+            },
+            // The EFFECTIVE local chord: a stored value that cannot be routed
+            // (reserved, or equal to the toggle) is replaced by the terminal-local
+            // fallback, so the fallback chord actually works.
+            self.current_settings().effective_chords().1,
+        );
+        match route {
+            Route::PassThrough => false,
+            Route::Command(Command::NewTab) => {
+                self.spawn_tab();
+                true
+            }
+            Route::Command(Command::CloseTab) => {
+                if let Some(i) = self.ivars().selected.get() {
+                    self.close_tab(i);
+                }
+                true
+            }
+            Route::Command(Command::SelectTab(i)) => {
+                self.select_tab(i);
+                true
+            }
+            Route::Command(Command::CopyUnavailable) => true,
+            Route::Command(Command::Paste) => {
+                // Clipboard access only for an explicit runtime paste action.
+                let text = NSPasteboard::generalPasteboard()
+                    .stringForType(unsafe { NSPasteboardTypeString });
+                if let Some(text) = text {
+                    let sessions = take_sessions(self.ivars());
+                    if let Some(session) = self.ivars().selected.get().and_then(|i| sessions.get(i))
+                    {
+                        session.send_input(input::paste_bytes(
+                            &text.to_string(),
+                            session.bracketed_paste(),
+                        ));
+                    }
+                    put_sessions(self.ivars(), sessions);
+                }
+                true
+            }
+            Route::Bytes(bytes) => {
+                let sessions = take_sessions(self.ivars());
+                if let Some(session) = self.ivars().selected.get().and_then(|i| sessions.get(i)) {
+                    session.send_input(bytes);
+                }
+                put_sessions(self.ivars(), sessions);
+                true
+            }
+        }
     }
 
     /// Post at most one notification per (a) raw bell and (b) finished
@@ -1473,10 +1574,10 @@ impl NotchView {
     pub fn drain_notifications(&self) {
         let ivars = self.ivars();
         let selected = ivars.selected.get();
-        let settings = ivars.settings.get();
+        let settings = self.current_settings();
         let sessions = take_sessions(ivars);
         for (index, session) in sessions.iter().enumerate() {
-            let looking = Some(index) == selected;
+            let looking = self.is_open() && Some(index) == selected;
             let bell = session.take_bell();
             let finished = session.take_finished();
             if looking {
@@ -1506,7 +1607,7 @@ impl NotchView {
     /// size, capped at `MAX_TABS`. Only while open.
     pub fn spawn_tab(&self) {
         let ivars = self.ivars();
-        if ivars.height.get() <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
+        if !self.is_open() {
             return;
         }
         let mut sessions = take_sessions(ivars);
@@ -1514,19 +1615,19 @@ impl NotchView {
             put_sessions(ivars, sessions);
             return;
         }
-        let cell = ivars.cell.get().expect("a cell metric exists once open");
-        let (rows, columns, scrollback) =
-            grid_dims(cell, header_height(ivars), ivars.settings.get());
+        let (_, cell) = ensure_font(ivars, &self.current_settings());
+        let (rows, columns, scrollback) = grid_dims(
+            cell,
+            header_height(ivars),
+            &self.current_settings(),
+            ivars.canvas.get(),
+        );
         ivars.hovered.set(None); // session indices are about to shift
-        sessions.push(Session::new(
-            rows,
-            columns,
-            cell.0,
-            cell.1,
-            scrollback,
-            &ivars.settings.get(),
-        ));
+        let pixels = cell_pixels(cell, ivars.backing_scale.get());
+        sessions.push(Session::new(rows, columns, pixels.0, pixels.1, scrollback));
+        let selected = sessions.len() - 1;
         put_sessions(ivars, sessions);
+        self.select_tab(selected);
         self.mark_dirty();
     }
 
@@ -1540,30 +1641,20 @@ impl NotchView {
             put_sessions(ivars, sessions);
             return;
         }
+        let mut removed = vec![false; sessions.len()];
+        removed[index] = true;
+        let selected = selection_after_removal(ivars.selected.get(), &removed);
         let doomed = sessions.remove(index);
         doomed.destroy();
-        let empty = sessions.is_empty();
-        let len = sessions.len();
         put_sessions(ivars, sessions);
         ivars.hovered.set(None);
-        if empty {
-            ivars.selected.set(None);
-            self.mark_dirty();
-            self.collapse();
+        ivars.selected.set(selected);
+        if let Some(index) = selected {
+            self.select_tab(index);
         } else {
-            // Selection fix-up: closing the SELECTED tab selects the tab
-            // that followed it (`min(index, len-1)` after removal); closing
-            // one LEFT of the selection shifts the index down so the same
-            // tab stays selected; closing one RIGHT leaves it alone.
-            match ivars.selected.get() {
-                Some(sel) if index == sel => {
-                    self.select_tab(if index < len { index } else { len - 1 });
-                }
-                Some(sel) if index < sel => self.select_tab(sel - 1),
-                _ => {}
-            }
-            self.mark_dirty();
+            self.collapse();
         }
+        self.mark_dirty();
     }
 
     /// Tear down every session whose child shell has exited (one pass for
@@ -1577,50 +1668,29 @@ impl NotchView {
             put_sessions(ivars, sessions);
             return;
         }
-        let mut survivors: Vec<Session> = vec![];
-        let mut first_removed: Option<usize> = None;
-        let mut removed_before_sel = 0;
-        let sel_at_entry = ivars.selected.get().unwrap_or(usize::MAX);
-        for (index, s) in sessions.into_iter().enumerate() {
-            if s.dead() {
-                s.destroy();
-                if first_removed.is_none() {
-                    first_removed = Some(index);
+        let removed: Vec<_> = sessions.iter().map(Session::dead).collect();
+        let selected = selection_after_removal(ivars.selected.get(), &removed);
+        let survivors = sessions
+            .into_iter()
+            .zip(removed)
+            .filter_map(|(session, dead)| {
+                if dead {
+                    session.destroy();
+                    None
+                } else {
+                    Some(session)
                 }
-                if index < sel_at_entry {
-                    removed_before_sel += 1;
-                }
-            } else {
-                survivors.push(s);
-            }
-        }
+            })
+            .collect();
         put_sessions(ivars, survivors);
         ivars.hovered.set(None);
-        if ivars.tab_count.get() == 0 {
-            ivars.selected.set(None);
-            self.mark_dirty();
-            self.collapse();
+        ivars.selected.set(selected);
+        if let Some(index) = selected {
+            self.select_tab(index);
         } else {
-            // Same remap as `close_tab`: dead tabs LEFT of the selection
-            // shift it down by one (the same tab stays selected); a
-            // selection at/past a removed tab moves to the tab that
-            // followed the first removal, clamped to the end.
-            match ivars.selected.get() {
-                Some(sel) => {
-                    let shifted = sel - removed_before_sel;
-                    let target = if shifted >= ivars.tab_count.get() {
-                        first_removed.unwrap_or(0).min(ivars.tab_count.get() - 1)
-                    } else {
-                        shifted
-                    };
-                    if target != sel {
-                        self.select_tab(target);
-                    }
-                }
-                _ => {}
-            }
-            self.mark_dirty();
+            self.collapse();
         }
+        self.mark_dirty();
     }
 
     /// Handle a click observed by the GLOBAL mouse monitor. A non-activating
@@ -1696,7 +1766,22 @@ impl NotchView {
         let y = screen.y - panel_frame.origin.y;
         let ivars = self.ivars();
         let h = ivars.height.get();
-        let open = h > CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT;
+        let open = self.is_open();
+
+        // Native auxiliary windows get their own clicks, including color panels/About.
+        for window in NSApplication::sharedApplication(self.mtm()).windows() {
+            if std::ptr::eq(&*window, &*panel) || !window.isVisible() || window.isMiniaturized() {
+                continue;
+            }
+            let frame = window.frame();
+            if screen.x >= frame.origin.x
+                && screen.x <= frame.origin.x + frame.size.width
+                && screen.y >= frame.origin.y
+                && screen.y <= frame.origin.y + frame.size.height
+            {
+                return;
+            }
+        }
 
         // The settings WINDOW is a separate layer-0 window, so a click on one
         // of its controls is observed by our global `LeftMouseDown` monitor
@@ -1816,6 +1901,9 @@ impl NotchView {
     /// cannot be forgotten by one call site.
     pub fn select_tab(&self, index: usize) {
         let ivars = self.ivars();
+        if index >= ivars.tab_count.get() {
+            return;
+        }
         ivars.selected.set(Some(index));
         let sessions = take_sessions(ivars);
         match sessions.get(index) {
@@ -1854,6 +1942,34 @@ impl NotchView {
                     true,
                 );
                 ivars.canvas.set(canvas);
+                // The stored open width may now exceed the canvas. Nothing is
+                // re-persisted for a geometry change: the preference stays raw
+                // and every consumer clamps through `effective_open_width`, so
+                // re-target the width spring at the effective value here and
+                // schedule an immediate grid reflow when the panel is open. A
+                // display change can otherwise leave the PTY grid at its old
+                // column count until another settings/open transition.
+                let width = self.current_settings().effective_open_width(canvas);
+                let open = self.is_open();
+                ivars
+                    .width_spring
+                    .retarget(displayed(width, ivars.notch.get().0, canvas));
+                if open {
+                    ivars
+                        .settings
+                        .borrow_mut()
+                        .require_resize(CFAbsoluteTimeGetCurrent());
+                }
+                if width < self.current_settings().open_width {
+                    let message = format!(
+                        "Open width is limited to {width:.0}pt on this display; your saved preference is kept"
+                    );
+                    // Screen-parameter notifications can fire repeatedly for one
+                    // resize, so the note is recorded once, not per frame.
+                    if !self.settings_status().contains(&message) {
+                        self.record_status(message);
+                    }
+                }
                 // Re-set the view's own frame (it fills the canvas, parent-relative),
                 // mirroring `main.rs`'s initial `setFrame`.
                 self.as_super().setFrame(NSRect::new(
@@ -1876,7 +1992,7 @@ impl NotchView {
     /// Open the panel (idempotent: already-open stays open) at the settings
     /// open height.
     pub fn expand(&self) {
-        self.set_target(self.ivars().settings.get().open_height);
+        self.set_target(self.current_settings().open_height);
     }
 
     /// Collapse the panel and reset the scroll position so reopening shows
@@ -1887,7 +2003,6 @@ impl NotchView {
         let ivars = self.ivars();
         ivars.scroll.set(0);
         ivars.scroll_pts.set(0.0);
-        ivars.selected.set(None);
         let sessions = take_sessions(ivars);
         for session in &sessions {
             session.scroll_display(0);
@@ -1901,20 +2016,29 @@ impl NotchView {
     /// Apple's `deltaY` is positive for a DOWNWARD scroll gesture, which
     /// reveals content BELOW the viewport (newer), so the line delta is
     /// negated against alacritty's `Scroll::Delta(+n)` = show older.
+    ///
+    /// The line metric comes from the cache when it is warm. A font-size or
+    /// family preview invalidates it (`font_invalidate`) and defers the grid
+    /// resize to a settings deadline, so a wheel event can land in the window
+    /// where nothing has repainted yet; `ensure_font` is then the same call
+    /// `draw` makes, so it rebuilds the face and metric from the CURRENT
+    /// settings. That restores a usable metric without panicking and keeps the
+    /// preview semantics intact — the next draw still resolves the selected font.
     pub fn scroll_wheel(&self, delta_y: CGFloat) {
         let ivars = self.ivars();
         if ivars.height.get() <= CLOSED_HEIGHT + TAB_INSET + TAB_HEIGHT {
             return;
         }
-        let cell_height = ivars.cell.get().expect("a cell metric exists once open").1;
+        let cell = ivars.cell.get().unwrap_or_else(|| {
+            let (_, cell) = ensure_font(ivars, &self.current_settings());
+            cell
+        });
         ivars.scroll_pts.set(ivars.scroll_pts.get() - delta_y);
-        let lines = (ivars.scroll_pts.get() / cell_height).trunc() as i32;
+        let (lines, carry) = scroll_lines(cell.1, ivars.scroll_pts.get());
+        ivars.scroll_pts.set(carry);
         if lines == 0 {
             return;
         }
-        ivars
-            .scroll_pts
-            .set(ivars.scroll_pts.get() - lines as f64 * cell_height);
         ivars.scroll.set(ivars.scroll.get() + lines);
         let sessions = take_sessions(ivars);
         match ivars.selected.get().and_then(|i| sessions.get(i)) {
@@ -1923,5 +2047,48 @@ impl NotchView {
         }
         put_sessions(ivars, sessions);
         self.mark_dirty();
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+
+    #[test]
+    fn grid_dimensions_use_shared_selected_metrics_and_canvas_bounds() {
+        let s = Settings::default();
+        let (_, wide, _) = grid_dims((8.0, 16.0), 33.0, &s, 1920.0);
+        let (_, narrow, _) = grid_dims((8.0, 16.0), 33.0, &s, 480.0);
+        assert_eq!(wide, 78);
+        assert_eq!(narrow, 58);
+        let (rows, columns, _) = grid_dims((16.0, 32.0), 33.0, &s, 1920.0);
+        assert_eq!(columns, 39);
+        assert!(rows > 0);
+        assert_eq!(cell_pixels((8.1, 16.2), 2.0), (17.0, 33.0));
+    }
+
+    #[test]
+    fn wheel_scroll_is_safe_when_a_preview_invalidated_the_cell_cache() {
+        // A font-size preview clears both cached cells and defers the resize, so
+        // the wheel path can run before any draw rebuilt metrics. It derives the
+        // metric from the resolved settings rather than unwrapping the cache,
+        // and the arithmetic below is that path with the cache absent.
+        let settings = Settings::default();
+        let resolved = resolve_monospace(&settings.font_family, settings.font_size)
+            .unwrap_or_else(|_| resolve_monospace("Menlo", settings.font_size).unwrap());
+        assert!(resolved.cell.1.is_finite() && resolved.cell.1 > 0.0);
+
+        let h = resolved.cell.1;
+        let (lines, carry) = scroll_lines(h, h * 2.5);
+        assert_eq!(lines, 2);
+        assert!((carry - h * 0.5).abs() < 1e-9);
+
+        // The invalidated-cache shape: no usable metric means no motion, and the
+        // accumulated points survive for the next event instead of panicking.
+        assert_eq!(scroll_lines(0.0, 40.0), (0, 40.0));
+        assert_eq!(scroll_lines(f64::NAN, 40.0), (0, 40.0));
+        assert_eq!(scroll_lines(h, 0.0), (0, 0.0));
+        // Sub-line accumulation defers until a whole line exists.
+        assert_eq!(scroll_lines(20.0, 15.0), (0, 15.0));
     }
 }

@@ -15,16 +15,14 @@
 
 use objc2_core_foundation::kCFBooleanTrue;
 use objc2_core_foundation::{
-    CFBoolean, CFMutableAttributedString, CFNumber, CFRange, CFRetained, CFString, CGFloat,
-    CGPoint, CGRect, CGSize,
+    CFMutableAttributedString, CFNumber, CFRange, CFRetained, CFString, CGFloat, CGPoint, CGRect,
+    CGSize,
 };
 use objc2_core_graphics::{CGColor, CGContext};
 use objc2_core_text::{
     CTFont, CTLine, kCTFontAttributeName, kCTForegroundColorFromContextAttributeName,
     kCTLigatureAttributeName,
 };
-
-use std::ptr::null;
 
 use crate::consts::PANEL_HEIGHT;
 use crate::settings::{CursorShape, Settings};
@@ -259,4 +257,75 @@ unsafe fn run(font: &CTFont, text: &CFString, ligatures: bool) -> CFRetained<CTL
         }
     };
     unsafe { CTLine::with_attributed_string(&**attr) }
+}
+
+/// Origin-independent paint adapter for a native preview view. No PTY is created.
+pub fn paint_grid_at(
+    ctx: &CGContext,
+    bounds: CGRect,
+    grid: &[Vec<CellSnapshot>],
+    cursor: Option<(usize, usize)>,
+    resolved: &crate::font::ResolvedFont,
+    settings: &Settings,
+) {
+    CGContext::save_g_state(Some(ctx));
+    CGContext::begin_path(Some(ctx));
+    CGContext::add_rect(Some(ctx), bounds);
+    CGContext::clip(Some(ctx));
+    CGContext::set_fill_color_with_color(Some(ctx), Some(&srgb(settings.background.rgb())));
+    CGContext::fill_rect(Some(ctx), bounds);
+    CGContext::translate_ctm(
+        Some(ctx),
+        bounds.origin.x,
+        bounds.origin.y + bounds.size.height - PANEL_HEIGHT,
+    );
+    draw_grid(
+        ctx,
+        grid,
+        cursor,
+        &resolved.font,
+        resolved.cell.0,
+        resolved.cell.1,
+        bounds.size.height,
+        -GRID_TOP_PAD,
+        settings,
+        0.0,
+        bounds.size.width,
+    );
+    CGContext::restore_g_state(Some(ctx));
+}
+
+/// Representative colors and ligatures using the same shaped grid renderer as real sessions.
+pub fn sample_grid(settings: &Settings) -> Vec<Vec<CellSnapshot>> {
+    let lines = [
+        "$ cargo build --release",
+        "   Compiling NotchQuake -> ready",
+        "✓ 0 errors  !=  =>  ===",
+        "ANSI 0123456789ABCDEF",
+    ];
+    let columns = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .enumerate()
+        .map(|(row, text)| {
+            text.chars()
+                .chain(std::iter::repeat(' '))
+                .take(columns)
+                .enumerate()
+                .map(|(column, character)| CellSnapshot {
+                    character,
+                    foreground: if row == 3 && (5..21).contains(&column) {
+                        settings.ansi[column - 5].rgb()
+                    } else {
+                        settings.foreground.rgb()
+                    },
+                    background: settings.background.rgb(),
+                })
+                .collect()
+        })
+        .collect()
 }

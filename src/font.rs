@@ -1,118 +1,121 @@
-//! The monospace font used for the terminal grid, and the cell metrics that
-//! come out of it.
-//!
-//! `CTFontCreateWithName` (bound as `CTFont::with_name`) resolves a font
-//! family name through the system font fallback, so we ask for "Fira Code"
-//! first — it is installed on this machine (`fc-list` reports
-//! `FiraCode-Regular.ttf` in `~/Library/Fonts`) — and fall back to "Menlo",
-//! which macOS always ships.
-//!
-//! No font registration happens here: `CTFontManagerRegisterFontsForURL`
-//! would need a `.ttf` shipped inside the repo, and there is none (Fira Code
-//! is already a system font), so registration is skipped entirely.
-//!
-//! The cell advance is measured with `CTFontGetAdvancesForGlyphs`
-//! (`CTFont::advances_for_glyphs`) on the space glyph, which is what keeps
-//! the grid monospace.
+//! Strict installed monospace resolution and metrics measured from that exact CTFont.
+use std::ptr::{NonNull, null};
 
-use objc2_core_foundation::{
-    CFArrayCallBacks, CFComparisonResult, CFMutableArray, CFMutableAttributedString, CFRange,
-    CFRetained, CFString, CFStringCompareFlags, CGAffineTransform, CGFloat, CGSize,
-};
+use objc2_core_foundation::{CFRetained, CFString, CGAffineTransform, CGFloat, CGSize};
 use objc2_core_graphics::CGGlyph;
 use objc2_core_text::{
-    CTFont, CTFontOrientation, CTLine, CTRun, kCTFontAttributeName, kCTFontFeatureSettingsAttribute,
+    CTFont, CTFontManagerCopyAvailableFontFamilyNames, CTFontOrientation, CTFontSymbolicTraits,
 };
 
-use std::ptr::NonNull;
-use std::ptr::null;
-
-/// Point size of the terminal font.
 pub const FONT_SIZE: CGFloat = 14.0;
 
-/// The space glyph code point, as a UTF-16 code unit (`UniChar`, which is
-/// `u16` in `objc2-core-foundation`).
-const SPACE_CODE_UNIT: u16 = 32;
-
-/// Creates the monospace font for `family` at `size`, falling back to "Menlo".
-///
-/// `None` means the default family ("Fira Code"). `CTFontCreateWithName` never
-/// returns nil, it only "best matches" the requested name, so the resolved
-/// `family_name()` is compared against the request before the font is accepted;
-/// a family that does not resolve ("SF Mono" is not installed, etc.) falls back
-/// to Menlo, which macOS always ships.
-pub fn monospace_with(size: CGFloat, family: Option<&str>) -> CFRetained<CTFont> {
-    let requested = family.unwrap_or("Fira Code");
-    let preferred = CFString::from_str(requested);
-    let font = unsafe { CTFont::with_name(&preferred, size, null::<CGAffineTransform>()) };
-
-    // `CTFontCreateWithName` never returns nil, it only "best matches" the
-    // requested name; so verify the family actually resolved before
-    // accepting it, otherwise the fallback would be silently shadowed by
-    // whatever CoreText substituted.
-    let family_name = unsafe { font.family_name() };
-    let resolved = unsafe { family_name.compare(Some(&preferred), CFStringCompareFlags(0)) };
-    if resolved.0 == CFComparisonResult::CompareEqualTo.0 {
-        return font;
-    }
-
-    let fallback = CFString::from_str("Menlo");
-    unsafe { CTFont::with_name(&fallback, size, null::<CGAffineTransform>()) }
+pub struct ResolvedFont {
+    pub font: CFRetained<CTFont>,
+    pub family: String,
+    pub cell: (CGFloat, CGFloat),
 }
 
-/// The default monospace font at `size`: "Fira Code" when the system resolves
-/// it, otherwise "Menlo".
+pub fn resolve_monospace(family: &str, size: CGFloat) -> Result<ResolvedFont, String> {
+    if !size.is_finite() || size <= 0.0 {
+        return Err("Font size must be finite and positive".into());
+    }
+    let requested = CFString::from_str(family);
+    let font = unsafe { CTFont::with_name(&requested, size, null::<CGAffineTransform>()) };
+    let resolved = unsafe { font.family_name() }.to_string();
+    if !resolved.eq_ignore_ascii_case(family)
+        || !unsafe { font.symbolic_traits() }.contains(CTFontSymbolicTraits::TraitMonoSpace)
+    {
+        return Err(format!(
+            "{family} is not an available monospace family (CoreText resolved {resolved})"
+        ));
+    }
+    let cell = metrics(&font);
+    if !(cell.0.is_finite() && cell.1.is_finite() && cell.0 > 0.0 && cell.1 > 0.0) {
+        return Err(format!("{family} has invalid cell metrics"));
+    }
+    Ok(ResolvedFont {
+        font,
+        family: resolved,
+        cell,
+    })
+}
+
+/// CoreText-only enumeration: no NSFontManager/main-thread AppKit requirements.
+pub fn installed_monospace_families() -> Vec<String> {
+    let families = unsafe { CTFontManagerCopyAvailableFontFamilyNames() };
+    // CoreText documents this array's elements as CFString family names.
+    let families = unsafe { families.cast_unchecked::<CFString>() };
+    let mut result: Vec<String> = families
+        .iter()
+        .map(|name| name.to_string())
+        .filter(|name| resolve_monospace(name, FONT_SIZE).is_ok())
+        .collect();
+    result.sort_by_key(|name| name.to_lowercase());
+    result.dedup();
+    result
+}
+
+/// Compatibility renderer fallback. Settings acceptance uses the strict resolver instead.
+pub fn monospace_with(size: CGFloat, family: Option<&str>) -> CFRetained<CTFont> {
+    resolve_monospace(family.unwrap_or("Fira Code"), size)
+        .or_else(|_| resolve_monospace("Menlo", size))
+        .expect("macOS includes Menlo")
+        .font
+}
+
 pub fn monospace(size: CGFloat) -> CFRetained<CTFont> {
     monospace_with(size, None)
 }
 
-/// The system UI font (San Francisco), used for the chrome text — the tab
-/// titles and the `⌘<n>` index hint. iTerm2 draws its tab strip in this face,
-/// and `.AppleSystemUIFont` is the reserved PostScript name for the current
-/// system text face, so it always resolves on macOS: no fallback chain needed
-/// (unlike `monospace`, which asks for a third-party family that may be absent).
 pub fn ui_font(size: CGFloat) -> CFRetained<CTFont> {
-    let name = CFString::from_str(".AppleSystemUIFont");
-    unsafe { CTFont::with_name(&name, size, null::<CGAffineTransform>()) }
+    unsafe {
+        CTFont::with_name(
+            &CFString::from_str(".AppleSystemUIFont"),
+            size,
+            null::<CGAffineTransform>(),
+        )
+    }
 }
 
-/// The horizontal advance of a space in `font`, in points.
-///
-/// Measured with `CTFontGetAdvancesForGlyphs` on the space glyph. This is the
-/// cell width: the grid stays monospace even when a ligature glyph visually
-/// spans more than one cell.
 pub fn cell_advance(font: &CTFont) -> CGFloat {
-    let code_unit = SPACE_CODE_UNIT;
-    let glyph: CGGlyph = 0;
-
-    // `CTFontGetGlyphsForCharacters` maps the code point to a glyph index.
-    let mapped =
-        unsafe { font.glyphs_for_characters(NonNull::from(&code_unit), NonNull::from(&glyph), 1) };
+    let code_unit: u16 = 32;
+    let mut glyph: CGGlyph = 0;
+    let mapped = unsafe {
+        font.glyphs_for_characters(NonNull::from(&code_unit), NonNull::from(&mut glyph), 1)
+    };
     if !mapped {
         return 0.0;
     }
-
-    // `advances` may be NULL: the summed advance of the single glyph is
-    // returned directly, which is exactly the cell width.
-    let no_advances: *mut CGSize = std::ptr::null_mut();
-    let width = unsafe {
+    unsafe {
         font.advances_for_glyphs(
             CTFontOrientation::Horizontal,
             NonNull::from(&glyph),
-            no_advances,
+            std::ptr::null_mut::<CGSize>(),
             1,
         )
-    };
-    width as CGFloat
+    }
 }
 
-/// The (cell width, cell height) pair for the terminal grid at `size`.
-///
-/// Height is the font's ascent + descent + leading, so a line of text never
-/// overlaps the next one.
+pub fn metrics(font: &CTFont) -> (CGFloat, CGFloat) {
+    (cell_advance(font), unsafe {
+        font.ascent() + font.descent() + font.leading()
+    })
+}
+
 pub fn cell_metrics(size: CGFloat) -> (CGFloat, CGFloat) {
-    let font = monospace(size);
-    let width = cell_advance(&font);
-    let height = unsafe { font.ascent() } + unsafe { font.descent() } + unsafe { font.leading() };
-    (width, height)
+    metrics(&monospace(size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_resolution_and_selected_metrics() {
+        assert!(resolve_monospace("Definitely Not An Installed Font", 14.0).is_err());
+        let resolved = resolve_monospace("Menlo", 14.0).unwrap();
+        assert_eq!(resolved.family, "Menlo");
+        assert_eq!(resolved.cell, metrics(&resolved.font));
+        assert!(resolved.cell.0 > 0.0 && resolved.cell.1 > 0.0);
+    }
 }

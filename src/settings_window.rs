@@ -15,14 +15,8 @@
 //! the view tree, so nothing else keeps them alive: drop one and `setTarget:`'s
 //! reference lets it die and that control's clicks silently no-op forever.
 //!
-//! Click-operability, verified live: a real pixel click on a control flips it
-//! (an `NSSwitch` went off → on). Background/synthetic input into the window IS
-//! refused (`minimized_or_hidden_window`) because the app is `Accessory`
-//! policy, but that only rules out TYPING into the window — the window itself
-//! can be brought to front and activated. So the UI is built from click-driven
-//! native controls only: sliders, popup menus, switches, segmented controls,
-//! color wells, swatch boxes. No editable `NSTextField` for values, no typed
-//! chord entry; `NSTextField` appears only as static labels.
+//! Compatibility UI pending the native settings redesign. Accessory policy does
+//! not prohibit native text editing or local shortcut recording.
 //!
 //! Unlike the notch panel (a non-activating `NSPanel` at layer 27), this is a
 //! normal layer-0 window: window tools can see it, and it can take key focus.
@@ -38,11 +32,11 @@ use objc2::runtime::ProtocolObject;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::sel;
 use objc2_app_kit::{
-    NSBackingStoreType, NSBox, NSBoxType, NSColor, NSColorSpace, NSColorWell, NSColorWellStyle,
-    NSControlStateValueOff, NSControlStateValueOn, NSGridView, NSMenu, NSMenuItem, NSPopUpButton,
-    NSSegmentSwitchTracking, NSSegmentedControl, NSSlider, NSSwitch, NSTabView, NSTabViewItem,
-    NSTabViewType, NSTextField, NSTitlePosition, NSView, NSWindow, NSWindowController,
-    NSWindowStyleMask,
+    NSAlert, NSApplication, NSBackingStoreType, NSBox, NSBoxType, NSColor, NSColorSpace,
+    NSColorWell, NSColorWellStyle, NSControlStateValueOff, NSControlStateValueOn, NSEventType,
+    NSGridView, NSMenu, NSMenuItem, NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl,
+    NSSlider, NSSwitch, NSTabView, NSTabViewItem, NSTabViewType, NSTextField, NSTitlePosition,
+    NSView, NSWindow, NSWindowController, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{
@@ -54,12 +48,11 @@ use std::cell::OnceCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use crate::consts::{CLOSED_HEIGHT, NOTCH_WIDTH, PANEL_HEIGHT, PANEL_WIDTH};
+use crate::consts::{CLOSED_HEIGHT, NOTCH_WIDTH, PANEL_HEIGHT};
 use crate::notch_view::NotchView;
 use crate::settings::{
-    CHORD_PRESETS, Color, FONT_FAMILIES, PALETTE_PRESETS, SCROLLBACK_PRESETS, Settings,
-    chord_index, chord_name, cursor_shape_index, cursor_shape_of, family_index, parse_hex,
-    scrollback_index, scrollback_of,
+    CHORD_PRESETS, Color, EditPhase, PALETTE_PRESETS, SCROLLBACK_PRESETS, Settings, chord_index,
+    chord_name, cursor_shape_index, cursor_shape_of, parse_hex, scrollback_index, scrollback_of,
 };
 use crate::window::{notch_screen, panel_origin};
 
@@ -120,7 +113,7 @@ const ANSI_COLORS: usize = PALETTE_PRESETS.len();
 
 /// The three cursor shapes a segmented control can select, in the same order
 /// `settings.rs::cursor_shape_of` decodes.
-const CURSOR_SHAPES: [&'static str; 3] = ["Block", "Bar", "Underline"];
+const CURSOR_SHAPES: [&str; 3] = ["Block", "Bar", "Underline"];
 
 /// The five sections of the settings pane, each one `NSTabViewItem` of the
 /// `NSTabView` with its own `NSGridView`. Every knob is placed by exactly one
@@ -270,7 +263,11 @@ pub fn apply_knob_value(settings: Settings, knob: usize, value: KnobValue) -> Se
     match knob {
         KNOB_OPEN_HEIGHT => s.open_height = value.number.clamp(HEIGHT_MIN, HEIGHT_MAX),
         KNOB_OPEN_WIDTH => s.open_width = value.number.clamp(WIDTH_MIN, width_max()),
-        KNOB_FONT_FAMILY => s.font_family = FONT_FAMILIES[value.index.min(FONT_FAMILIES.len() - 1)],
+        KNOB_FONT_FAMILY => {
+            if let Some(family) = family_names().get(value.index) {
+                s.font_family = family.clone();
+            }
+        }
         KNOB_FONT_SIZE => s.font_size = value.number.clamp(FONT_MIN, FONT_MAX),
         KNOB_LIGATURES => s.ligatures = value.index != 0,
         KNOB_BACKGROUND => s.background = value.color,
@@ -307,7 +304,8 @@ pub struct SettingsCellIvars {
     /// the same discipline as the stored `NotchView` pointer below and the
     /// Carbon handler's `userData`.
     control: OnceCell<*const AnyObject>,
-    /// The notch view whose `Cell<Settings>` this cell mutates. Raw for the
+    /// The notch view whose settings state this cell mutates (its proposal /
+    /// accept seam lives in `NotchView::apply_settings`). Raw for the
     /// same reason and with the same safety argument as the Carbon handler's
     /// `userData`: `AppDelegate.view` retains the view for the whole process
     /// lifetime, and every handler that reads this is AppKit control dispatch
@@ -344,14 +342,21 @@ define_class!(
                 return
             }
             let value = knob_value_from_sender(ivars.knob, control);
-            NotchView::apply_settings(view, apply_knob_value(view.current_settings(), ivars.knob, value));
+            let before = view.current_settings();
+            let phase = if matches!(ivars.knob, KNOB_OPEN_HEIGHT | KNOB_OPEN_WIDTH | KNOB_FONT_SIZE | KNOB_NOTIFY_SECS)
+                && NSApplication::sharedApplication(self.mtm()).currentEvent().is_some_and(|event| event.r#type() != NSEventType::LeftMouseUp) { EditPhase::Preview } else { EditPhase::Commit };
+            if let Err(error) = view.apply_settings(apply_knob_value((*before).clone(), ivars.knob, value), phase) {
+                view.record_status(error.to_string());
+                readback_control(ivars.knob, control, &view.current_settings());
+                show_error(self.mtm(), &error.to_string());
+            }
         }
     }
 );
 
 impl SettingsCell {
-    /// A cell for one knob, bound to the notch view whose `Cell<Settings>` it
-    /// mutates.
+    /// A cell for one knob, bound to the notch view whose settings state it
+    /// proposes changes to.
     pub fn new(mtm: MainThreadMarker, knob: usize, view: &NotchView) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(SettingsCellIvars {
             knob,
@@ -472,7 +477,8 @@ impl SettingsOwner {
     pub fn window_frame(&self) -> Option<NSRect> {
         match self.ivars().window.get() {
             None => None,
-            Some(window) => Some(window.frame()),
+            Some(window) if window.isVisible() && !window.isMiniaturized() => Some(window.frame()),
+            Some(_) => None,
         }
     }
 
@@ -540,7 +546,7 @@ impl SettingsOwner {
         let grids: Vec<Retained<NSGridView>> = SECTIONS
             .map(|section| {
                 let grid =
-                    self.grid_for_section(mtm, view, view.current_settings(), section, &mut cells);
+                    self.grid_for_section(mtm, view, &view.current_settings(), section, &mut cells);
                 let item: Retained<NSTabViewItem> = NSTabViewItem::new();
                 item.setLabel(&*NSString::from_str(section.title()));
                 item.setView(Some(grid.as_super()));
@@ -631,7 +637,7 @@ impl SettingsOwner {
         &self,
         mtm: MainThreadMarker,
         view: &NotchView,
-        settings: Settings,
+        settings: &Settings,
         section: Section,
         cells: &mut Vec<Retained<SettingsCell>>,
     ) -> Retained<NSGridView> {
@@ -718,7 +724,7 @@ impl SettingsOwner {
                             cells,
                             KNOB_FONT_FAMILY,
                             family_titles(),
-                            family_index(settings.font_family),
+                            font_index(&settings.font_family),
                         ),
                     ],
                 );
@@ -947,9 +953,8 @@ fn switch(
 /// user clicks an item in the pulled-down menu. The button itself also gets
 /// the pair (the factory's `target:`/`action:`), so a click on the button
 /// body fires too; both routes are idempotent because the handler re-reads the
-/// control's current selection rather than an argument. `setPullsDown(true)`
-/// so the menu opens beside the button (a closed "choose" popup would otherwise
-/// snap back and show nothing).
+/// control's current selection rather than an argument. Use a popup, not a
+/// pull-down menu, so its accepted selection stays visible.
 fn popup(
     mtm: MainThreadMarker,
     view: &NotchView,
@@ -983,7 +988,7 @@ fn popup(
             Some(sel!(applyKnob)),
         )
     };
-    control.setPullsDown(true);
+    control.setPullsDown(false);
     control.selectItemAtIndex(selected as NSInteger);
     keep(
         &cell,
@@ -1029,9 +1034,8 @@ fn segmented(
 }
 
 /// A real color well for a color knob. `NSColorWell::colorWellWithStyle:` in
-/// the `Minimal` style: a click shows a popover picker (the `Expanded`/`Default`
-/// styles drag an `NSColorPanel`, which needs app activation this app does
-/// not have). The cell reads the well back with `NSColorWell::color`.
+/// the `Minimal` style: a click shows a native picker. The cell reads the
+/// well back with `NSColorWell::color` through its target/action.
 fn well(
     mtm: MainThreadMarker,
     view: &NotchView,
@@ -1044,6 +1048,12 @@ fn well(
         NSColorWell::colorWellWithStyle(NSColorWellStyle::Minimal, mtm);
     control.setColor(&*srgb_color(color));
     control.setSupportsAlpha(false);
+    unsafe {
+        control.setTarget(Some(
+            ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*cell).as_ref(),
+        ));
+        control.setAction(Some(sel!(applyKnob)));
+    }
     keep(
         &cell,
         ProtocolObject::<dyn NSObjectProtocol>::from_ref(&*control).as_ref(),
@@ -1080,7 +1090,7 @@ fn swatch(mtm: MainThreadMarker, color: Color) -> Retained<NSView> {
 /// points at, so the color popup starts on the color that slot already has
 /// (otherwise it would claim slot 0 is palette 0 and the first click would
 /// silently change a slot the user never chose). Falls back to palette 0.
-fn ansi_color_index(settings: Settings) -> usize {
+fn ansi_color_index(settings: &Settings) -> usize {
     let slot = ANSI_SLOT.load(Ordering::SeqCst).min(ANSI_SLOTS - 1);
     let current = settings.ansi[slot];
     let hex = current.hex();
@@ -1102,7 +1112,7 @@ fn ansi_color_index(settings: Settings) -> usize {
 /// sizes itself to `16*SWATCH + 15*SWATCH_GAP` and lays the swatches out with
 /// explicit frames, so `NSGridView` keeps its two columns (label + control),
 /// the sliders stay long, and every swatch stays a `SWATCH`-sized square.
-fn swatch_row(mtm: MainThreadMarker, settings: Settings) -> Vec<Retained<NSView>> {
+fn swatch_row(mtm: MainThreadMarker, settings: &Settings) -> Vec<Retained<NSView>> {
     let container: Retained<NSView> = NSView::new(mtm);
     let step = SWATCH + SWATCH_GAP;
     for i in 0..ANSI_SLOTS {
@@ -1128,8 +1138,25 @@ fn keep(cell: &Retained<SettingsCell>, control: &AnyObject) {
 }
 
 // ── Menu titles ───────────────────────────────────────────────────────────
+fn family_names() -> Vec<String> {
+    thread_local! {
+        static FAMILIES: Vec<String> = crate::font::installed_monospace_families();
+    }
+    FAMILIES.with(Clone::clone)
+}
+
+fn font_index(family: &str) -> usize {
+    family_names()
+        .iter()
+        .position(|name| name == family)
+        .unwrap_or(0)
+}
+
 fn family_titles() -> Vec<Retained<NSString>> {
-    FONT_FAMILIES.map(|name| NSString::from_str(name)).to_vec()
+    family_names()
+        .iter()
+        .map(|name| NSString::from_str(name))
+        .collect()
 }
 
 fn scrollback_titles() -> Vec<Retained<NSString>> {
@@ -1157,18 +1184,21 @@ fn ansi_slot_titles() -> Vec<Retained<NSString>> {
 }
 
 /// The About section: app name, version, the live chord names, the plist
-/// path, and why chords are preset-only. Static labels — the window cannot
-/// take typed input under `Accessory` policy, and Carbon cannot record an
-/// arbitrary chord.
-fn about_rows(settings: Settings) -> Vec<String> {
+/// path, and why chords are preset-only. Static labels in this compatibility
+/// UI. Being `Accessory` does NOT prevent typed input in a normal window, and
+/// recording a LOCAL chord needs no Input Monitoring grant (the panel's local
+/// key monitor works while it is key); what is limited is that a chord only
+/// reaches the app once Carbon has registered it.
+fn about_rows(settings: &Settings) -> Vec<String> {
     vec![
         "NotchQuake — notch terminal, v0.1-alpha".to_string(),
         format!("Toggle chord: {0}", chord_name(settings.toggle_chord)),
         format!("New tab chord: {0}", chord_name(settings.new_tab_chord)),
         "Saved in ~/Library/Preferences/local.notchquake.plist".to_string(),
-        "Chords are limited to the registered presets above: the Carbon Event".to_string(),
-        "Manager can only deliver chords it registered at launch, and recording".to_string(),
-        "an arbitrary chord needs an Input Monitoring grant this app does not have.".to_string(),
+        "Chords are limited to the presets above: Carbon only delivers chords".to_string(),
+        "this app has registered, and a new chord is applied on commit.".to_string(),
+        "A global chord can collide with a macOS shortcut; rejected chords are".to_string(),
+        "reported and never saved.".to_string(),
     ]
 }
 
@@ -1202,5 +1232,47 @@ pub fn window_frame(slot: &OnceCell<Retained<SettingsOwner>>) -> Option<NSRect> 
     match slot.get() {
         None => None,
         Some(owner) => owner.window_frame(),
+    }
+}
+
+pub fn show_error(mtm: MainThreadMarker, message: &str) {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("NotchQuake settings status"));
+    alert.setInformativeText(&NSString::from_str(message));
+    alert.runModal();
+}
+
+fn readback_control(knob: usize, control: *const AnyObject, s: &Settings) {
+    // Each knob's class matches knob_value_from_sender. Restore accepted state after rejection.
+    match knob {
+        KNOB_OPEN_HEIGHT | KNOB_OPEN_WIDTH | KNOB_FONT_SIZE | KNOB_NOTIFY_SECS => {
+            let value = match knob {
+                KNOB_OPEN_HEIGHT => s.open_height,
+                KNOB_OPEN_WIDTH => s.open_width,
+                KNOB_FONT_SIZE => s.font_size,
+                _ => s.finished_notify_secs,
+            };
+            unsafe { &*(control as *const NSSlider) }.setDoubleValue(value);
+        }
+        KNOB_FONT_FAMILY | KNOB_SCROLLBACK | KNOB_TOGGLE_CHORD | KNOB_NEW_TAB_CHORD
+        | KNOB_ANSI_COLOR => {
+            let index = match knob {
+                KNOB_FONT_FAMILY => font_index(&s.font_family),
+                KNOB_SCROLLBACK => scrollback_index(s.scrollback_lines),
+                KNOB_TOGGLE_CHORD => chord_index(s.toggle_chord),
+                KNOB_NEW_TAB_CHORD => chord_index(s.new_tab_chord),
+                _ => ansi_color_index(s),
+            };
+            unsafe { &*(control as *const NSPopUpButton) }.selectItemAtIndex(index as NSInteger);
+        }
+        KNOB_BACKGROUND | KNOB_FOREGROUND | KNOB_CURSOR_COLOR => {
+            let color = match knob {
+                KNOB_BACKGROUND => s.background,
+                KNOB_FOREGROUND => s.foreground,
+                _ => s.cursor_color,
+            };
+            unsafe { &*(control as *const NSColorWell) }.setColor(&srgb_color(color));
+        }
+        _ => {}
     }
 }

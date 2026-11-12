@@ -1,300 +1,325 @@
-//! Global hotkey via the Carbon Event Manager (`RegisterEventHotKey`).
-//!
-//! A non-activating `NSPanel` can never take key focus, so the Option+Space
-//! hotkey must be observed system-wide. `NSEvent::addGlobalMonitorForEvents`
-//! needs an Accessibility / Input Monitoring grant to see *key* events — our
-//! adhoc-signed dev bundle gets neither, so the monitor silently receives
-//! zero callbacks. The Carbon hotkey API registers a chord system-wide and
-//! delivers a dedicated hotkey event to *this* app on the main run loop
-//! without any TCC grant and without the app being frontmost. It sees only
-//! the registered chord, never other keystrokes.
+//! Transactional, main-thread Carbon toggle registration. New tab is terminal-local.
+use std::cell::{Cell, RefCell};
+use std::fmt;
 
-use objc2::ClassType;
-use objc2::msg_send;
-use objc2::sel;
 use objc2_foundation::MainThreadMarker;
 
 use crate::notch_view::NotchView;
-use crate::settings::{Chord, Settings};
+use crate::settings::{Chord, DEFAULT_TOGGLE, chord_mask, validate_toggle_chord};
 
-/// `OSType` four-character code: `b"keyb"` -> `0x6B657962`.
-const K_EVENT_CLASS_KEYBOARD: u32 = 0x6B657962;
-/// `kEventHotKeyPressed`.
-const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
-/// `kEventParamDirectObject`: `b"----"` -> `0x2D2D2D2D`.
-const K_EVENT_PARAM_DIRECT_OBJECT: u32 = 0x2D2D2D2D;
-/// `typeEventHotKeyID`: `b"hkid"` -> `0x686B6964`.
-const TYPE_EVENT_HOT_KEY_ID: u32 = 0x686B6964;
+const SIGNATURE: u32 = u32::from_be_bytes(*b"NQhk");
 
-/// Carbon key-modifier bit constants (`<Carbon Events.h>`).
-const ACTIVE_FLAG_BIT: u32 = 0;
-const CMD_KEY_BIT: u32 = 8;
-const SHIFT_KEY_BIT: u32 = 9;
-const ALPHA_LOCK_BIT: u32 = 10;
-const OPTION_KEY_BIT: u32 = 11;
-const CONTROL_KEY_BIT: u32 = 12;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistrationError(pub String);
 
-fn modifier_mask(option: bool, cmd: bool, shift: bool, control: bool) -> u32 {
-    let mut m = 0u32;
-    if cmd {
-        m |= 1 << CMD_KEY_BIT;
+impl fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
-    if option {
-        m |= 1 << OPTION_KEY_BIT;
-    }
-    if shift {
-        m |= 1 << SHIFT_KEY_BIT;
-    }
-    if control {
-        m |= 1 << CONTROL_KEY_BIT;
-    }
-    // Carbon expects the active-flag bit set alongside any modifier (it is the
-    // "modifiers pressed" flag). Without it some chord registrations no-op.
-    if m != 0 {
-        m |= 1 << ACTIVE_FLAG_BIT;
-    }
-    m
 }
 
+pub trait Backend {
+    fn register(&mut self, chord: Chord, generation: u32) -> Result<usize, i32>;
+    fn unregister(&mut self, handle: usize) -> Result<(), i32>;
+}
+
+pub struct Registration<B> {
+    backend: B,
+    active: Option<(Chord, u32, usize)>,
+    next_generation: u32,
+    // Failed cleanup handles remain owned and never dispatch as active.
+    retained: Vec<usize>,
+}
+
+impl<B: Backend> Registration<B> {
+    pub fn new(backend: B) -> Self {
+        Self {
+            backend,
+            active: None,
+            next_generation: 1,
+            retained: vec![],
+        }
+    }
+
+    pub fn active_generation(&self) -> Option<u32> {
+        self.active.map(|(_, generation, _)| generation)
+    }
+
+    pub fn change(&mut self, chord: Chord) -> Result<(), RegistrationError> {
+        validate_toggle_chord(chord).map_err(|e| RegistrationError(e.to_string()))?;
+        if self.active.is_some_and(|(old, _, _)| old == chord) {
+            return Ok(());
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
+            RegistrationError("Registration generation exhausted; restart the app".into())
+        })?;
+        let candidate = self.backend.register(chord, generation).map_err(|status| {
+            RegistrationError(format!(
+                "Carbon register failed ({status}); previous shortcut retained"
+            ))
+        })?;
+        if let Some((_, _, old)) = self.active
+            && let Err(status) = self.backend.unregister(old)
+        {
+            let cleanup = self.backend.unregister(candidate);
+            let detail = match cleanup {
+                Ok(()) => "candidate removed".into(),
+                Err(code) => {
+                    self.retained.push(candidate);
+                    format!("candidate cleanup failed ({code}); handle retained, events ignored")
+                }
+            };
+            return Err(RegistrationError(format!(
+                "Carbon release of previous shortcut failed ({status}); {detail}; previous shortcut retained"
+            )));
+        }
+        self.active = Some((chord, generation, candidate));
+        Ok(())
+    }
+}
+
+struct Carbon;
+type Raw = *mut std::ffi::c_void;
+
 #[repr(C)]
-#[derive(Copy, Clone)]
 struct EventTypeSpec {
-    event_class: u32,
-    event_kind: u32,
+    class: u32,
+    kind: u32,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone)]
-struct EventHotKeyID {
+#[derive(Clone, Copy)]
+struct EventId {
     signature: u32,
-    id: u32,
+    generation: u32,
 }
-
-type EventTargetRef = *mut std::ffi::c_void;
-type EventHandlerRef = *mut std::ffi::c_void;
-type EventHandlerUPP = unsafe extern "C" fn(
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-) -> u32;
-type EventHotKeyRef = *mut std::ffi::c_void;
-
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-
-/// The two registered hotkey refs, stored as integers so they can live in a
-/// `static` next to the Carbon calls that consume them. `RegisterEventHotKey`
-/// hands back an `EventHotKeyRef` that must stay alive for the chord to keep
-/// working, and is the ONLY handle `UnregisterEventHotKey` accepts; the pre-
-/// settings code threw both away, which is why a chord could never be changed.
-///
-/// Slot 0 = `HOTKEY_ID_TOGGLE`, slot 1 = `HOTKEY_ID_NEW_TAB`; 0 means "never
-/// registered" (Carbon refs are heap pointers, never null-ish in practice).
-///
-/// A `static` rather than a view ivar because `notch_view.rs` already depends
-/// on this module (`hot_key_handler` calls back into `NotchView`), so the ivar
-/// struct cannot name these cells without a cycle. A Carbon ref is `!Send`/`!Sync`
-/// in spirit, but every access here is main-thread-only by construction: launch
-/// registers from `main`/`applicationDidFinishLaunching:`, and the settings
-/// panel re-registers from a click handler that runs on the main run loop.
-/// `AtomicUsize` is the cheapest way to keep the process-wide state legal in
-/// Rust without wrapping a raw pointer in a new type.
-static HOT_REFS: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
-    fn GetApplicationEventTarget() -> EventTargetRef;
+    fn GetApplicationEventTarget() -> Raw;
     fn InstallEventHandler(
-        target: EventTargetRef,
-        handler: EventHandlerUPP,
-        num_types: u32,
-        type_list: *const EventTypeSpec,
-        user_data: *mut std::ffi::c_void,
-        out_ref: *mut EventHandlerRef,
+        target: Raw,
+        handler: unsafe extern "C" fn(Raw, Raw, Raw) -> i32,
+        count: u32,
+        types: *const EventTypeSpec,
+        user: Raw,
+        out: *mut Raw,
     ) -> i32;
     fn RegisterEventHotKey(
-        key_code: u32,
+        key: u32,
         modifiers: u32,
-        id: EventHotKeyID,
-        target: EventTargetRef,
+        id: EventId,
+        target: Raw,
         options: u32,
-        out_ref: *mut EventHotKeyRef,
+        out: *mut Raw,
     ) -> i32;
-    fn UnregisterEventHotKey(hot_ref: EventHotKeyRef) -> i32;
+    fn UnregisterEventHotKey(handle: Raw) -> i32;
     fn GetEventParameter(
-        event: *mut std::ffi::c_void,
+        event: Raw,
         name: u32,
-        type_: u32,
+        kind: u32,
         out_type: *mut u32,
-        buffer_size: usize,
-        actual_size: *mut usize,
-        out_value: *mut std::ffi::c_void,
+        size: usize,
+        actual: *mut usize,
+        value: Raw,
     ) -> i32;
 }
 
-/// Carbon hotkey ids we register, dispatched by `hot_key_handler`.
-const HOTKEY_ID_TOGGLE: u32 = 1;
-/// iTerm's "new tab" chord (Cmd+T).
-const HOTKEY_ID_NEW_TAB: u32 = 2;
-/// The four-character signature Carbon matches our hotkey ids against.
-const HOTKEY_SIGNATURE: u32 = u32::from_be_bytes(*b"BNTh");
+impl Backend for Carbon {
+    fn register(&mut self, chord: Chord, generation: u32) -> Result<usize, i32> {
+        let mut handle = std::ptr::null_mut();
+        let status = unsafe {
+            RegisterEventHotKey(
+                chord.key_code as u32,
+                chord_mask(chord),
+                EventId {
+                    signature: SIGNATURE,
+                    generation,
+                },
+                GetApplicationEventTarget(),
+                0,
+                &mut handle,
+            )
+        };
+        if status == 0 && !handle.is_null() {
+            Ok(handle as usize)
+        } else {
+            Err(if status == 0 { -1 } else { status })
+        }
+    }
 
-/// The Carbon event handler. `userData` is the raw `NotchView *` we passed to
-/// `InstallEventHandler`. Carbon dispatches this on the main run loop, so
-/// the main-thread marker is available. Dispatches on the hotkey `id` so one
-/// handler serves every registered chord.
-unsafe extern "C" fn hot_key_handler(
-    _caller: *mut std::ffi::c_void,
-    event: *mut std::ffi::c_void,
-    user_data: *mut std::ffi::c_void,
-) -> u32 {
-    // Confirm this is the hot-key event we registered, then dispatch on its id.
-    let mut hot_id = EventHotKeyID {
+    fn unregister(&mut self, handle: usize) -> Result<(), i32> {
+        let status = unsafe { UnregisterEventHotKey(handle as Raw) };
+        if status == 0 { Ok(()) } else { Err(status) }
+    }
+}
+
+thread_local! {
+    static REGISTRATION: RefCell<Registration<Carbon>> = RefCell::new(Registration::new(Carbon));
+    static ACTIVE: Cell<Option<u32>> = const { Cell::new(None) };
+    static HANDLER: Cell<usize> = const { Cell::new(0) };
+}
+
+pub fn accepts_event(signature: u32, generation: u32, active: Option<u32>) -> bool {
+    signature == SIGNATURE && active == Some(generation)
+}
+
+unsafe extern "C" fn handler(_caller: Raw, event: Raw, user: Raw) -> i32 {
+    let mut id = EventId {
         signature: 0,
-        id: 0,
+        generation: 0,
     };
     let status = unsafe {
         GetEventParameter(
             event,
-            K_EVENT_PARAM_DIRECT_OBJECT,
-            TYPE_EVENT_HOT_KEY_ID,
+            u32::from_be_bytes(*b"----"),
+            u32::from_be_bytes(*b"hkid"),
             std::ptr::null_mut(),
-            std::mem::size_of::<EventHotKeyID>(),
+            std::mem::size_of::<EventId>(),
             std::ptr::null_mut(),
-            &mut hot_id as *mut EventHotKeyID as *mut std::ffi::c_void,
+            &mut id as *mut EventId as Raw,
         )
     };
     if status != 0 {
-        return status as u32;
+        return status;
     }
-    if let Some(mtm) = MainThreadMarker::new() {
-        // SAFETY: `user_data` is the raw pointer to a `NotchView` retained for
-        // the whole process lifetime by the delegate (kept in `OnceCell`). It
-        // is a valid, live `NotchView` on the main thread.
-        let view: &NotchView = unsafe { &*(user_data as *const NotchView) };
-        let _ = mtm;
-        match hot_id.id {
-            HOTKEY_ID_TOGGLE => view.toggle(),
-            HOTKEY_ID_NEW_TAB => view.spawn_tab(),
-            _ => {}
-        }
+    if MainThreadMarker::new().is_some()
+        && ACTIVE.with(|a| accepts_event(id.signature, id.generation, a.get()))
+    {
+        // Delegate retains the view and installed handler for the application's lifetime.
+        unsafe { &*(user as *const NotchView) }.toggle();
     }
     0
 }
 
-/// Register one of our two chords from `chord` and remember Carbon's ref so
-/// `reregister_hotkeys` can unregister it later. A failure is logged but not
-/// fatal: the other chord and every click path still work.
-fn register_chord(target: EventTargetRef, id: u32, chord: Chord) {
-    let slot = if id == HOTKEY_ID_NEW_TAB { 1 } else { 0 };
-    let hotkey_id = EventHotKeyID {
-        signature: HOTKEY_SIGNATURE,
-        id,
-    };
-    let modifiers = modifier_mask(chord.option, chord.cmd, chord.shift, chord.ctrl);
-    let mut hot_ref: EventHotKeyRef = std::ptr::null_mut();
-    let status = unsafe {
-        RegisterEventHotKey(
-            chord.key_code as u32,
-            modifiers,
-            hotkey_id,
-            target,
-            0,
-            &mut hot_ref,
-        )
-    };
-    if status != 0 {
-        eprintln!("notch-terminal: RegisterEventHotKey (id {id}) failed: {status}");
-        return;
-    }
-    if slot == 0 {
-        HOT_REFS.0.swap(hot_ref as usize, Ordering::SeqCst);
-    } else {
-        HOT_REFS.1.swap(hot_ref as usize, Ordering::SeqCst);
-    }
+pub fn change_toggle(_mtm: MainThreadMarker, chord: Chord) -> Result<(), RegistrationError> {
+    let result = REGISTRATION.with(|r| r.borrow_mut().change(chord));
+    // No mutable registry borrow is held when dispatch becomes eligible.
+    let active = REGISTRATION.with(|r| r.borrow().active_generation());
+    ACTIVE.with(|a| a.set(active));
+    result
 }
 
-/// Unregister both stored chords. Carbon keeps its own queue entry alive only
-/// through the ref we were handed, so dropping the ref (as the pre-settings
-/// code did) would leak a live registration that the settings panel could not
-/// replace — the old Option+Space would keep toggling after the user picked a
-/// new chord.
-fn unregister_hotkeys() {
-    unregister_one(&HOT_REFS.0);
-    unregister_one(&HOT_REFS.1);
+/// Returns warnings; fallback never overwrites the stored preference.
+pub fn register_hotkeys(mtm: MainThreadMarker, view: &NotchView, chord: Chord) -> Vec<String> {
+    let mut out = vec![];
+    if HANDLER.with(|h| h.get() == 0) {
+        let target = unsafe { GetApplicationEventTarget() };
+        let mut handle = std::ptr::null_mut();
+        let status = if target.is_null() {
+            -1
+        } else {
+            unsafe {
+                InstallEventHandler(
+                    target,
+                    handler,
+                    1,
+                    &EventTypeSpec {
+                        class: u32::from_be_bytes(*b"keyb"),
+                        kind: 5,
+                    },
+                    view as *const NotchView as Raw,
+                    &mut handle,
+                )
+            }
+        };
+        if status != 0 {
+            return vec![format!(
+                "Carbon handler installation failed ({status}); click the notch to open"
+            )];
+        }
+        HANDLER.with(|h| h.set(handle as usize));
+    }
+    if let Err(e) = change_toggle(mtm, chord) {
+        out.push(e.to_string());
+        if chord != DEFAULT_TOGGLE {
+            match change_toggle(mtm, DEFAULT_TOGGLE) {
+                Ok(()) => out
+                    .push("Using Option+Space temporarily; saved shortcut was not changed".into()),
+                Err(e) => out.push(format!(
+                    "Default fallback also failed: {e}; click the notch to open"
+                )),
+            }
+        }
+    }
+    out
 }
 
-/// Unregister one stored chord ref (a 0 slot means "never registered").
-fn unregister_one(stored: &AtomicUsize) {
-    let raw = stored.swap(0, Ordering::SeqCst);
-    if raw == 0 {
-        return;
-    }
-    let status = unsafe { UnregisterEventHotKey(raw as *mut std::ffi::c_void) };
-    if status != 0 {
-        eprintln!("notch-terminal: UnregisterEventHotKey failed: {status}");
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
 
-/// Register the global hotkeys. The returned value is only false on failure
-/// (matching the old monitor's `is_none()` check).
-///
-/// `view` is retained by the caller for the process lifetime; we hand Carbon
-/// its raw pointer as the handler's `userData`. The chords come from `settings`
-/// (whose defaults are exactly the old hardcoded Option+Space / Cmd+T), so a
-/// stored preference is what launch registers.
-pub fn register_hotkeys(mtm: MainThreadMarker, view: &NotchView, settings: Settings) -> bool {
-    let _ = mtm;
-    let target = unsafe { GetApplicationEventTarget() };
-    if target.is_null() {
-        eprintln!("notch-terminal: GetApplicationEventTarget() returned null");
-        return false;
+    #[derive(Default)]
+    struct Fake {
+        calls: Vec<String>,
+        failures: VecDeque<bool>,
+        next: usize,
     }
-    let spec = EventTypeSpec {
-        event_class: K_EVENT_CLASS_KEYBOARD,
-        event_kind: K_EVENT_HOT_KEY_PRESSED,
-    };
-    let mut handler_ref: EventHandlerRef = std::ptr::null_mut();
-    let status = unsafe {
-        InstallEventHandler(
-            target,
-            hot_key_handler,
-            1,
-            &spec,
-            view as *const NotchView as *mut std::ffi::c_void,
-            &mut handler_ref,
-        )
-    };
-    if status != 0 {
-        eprintln!("notch-terminal: InstallEventHandler failed: {status}");
-        return false;
-    }
-    register_chord(target, HOTKEY_ID_TOGGLE, settings.toggle_chord);
-    register_chord(target, HOTKEY_ID_NEW_TAB, settings.new_tab_chord);
-    true
-}
 
-/// Re-register both chords from a changed settings bundle, called by the
-/// settings panel through `NotchView::reregister_hotkeys` when a hotkey row
-/// steps to a different preset. The ids stay the same, so `hot_key_handler`
-///'s dispatch is untouched; only the Carbon registrations move.
-///
-/// `InstallEventHandler` is NOT re-installed: its ref was taken at launch and
-/// stays alive for the process (the delegate retains the view, which is the
-/// handler's `userData`), so re-registering the chords against the same target
-/// is enough.
-pub fn reregister_hotkeys(mtm: MainThreadMarker, view: &NotchView, settings: Settings) -> bool {
-    let _ = mtm;
-    unregister_hotkeys();
-    let target = unsafe { GetApplicationEventTarget() };
-    if target.is_null() {
-        eprintln!(
-            "notch-terminal: GetApplicationEventTarget() returned null during re-registration"
+    impl Backend for Fake {
+        fn register(&mut self, _: Chord, generation: u32) -> Result<usize, i32> {
+            self.calls.push(format!("register {generation}"));
+            if self.failures.pop_front().unwrap_or(false) {
+                return Err(-10);
+            }
+            self.next += 1;
+            Ok(self.next)
+        }
+
+        fn unregister(&mut self, handle: usize) -> Result<(), i32> {
+            self.calls.push(format!("unregister {handle}"));
+            if self.failures.pop_front().unwrap_or(false) {
+                Err(-20)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn alternative() -> Chord {
+        Chord {
+            key_code: 50,
+            ..DEFAULT_TOGGLE
+        }
+    }
+
+    #[test]
+    fn transactional_order_and_unchanged() {
+        let mut r = Registration::new(Fake::default());
+        r.change(DEFAULT_TOGGLE).unwrap();
+        r.change(DEFAULT_TOGGLE).unwrap();
+        assert_eq!(r.backend.calls.len(), 1);
+        r.change(alternative()).unwrap();
+        assert_eq!(
+            r.backend.calls,
+            ["register 1", "register 2", "unregister 1"]
         );
-        return false;
+        assert!(!accepts_event(SIGNATURE, 1, r.active_generation()));
+        assert!(accepts_event(SIGNATURE, 2, r.active_generation()));
+        assert!(!accepts_event(0, 2, r.active_generation()));
     }
-    register_chord(target, HOTKEY_ID_TOGGLE, settings.toggle_chord);
-    register_chord(target, HOTKEY_ID_NEW_TAB, settings.new_tab_chord);
-    let _ = view;
-    true
+
+    #[test]
+    fn registration_and_rollback_failures_retain_old() {
+        let mut r = Registration::new(Fake::default());
+        r.change(DEFAULT_TOGGLE).unwrap();
+        r.backend.failures = [true].into();
+        assert!(r.change(alternative()).is_err());
+        assert_eq!(r.active_generation(), Some(1));
+        r.backend.failures = [false, true, false].into();
+        assert!(r.change(alternative()).is_err());
+        assert_eq!(r.active_generation(), Some(1));
+        assert!(r.retained.is_empty());
+        r.backend.failures = [false, true, true].into();
+        assert!(
+            r.change(alternative())
+                .unwrap_err()
+                .0
+                .contains("cleanup failed")
+        );
+        assert_eq!(r.active_generation(), Some(1));
+        assert_eq!(r.retained.len(), 1);
+    }
 }
