@@ -17,3 +17,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo build --locked
       - run: cargo test --locked
+      # Offline + deterministic; needs only Cargo.lock, the registry sources `cargo build`
+      # just fetched, and the committed licenses/ texts. cargo-deny is not on the runner, so
+      # the `deny` check stays a local/release step (scripts/gen-notices.sh deny).
+      - run: scripts/gen-notices.sh check

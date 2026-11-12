@@ -60,10 +60,16 @@ ordinary version updates do not change the preferences domain.
 
 MIT — see [LICENSE](./LICENSE), Copyright 2026 Barnstorm LLC.
 
-Attribution: NotchQuake embeds [`alacritty_terminal`](https://github.com/alacritty/alacritty_terminal)
-(Apache-2.0) for the terminal grid and PTY plumbing, and the
-[`objc2`](https://github.com/objc2-rs/objc2) family of bindings for the AppKit/Core
-surface it is written against.
+Third-party attribution lives in [NOTICE.md](./NOTICE.md) (short form) and
+[THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) (per-dependency, with the licence texts
+and their pinned provenance in [`licenses/`](./licenses/)). NotchQuake embeds
+[`alacritty_terminal`](https://github.com/alacritty/alacritty) (Apache-2.0) for the terminal
+grid and PTY plumbing, and the
+[`objc2`](https://github.com/madsmtm/objc2) family of bindings for the AppKit/Core surface it
+is written against. Regenerate and check them with `scripts/gen-notices.sh gen` /
+`scripts/gen-notices.sh check`; `deny.toml` plus `scripts/gen-notices.sh deny` (cargo-deny)
+fail on any licence outside the allow-list or any dependency source other than crates.io.
+Include `NOTICE.md`, `THIRD-PARTY-NOTICES.md`, `LICENSE`, and `licenses/` in a release archive.
 
 ## Signing & releases (Barnstorm LLC Developer ID)
 

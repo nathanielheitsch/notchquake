@@ -2,6 +2,9 @@
 name = "notchquake"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/nathanielheitsch/notchquake"
+description = "NotchQuake — a terminal living in the macOS notch"
 
 [dependencies]
 alacritty_terminal = "0.26.0"

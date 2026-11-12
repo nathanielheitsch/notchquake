@@ -65,9 +65,10 @@ Required follow-up:
    never print or commit certificates' private keys, passwords, or notary API keys.
 5. Require successful gates, signed annotated tags (no unsigned fallback), and
    verified notarization before publishing a GitHub release. Test a downloaded
-   artifact on a clean Mac; generate checksums, include dependency notices, and
-   add a `NOTICE` file containing the Apache-2.0 attribution/text for
-   `alacritty_terminal`; bundle that notice with the release archive.
+   artifact on a clean Mac; generate checksums, and bundle the dependency notices —
+   `NOTICE.md`, `THIRD-PARTY-NOTICES.md`, `LICENSE`, and `licenses/` — in the release
+   archive. The notice lane is DONE (see below); packaging them into the archive is the
+   remaining step, and `scripts/gen-notices.sh check` must pass on the release commit.
 
 The release workflow is temporarily manual/build-only to prevent accidental
 unsigned publication. Fix its signing path before restoring tag-triggered releases.
@@ -77,4 +78,31 @@ unsigned publication. Fix its signing path before restoring tag-triggered releas
 Earlier history checks found no tracked agent-run artifacts and no obvious secret
 patterns. That was a heuristic scan, not a comprehensive secret/license audit.
 Author names/emails and signed-commit identities are public Git metadata. Complete
-a dedicated history scanner and dependency-license/notice review before release.
+a dedicated history scanner before release.
+
+## Dependency licences and notices (done 2026-11-12)
+
+The dependency-license/notice review is complete; the history scanner above is not.
+
+- `NOTICE.md` — short attribution summary.
+- `THIRD-PARTY-NOTICES.md` — generated per-dependency audit: direct / transitive runtime /
+  compile-time-only (proc-macro closure) / out-of-scope-for-this-target, each crate's SPDX
+  expression, crates.io + repository links, the licence file each crate actually shipped, and
+  the copyright lines as written.
+- `licenses/` — the canonical texts plus pinned objc2 texts, with sha256 and the exact commit
+  each came from in `licenses/pins.json`, and an `otool -L` snapshot of the Apple frameworks.
+- `scripts/gen-notices.py` + `scripts/gen-notices.sh` (`gen` / `check` / `deny` / `linkage`) —
+  offline and deterministic (no timestamps, sorted output); a release never fetches anything.
+- `deny.toml` — cargo-deny allow-list (MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, Zlib,
+  Unlicense, Unicode-3.0), crates.io-only sources, RustSec advisories.
+
+Verified locally: `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`; the
+only remaining warning is the expected duplicate `windows-sys` pair gated to non-shipped
+Windows targets; regeneration is byte-identical; `scripts/gen-notices.sh linkage` matches the
+release build. `Cargo.toml` gained `license = "MIT"`, `repository`, `description` so
+`cargo deny` reports no `no-license-field` for the root crate (no dependency changes, so
+`Cargo.lock` is untouched).
+
+Open questions are recorded in `THIRD-PARTY-NOTICES.md` rather than answered there — chiefly
+the objc2 family's Apple-SDK-derivation note and the fact that its published crates ship no
+licence text (texts pinned from upstream instead). Not legal advice.

@@ -1,0 +1,52 @@
+# cargo-deny policy for NotchQuake (macOS arm64 app, Barnstorm LLC).
+#
+# Run: scripts/gen-notices.sh deny   (or: cargo deny check)
+#
+# `cargo deny check` reads this file from the repository root. It covers four
+# checks: license allow-list, duplicate/unwanted versions, the RustSec advisory
+# database, and where dependencies come from.
+
+[licenses]
+# Fail (not warn) on anything outside this list. These are the only SPDX
+# expressions `cargo metadata` reports for the aarch64-apple-darwin graph;
+# THIRD-PARTY-NOTICES.md maps each one to a committed text in licenses/.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "Zlib",
+  "Unlicense",
+  "Unicode-3.0",
+]
+# Reject licences cargo-deny cannot confidently identify from the shipped files.
+confidence-threshold = 0.8
+
+# NotchQuake has no dev-dependencies and no workspace members today, so the
+# allow-list above is the whole policy. If a dev/build dependency is ever added
+# with a copyleft licence, prefer an explicit `[[licenses.clarify]]` entry plus a
+# separate `[licenses] allow` review over silently widening the list.
+
+[bans]
+# `windows-sys` 0.59.0 and 0.61.2 both appear in Cargo.lock, gated to different
+# target cfgs; only one is ever compiled for aarch64-apple-darwin. Warn, do not
+# fail — the lock file is shared across targets on purpose.
+multiple-versions = "warn"
+# Every dependency here is a precise version requirement.
+wildcards = "allow"
+highlight = "all"
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# Unmaintained/yanked crates are worth seeing but are not a build blocker.
+unmaintained = "workspace"
+yanked = "warn"
+# Add an entry here (with a reason and a review date) only when an advisory is
+# genuinely not applicable; never to make a red build green without a note.
+ignore = []
+
+[sources]
+# crates.io only. No git, no local path dependencies, no non-standard registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
