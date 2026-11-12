@@ -239,13 +239,13 @@ UI to replace, not to extend:
   still exceeds clippy's argument-count limit (pre-existing).
 - Clipboard paste only reads `NSPasteboardTypeString`; there is no selection model
   in the panel, so `Cmd+C` is consumed as `CopyUnavailable`.
-- Strict Clippy is **not** green: 50 pre-existing lint errors remain (14
-  `collapsible_if`, 21 needless deref/auto-deref, 6 `single_match`, 1
-  `draw_grid` argument count, 1 `let_and_return`, 1 doc-comment spacing, 1
-  deprecated `msg_send!` comma form, and 5 `window.rs` unused-import/dead-code
-  items). This lane fixed the only lint its own new code introduced and removed
-  35 baseline lints as a side effect of the rewritten modules; no unrelated
-  cleanup was applied.
+- Strict Clippy is **not** green and is not part of the repository gate: 50
+  warnings remain (they become errors under `-D warnings`) — 14 `collapsible_if`,
+  21 needless deref/auto-deref, 6 `single_match`, 1 `draw_grid` argument count,
+  1 `let_and_return`, 1 doc-comment spacing, 1 `map_option`, 1 deprecated
+  `msg_send!` comma, and 4 `window.rs` unused-import/dead-code items. The lane
+  fixed the only lint its own new code introduced and removed 35 baseline lints as
+  a side effect of the rewritten modules; no unrelated cleanup was applied.
 - Tests are pure: parser/pref decode/font resolve/grid dims/selection/spring/
   input routing. No `Session::new`, no PTY, no default-preferences I/O.
 - No live UI verification was performed in this lane (no launch, no desktop

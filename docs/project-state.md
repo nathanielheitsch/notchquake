@@ -35,7 +35,9 @@ reports live panel/tab/hotkey checks.
 
 Real-user slider dragging, popup selection, widened-panel outside-click behavior,
 all settings tabs, and shell-exit teardown still need a complete manual pass.
-Use a throwaway `BNT_DEFAULTS_SUITE` when testing settings, never real preferences.
+Use the throwaway suite when testing settings:
+`BNT_DEFAULTS_SUITE=bnt-verify open -n NotchQuake.app`. An empty value refuses
+the default domain instead of falling back; that is intentional.
 The app bundle is ignored; `launch.sh` expects the bundle directory to exist and
 is intended for the shipped checkout rather than a clean source-only checkout.
 
@@ -63,7 +65,9 @@ Required follow-up:
    never print or commit certificates' private keys, passwords, or notary API keys.
 5. Require successful gates, signed annotated tags (no unsigned fallback), and
    verified notarization before publishing a GitHub release. Test a downloaded
-   artifact on a clean Mac; generate checksums and include dependency notices.
+   artifact on a clean Mac; generate checksums, include dependency notices, and
+   add a `NOTICE` file containing the Apache-2.0 attribution/text for
+   `alacritty_terminal`; bundle that notice with the release archive.
 
 The release workflow is temporarily manual/build-only to prevent accidental
 unsigned publication. Fix its signing path before restoring tag-triggered releases.
