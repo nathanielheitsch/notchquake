@@ -16,8 +16,8 @@ Event Manager, so they work without Accessibility or Input-Monitoring grants.
 ## Requirements
 
 - macOS only, **arm64**. There is no Intel, Linux, or Windows build.
-- A display with a notch (or a notch display) — the panel is positioned from the
-  notch geometry and sized to the notch display's logical width at startup.
+- A notch display is ideal. Without one, the panel parks at the top-centre of the
+  lowest screen using a 33pt fallback pill.
 
 ## Build
 
@@ -43,11 +43,12 @@ cargo test           # pure parser/geometry tests only — never spawn a PTY in 
 | Chord | Effect |
 | --- | --- |
 | Option+Space | Toggle the notch panel open / closed |
-| Cmd+T | Spawn a new PTY tab (inert while the panel is closed) |
+| Cmd+T | Spawn a new PTY tab — terminal-local, only while the panel is open and holds key focus |
 
-Chords are configurable, but only within the registered Carbon presets — the
-Carbon Event Manager can deliver chords it registered at launch, and recording
-an arbitrary chord needs an Input Monitoring grant this app does not have.
+Chords are configurable. The global toggle accepts any unreserved Option/Cmd/Control
+chord; the new-tab chord is terminal-local and only runs while the panel has key focus.
+macOS-reserved or conflicting chords are rejected. If a chord cannot be registered,
+the runtime falls back to the default without rewriting the stored preference.
 
 ## Settings persistence
 
@@ -61,7 +62,7 @@ MIT — see [LICENSE](./LICENSE), Copyright 2026 Barnstorm LLC.
 
 Attribution: NotchQuake embeds [`alacritty_terminal`](https://github.com/alacritty/alacritty_terminal)
 (Apache-2.0) for the terminal grid and PTY plumbing, and the
-[`objc2`](https://github.com/kacperix/objc2) family of bindings for the AppKit/Core
+[`objc2`](https://github.com/objc2-rs/objc2) family of bindings for the AppKit/Core
 surface it is written against.
 
 ## Signing & releases (Barnstorm LLC Developer ID)

@@ -10,11 +10,15 @@
 
 ## Implemented
 
-- Animated notch panel, Carbon global toggle and new-tab hotkeys.
-- Live PTY sessions, dynamic tabs, terminal key routing, scrollback.
-- Byte-transparent OSC observation and zsh shell integration for tab metadata.
-- Separate tabbed native settings window; persisted fonts, colors, geometry,
-  cursor, hotkeys, notifications, and scrollback preferences.
+- Animated notch panel and Carbon global toggle hotkey with transactional registration
+  and stale-event generation guards; new-tab routing is terminal-local.
+- Live PTY sessions, dynamic tabs, terminal key routing, scrollback, paste sanitization,
+  and byte-transparent OSC observation with zsh shell integration for tab metadata.
+- Separate tabbed native settings window; persisted fonts, colors, geometry, cursor,
+  hotkeys, notifications, and scrollback preferences.
+- Settings proposal/validation/effective-value pipeline with coalesced resize/save effects.
+- Strict CoreText monospace resolution, Reduce Motion support, main-menu integration,
+  and app-wide click gating for native windows.
 - Display-width canvas and live terminal/PTY resize when open dimensions change.
 - Internal `BNT.` preference keys and `BNT_DEFAULTS_SUITE` remain intentional.
   The bundle-ID rename reset preferences once; version bumps do not reset them.
@@ -25,14 +29,15 @@ Run `cargo fmt --all --check`, `cargo build --locked`, and `cargo test --locked`
 Tests must not spawn login-shell PTYs (see AGENTS.md). CI runs these checks on
 `main` pushes and pull requests using a macOS ARM64 runner.
 
-During branch consolidation, formatting, `cargo build --locked`, and
-`cargo test --locked` all passed locally (7 tests, 0 failures). Earlier work
-also reports live panel/tab/hotkey checks.
+On the pushed `main` HEAD, formatting, `cargo build --locked`, and
+`cargo test --locked` pass locally (**44 tests, 0 failures**). Earlier work also
+reports live panel/tab/hotkey checks.
+
 Real-user slider dragging, popup selection, widened-panel outside-click behavior,
 all settings tabs, and shell-exit teardown still need a complete manual pass.
 Use a throwaway `BNT_DEFAULTS_SUITE` when testing settings, never real preferences.
-A clean-checkout bundle bootstrap via `launch.sh` also needs work: the bundle is
-ignored and the script currently assumes it exists.
+The app bundle is ignored; `launch.sh` expects the bundle directory to exist and
+is intended for the shipped checkout rather than a clean source-only checkout.
 
 ## Signing and releases — blocked, not verified
 
