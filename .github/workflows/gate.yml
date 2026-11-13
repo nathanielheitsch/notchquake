@@ -1,23 +1,84 @@
 name: gate
 
+# CI gate for NotchQuake. `macos-14` is RETIRED on GitHub Actions (all macOS 14
+# images were removed 2026-11-02; actions/runner-images#15226), so the runner
+# label here is a currently supported arm64 one. `macos-26` is the arm64 label
+# behind `macos-latest`; the app targets macOS 13 deployment, so a newer SDK is
+# fine (deployment target, not SDK, is what users' machines enforce).
+#
+# arm64 is the only supported target — there is no Intel build, so the job must
+# run on an Apple-silicon runner (`macos-26`, not `macos-26-large`/`-intel`).
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  # Keep CI builds reproducible in the same sense as local ones: the same
+  # deployment target the bundle metadata states (packaging/Info.plist).
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
 jobs:
   gate:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - run: cargo fmt --all --check
-      - run: cargo build --locked
-      - run: cargo test --locked
-      # Offline + deterministic; needs only Cargo.lock, the registry sources `cargo build`
-      # just fetched, and the committed licenses/ texts. cargo-deny is not on the runner, so
-      # the `deny` check stays a local/release step (scripts/gen-notices.sh deny).
-      - run: scripts/gen-notices.sh check
+
+      - name: Rust toolchain
+        run: rustup show && rustc -V && cargo -V
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Build (arm64, locked)
+        run: cargo build --locked --target aarch64-apple-darwin
+
+      - name: Test (locked; pure tests only — never a PTY, see AGENTS.md)
+        run: cargo test --locked --target aarch64-apple-darwin
+
+      # Offline + deterministic: needs only Cargo.lock, the registry sources this
+      # job's build already fetched, and the committed licenses/ texts. cargo-deny
+      # is not preinstalled on the runner, so the `deny` lane stays a local/release
+      # step (scripts/gen-notices.sh deny); install it here if that changes.
+      - name: Third-party notices are current
+        run: scripts/gen-notices.sh check
+
+      # Bundle assembly is exercised on every push so a packaging regression is a
+      # gate failure, not a surprise at release time. No signing, no launch, no
+      # artifact from this step.
+      - name: Bundle metadata assembles
+        run: |
+          scripts/build-bundle.sh release
+          plutil -lint NotchQuake.app/Contents/Info.plist
+          plutil -p NotchQuake.app/Contents/Info.plist | grep -E 'CFBundleShortVersionString|LSMinimumSystemVersion|NSHumanReadableCopyright'
+          file NotchQuake.app/Contents/MacOS/notchquake | grep -q arm64
+          # The assembled bundle must verify strictly. A bundle with Resources and
+          # no _CodeSignature fails this with "code has no resources but signature
+          # indicates they must be present" — the previous bundle's signature sealed
+          # 0 files, so every check against it was vacuous.
+          codesign --verify --strict --verbose=1 NotchQuake.app
+
+      # Upload the CI build so a reviewer can inspect exactly what the gate
+      # produced. It carries only an AD-HOC signature (build-bundle.sh seals it
+      # so the bundle verifies strictly) and is NOT distributable — this is a
+      # build artifact, not a release (docs/release-runbook.md). package-artifact.sh
+      # emits SHA256SUMS and proves byte-identity by archiving the same tree twice.
+      - name: Deterministic artifact
+        run: NQ_APP=NotchQuake.app scripts/package-artifact.sh dist
+
+      - name: Upload build artifact (ad-hoc signed, not distributable)
+        uses: actions/upload-artifact@v4
+        with:
+          name: notchquake-arm64-ci
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

@@ -15,20 +15,31 @@ Event Manager, so they work without Accessibility or Input-Monitoring grants.
 
 ## Requirements
 
-- macOS only, **arm64**. There is no Intel, Linux, or Windows build.
+- macOS only, **arm64**, **macOS 13 or later**. There is no Intel, Linux, or Windows
+  build. The deployment target is 13.0 (the notch geometry needs
+  `NSScreen.safeAreaInsets` / `auxiliaryTop*Area`); `scripts/build-bundle.sh` fails
+  if the compiled binary and `LSMinimumSystemVersion` disagree.
 - A notch display is ideal. Without one, the panel parks at the top-centre of the
   lowest screen using a 33pt fallback pill.
 
 ## Build
 
 ```bash
-cargo build              # the gate — there is no LSP in this repo
-./scripts/launch.sh      # build + kill stale instances + relaunch NotchQuake.app
+cargo build                            # the gate — there is no LSP in this repo
+./scripts/launch.sh                    # build + assemble bundle + kill stale + relaunch
+scripts/build-bundle.sh release        # bundle only, into ./NotchQuake.app
+NQ_APP=/tmp/nq/NotchQuake.app scripts/build-bundle.sh release   # bundle elsewhere
 ```
 
-`launch.sh` **kills every running instance before relaunching** (including
-renamed debug copies): a stale binary reuses the running process via `open`, and
-a stale Carbon registration silently steals the exclusive Option+Space chord.
+`launch.sh` **assembles the bundle from the freshly built binary plus the tracked
+`packaging/Info.plist`**, so a stale gitignored `NotchQuake.app/` can never be what
+you test. It then **kills every running instance before relaunching** (including
+renamed debug copies): a stale binary reuses the running process via `open`, and a
+stale Carbon registration silently steals the exclusive Option+Space chord.
+
+The bundle it produces carries only an **ad-hoc local signature**. That is enough to
+run on your own Mac; it is not distributable (`spctl` rejects it, notarization will
+never accept it). See [Signing & releases](#signing--releases-barnstorm-llc-developer-id).
 
 ## Validation gates
 
@@ -36,6 +47,8 @@ a stale Carbon registration silently steals the exclusive Option+Space chord.
 cargo fmt --all --check
 cargo build
 cargo test           # pure parser/geometry tests only — never spawn a PTY in a test
+scripts/gen-notices.sh check     # third-party notices are current (offline)
+scripts/release.sh v0.2.0        # all of the above + bundle + checksummed archive
 ```
 
 ## Hotkeys
@@ -70,14 +83,37 @@ is written against. Regenerate and check them with `scripts/gen-notices.sh gen` 
 `scripts/gen-notices.sh check`; `deny.toml` plus `scripts/gen-notices.sh deny` (cargo-deny)
 fail on any licence outside the allow-list or any dependency source other than crates.io.
 Include `NOTICE.md`, `THIRD-PARTY-NOTICES.md`, `LICENSE`, and `licenses/` in a release archive.
+`scripts/build-bundle.sh` installs them into `NotchQuake.app/Contents/Resources/`, and
+`scripts/release.sh` asserts they are present **inside** the archive.
 
 ## Signing & releases (Barnstorm LLC Developer ID)
 
-**Not production-ready yet.** See [the current project state](docs/project-state.md)
-for implemented features, validation, and signing/release blockers. The existing
-setup and release scripts are scaffolding, not a verified publishing pipeline.
-Notarization can be automated with `xcrun notarytool`; the earlier claim that
-it required a web-only submission was incorrect.
+**Signing is blocked until credentials exist.** Stage 1 — CI, bundle metadata, a
+deterministic artifact, and checksums — is implemented; stage 2 — Developer ID
+signing, notarization, stapling, and publication — has never been run, because
+there is no Developer ID certificate and no notary API key. Nothing here has ever
+been notarized, and no release has been published.
 
-CI checks `main` pushes and pull requests. The release workflow is manual and
-build-only until Developer ID signing, notarization, and stapling are verified.
+Read [docs/release-runbook.md](./docs/release-runbook.md) for the staged process,
+the exact GitHub Actions secrets (`DEVID_P12_B64`, `DEVID_P12_PASS`,
+`NOTARY_API_KEY`, `NOTARY_KEY_ID`, `NOTARY_ISSUER`), ephemeral-keychain discipline,
+signed-tag and clean-Mac Gatekeeper validation, and the future Homebrew cask
+prerequisites. [docs/project-state.md](./docs/project-state.md) is the authoritative
+blocker list.
+```bash
+scripts/release.sh v0.2.0        # gates -> bundle -> archive -> checksums; refuses to publish
+scripts/release.sh v0.2.0 --tag  # plus a signed annotated tag (never an unsigned one)
+```
+
+Notarization is automatable with `xcrun notarytool` and an App Store Connect API
+key; the earlier claim that it required a web-only submission was incorrect. The
+identity check that matters is the **Authority chain**
+(`Authority=Developer ID Application: …`) plus `TeamIdentifier` and
+`security find-identity -v -p codesigning` — not a `Signature=` grep, which an
+ad-hoc signature also satisfies.
+
+CI checks `main` pushes and pull requests on the arm64 runner label `macos-26`
+(`macos-14` is retired), and uploads a deterministic but **ad-hoc-signed** build
+artifact. Release publication requires an explicit `workflow_dispatch` with
+`publish: true` and fails closed when any signing secret is missing; there is no
+tag-triggered workflow.

@@ -1,48 +1,75 @@
 #!/bin/bash
-# One-time setup: import your Apple Developer ID Application certificate
-# ("Barnstorm LLC") into the login keychain so codesign can use it everywhere
-# in this pipeline.
+# LOCAL, ONE-TIME developer setup for Developer ID signing. Requires real Apple
+# Developer ID credentials, which this project does not have yet
+# (docs/project-state.md). Nothing here creates a signing identity: a
+# self-signed certificate is NOT a Developer ID certificate and no command can
+# conjure one. If you do not have the certificate, stop and read
+# docs/release-runbook.md instead.
 #
-# HOW TO OBTAIN THE CERT (do this once, then never again):
-#   1. Log into developer.apple.com with the "Barnstorm LLC" account.
-#   2. Account > Memberships: confirm you have the "App Development with
-#      Distribution" entitlement (that is what unlocks Developer ID cert).
-#   3. Account > Certificates, Credentials, Keys > Developer ID tab. If empty,
-#      click "Create a Certificate" (no special app registration needed for
-#      CLI-distributed apps). You'll set a passphrase and download a .p12.
-#   4. Save it as .signing/BarnstormLLC.p12 in this repo. chmod 600.
+# What this does:
+#   1. import a Developer ID Application .p12 into the LOCAL login keychain, and
+#   2. prove the imported identity really is a valid Developer ID chain —
+#      `security find-identity -v -p codesigning` plus the Authority chain and
+#      TeamIdentifier from `codesign -dvv`, NOT the old `grep "^Signature=Developer"`
+#      which a self-signed identity can also satisfy.
 #
-# Cleanup note: if you ran scripts/make-signing-cert.sh before, the login
-# keychain already holds a self-signed "Barnstorm LLC" cert and the security
-# CLI has no delete verb — open Keychain.app, search "Barnstorm LLC", delete
-# the cert item and its private key. The verify gate below will also catch a
-# collision (self-signed → Signature=adhoc; Developer → Signature=Developer).
+# CI does NOT use this script. CI builds an EPHEMERAL keychain per job and deletes
+# it (see .github/workflows/release.yml and docs/release-runbook.md). Do not put a
+# .p12 in this repo: .signing/ is gitignored for that reason.
 set -eu
 cd "$(dirname "$0")/.."
-P12=.signing/BarnstormLLC.p12
-[ -f "$P12" ] || { echo "place your Developer ID .p12 at $P12 first (instructions above)"; exit 1; }
+
+P12="${1:-.signing/BarnstormLLC.p12}"
+IDENTITY="${NQ_SIGNING_IDENTITY:-Developer ID Application: Barnstorm LLC}"
+
+[ -f "$P12" ] || {
+  cat >&2 <<EOF
+No Developer ID .p12 at $P12.
+
+To obtain one (once, from an Apple Developer account with the "App Development
+with Distribution" membership capability):
+  1. developer.apple.com -> Account -> Certificates, IDs & Profiles.
+  2. Create a Developer ID Application certificate (CSR from Keychain Access,
+     or a customer code-signing request); install it in your login keychain so
+     its private key lives next to it.
+  3. Export that identity + private key as a password-protected .p12 and place
+     it at $P12 (chmod 600). It stays local and gitignored; CI gets its own copy
+     via the DEVID_P12_B64 secret.
+There is no shortcut and no substitute: an ad-hoc or self-signed identity cannot
+be notarized and will not pass Gatekeeper on someone else's Mac.
+EOF
+  exit 1
+}
+
 umask 077
-read -r -p "p12 passphrase (leave blank if none): " PASS
-if [ -z "$PASS" ]; then
-  security import "$P12" -k ~/Library/Keychains/login.keychain-db
-else
-  security import "$P12" -k ~/Library/Keychains/login.keychain-db -P "$PASS"
-fi
-# empirical gate — sign a throwaway build copy and prove we got Developer, not adhoc
-codesign -s "Barnstorm LLC" -f target/debug/notchquake
-codesign -dv target/debug/notchquake 2>&1 | grep -E "^Signature=Developer" \
-  || { echo "NOT Developer-signed (likely the self-signed collision or wrong identity). Delete the 'Barnstorm LLC' cert in Keychain.app and re-import."; exit 1; }
-codesign -dv target/debug/notchquake 2>&1 | grep -E "^Owner" | head -1
-echo "OK — Developer ID identity 'Barnstorm LLC' is live in your login keychain."
+read -r -p "p12 passphrase: " PASS
+[ -n "$PASS" ] || { echo "a Developer ID .p12 export always carries a passphrase; refusing a blank import" >&2; exit 1; }
+security import "$P12" -k ~/Library/Keychains/login.keychain-db -P "$PASS" -T /usr/bin/codesign
+
+# --- identity gate -----------------------------------------------------------
+# find-identity -v already validates the trust chain; a self-signed or revoked
+# cert does not appear as a valid codesigning identity.
+line=$(security find-identity -v -p codesigning | grep -F "$IDENTITY" | head -1)
+[ -n "$line" ] || {
+  echo "no valid codesigning identity matching '$IDENTITY'. Check:" >&2
+  security find-identity -v -p codesigning >&2
+  echo "A self-signed certificate from an earlier experiment must be deleted in Keychain.app (the security CLI has no delete verb)." >&2
+  exit 1
+}
+SHA=$(printf '%s' "$line" | awk '{print $2}')
+echo "valid identity: $line"
+
+# Prove the chain and team, which is what notarization actually keys on.
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+cp packaging/Info.plist "$TMP/Info.plist"   # any file works; we sign a throwaway copy
+codesign --force --sign "$SHA" --timestamp=none "$TMP/Info.plist" >/dev/null 2>&1 || true
+codesign -dvv "$TMP/Info.plist" 2>&1 | grep -E '^(Authority|TeamIdentifier|Signature)' | sed 's/^/  /' || true
+codesign -dvv "$TMP/Info.plist" 2>&1 | grep -q 'Authority=Developer ID Application' || {
+  echo "Authority chain is not 'Developer ID Application' — this is not a distributable identity." >&2
+  exit 1
+}
+
 echo
-echo "Now set the CI Secrets so release.yml can sign on GitHub:"
-echo "  gh secret set DEVID_P12_B64 < <(base64 -A $P12)"
-echo "  gh secret set DEVID_P12_PASS  # prompts; the passphrase you gave when creating the cert"
-echo
-echo "Optional notarization (Gatekeeper trust without a Smart-X click; do this"
-echo "once per signed release you distribute):"
-echo "  1. sign a throwaway copy locally with Developer ID (this script proves you can)."
-echo "  2. open https://developer.apple.com/submit-binary/ and upload"
-echo "     target/debug/notchquake (or the release build). Apple returns a"
-echo "     notarized copy — you staple it with \`stapler staple <file>\` and"
-echo "     ship that file; \`stapler validate\` proves the ticket is attached."
+echo "OK — a valid Developer ID identity is in your LOCAL login keychain."
+echo "Next: docs/release-runbook.md (stage 2) for the CI secrets and the"
+echo "sign -> notarize -> staple -> verify -> publish order."

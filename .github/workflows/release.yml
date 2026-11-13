@@ -1,15 +1,282 @@
 name: release-build
 
-# Publishing is deliberately disabled until signing/notarization is verified.
+# Two stages, deliberately separated:
+#
+#   build   — always available. Runs the gates, assembles the bundle, and uploads
+#             a DETERMINISTIC arm64 artifact with checksums. Ad-hoc signed only:
+#             not a release, and it does not create or publish anything.
+#   publish — Developer ID sign + notarize + staple + GitHub Release. Requires
+#             credentials that DO NOT EXIST YET (docs/project-state.md), so it is
+#             gated behind an explicit input, a secrets-presence check, AND a named
+#             GitHub Environment (`release`). Required reviewers for that
+#             environment must be created in repository settings — the YAML
+#             cannot create them, so the environment is a documented prerequisite,
+#             not proof of protection (docs/release-runbook.md). The job fails
+#             closed rather than publishing an unsigned bundle.
+#
+# Both jobs check out the tag's commit (detached) instead of whatever head
+# dispatched the workflow, so the bytes built, verified, and published belong to
+# the verified signed tag. Nothing here ever launches the app, and no secret
+# value is ever echoed.
+#
+# Runner: `macos-26` is the supported arm64 label (`macos-14` was retired
+# 2026-11-02). arm64 only — there is no Intel build.
+
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, e.g. v0.2.0 (must match Cargo.toml version)"
+        required: true
+        type: string
+      publish:
+        description: "Also sign, notarize, and publish (requires Developer ID + notary secrets)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  # Must agree with LSMinimumSystemVersion in packaging/Info.plist.
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
 jobs:
+  # ---- stage 1: gates + deterministic artifact (no credentials) -------------
   build:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - run: cargo build --release --locked
+        with:
+          # Full history AND tag refs: the release tag's own object is needed to
+          # verify its signature below. actions/checkout v4 passes `--no-tags`
+          # unless fetch-tags is requested, so `fetch-depth: 0` alone would leave
+          # refs/tags absent and every tag guard below would be vacuous.
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Bind the job to the tag BEFORE anything is built: every step after this
+      # one (gates, bundle, archive) then runs against the tag's commit tree, not
+      # against whatever head happened to dispatch the workflow. Without the
+      # detach, the signature check would attest one commit while the artifact
+      # came from another.
+      - name: Verify the signed tag, then build THAT commit (detached)
+        run: |
+          tag="${{ inputs.tag }}"
+          git fetch --tags --force origin "refs/tags/${tag}" || true
+          # `-t` on a missing ref errors, so swallow stderr and let the guard
+          # below report it (steps run under `bash -e`).
+          git cat-file -t "refs/tags/${tag}" 2>/dev/null | grep -q '^tag$' \
+            || { echo "$tag is not an annotated tag (lightweight tags are not releases)" >&2; exit 1; }
+          # A tag object's signature is appended AFTER the message as a
+          # `-----BEGIN PGP SIGNATURE-----` block (SSH-signed tags use
+          # `-----BEGIN SSH SIGNATURE-----`). It is NOT a `gpgsig` header — that
+          # form only appears on signed *commit* objects, and
+          # `git for-each-ref %(signature)` is empty for tag objects. No unsigned
+          # fallback and no `|| true`: an unsigned tag is not attributable.
+          # (`git verify-tag` is stronger but needs the tagger's public key, which
+          # a CI runner does not have.)
+          git cat-file tag "refs/tags/${tag}" \
+            | grep -qE '^-----BEGIN (PGP|SSH) SIGNATURE-----' \
+            || { echo "$tag is unsigned — create it with: git tag -s <tag> -m ..." >&2; exit 1; }
+          commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          echo "TAG_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "release tag $tag -> commit $commit"
+          git checkout --detach "$commit"
+          # The tree must be exactly the tagged tree, nothing extra in it.
+          [ -z "$(git status --porcelain)" ] \
+            || { echo "working tree is not clean after checking out $tag" >&2; exit 1; }
+
+      - name: Tag version matches Cargo.toml
+        run: |
+          # Runs AFTER the detach on purpose: the Cargo.toml read here is the
+          # tagged tree's, so version agreement is an assertion about the bytes
+          # that actually get built.
+          v="${{ inputs.tag }}"; v="${v#v}"
+          cargo_v=$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
+          [ "$v" = "$cargo_v" ] || { echo "tag $v != Cargo.toml $cargo_v" >&2; exit 1; }
+
+      - name: Gates
+        run: |
+          cargo fmt --all -- --check
+          cargo build --locked --target aarch64-apple-darwin
+          cargo test --locked --target aarch64-apple-darwin
+          scripts/gen-notices.sh check
+
+      - name: Bundle + deterministic archive
+        run: |
+          scripts/build-bundle.sh release
+          NQ_APP=NotchQuake.app scripts/package-artifact.sh dist
+
+      - name: Licence artefacts are inside the archive
+        run: |
+          v="${{ inputs.tag }}"; v="${v#v}"
+          for f in NOTICE.md THIRD-PARTY-NOTICES.md LICENSE; do
+            bsdtar -tf "dist/NotchQuake-$v.tar.gz" "NotchQuake.app/Contents/Resources/$f" >/dev/null \
+              || { echo "archive missing Contents/Resources/$f" >&2; exit 1; }
+          done
+          bsdtar -tf "dist/NotchQuake-$v.tar.gz" 'NotchQuake.app/Contents/Resources/licenses/' >/dev/null
+
+      - name: Upload CI build artifact (ad-hoc signed, not distributable)
+        uses: actions/upload-artifact@v4
+        with:
+          name: notchquake-${{ inputs.tag }}-arm64-ci
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---- stage 2: sign + notarize + publish (credential-gated, NOT verified) ---
+  publish:
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: macos-26
+    # REQUIRED PREREQUISITE (does not exist yet): a GitHub Environment named
+    # `release` with required reviewers configured under
+    # Settings → Actions → Environments. GitHub silently CREATES the environment
+    # on first run if it is absent, so this declaration alone gates nothing —
+    # the reviewers must be added in the repository settings, and until stage 2
+    # is verified the correct configuration is a reviewer set that cannot
+    # approve itself, or no environment at all combined with never dispatching
+    # `publish: true`. See docs/release-runbook.md; do not pretend the gate
+    # exists.
+    environment: release
+    # The release asset upload needs write access to contents (GitHub Releases).
+    permissions:
+      contents: write
+    env:
+      # Quoted because the fallback string contains ": ", which is invalid in an
+      # unquoted YAML scalar. `vars.` is a non-secret repository variable.
+      NQ_SIGNING_IDENTITY: "${{ vars.NQ_SIGNING_IDENTITY || 'Developer ID Application: Barnstorm LLC' }}"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Same binding as the build job: tags fetched, and the tree is
+          # detached to the tag's commit below, so the bundle that is signed and
+          # published is built from the tagged commit, not the dispatch head.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify the signed tag, then build THAT commit (detached)
+        run: |
+          tag="${{ inputs.tag }}"
+          git fetch --tags --force origin "refs/tags/${tag}" || true
+          git cat-file -t "refs/tags/${tag}" 2>/dev/null | grep -q '^tag$' \
+            || { echo "$tag is not an annotated tag (lightweight tags are not releases)" >&2; exit 1; }
+          git cat-file tag "refs/tags/${tag}" \
+            | grep -qE '^-----BEGIN (PGP|SSH) SIGNATURE-----' \
+            || { echo "$tag is unsigned — refusing to publish bytes from an unattributable tag" >&2; exit 1; }
+          commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          echo "TAG_COMMIT=$commit" >> "$GITHUB_ENV"
+          git checkout --detach "$commit"
+          [ -z "$(git status --porcelain)" ] \
+            || { echo "working tree is not clean after checking out $tag" >&2; exit 1; }
+          v="$tag"; v="${v#v}"
+          cargo_v=$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
+          [ "$v" = "$cargo_v" ] || { echo "tag $v != Cargo.toml $cargo_v" >&2; exit 1; }
+
+      - name: Fail closed when credentials are missing
+        run: |
+          # macOS runners ship bash 3.2, where an empty array under `set -u` is an
+          # unbound-variable error, so collect the names in a plain string.
+          missing=""
+          [ -n "${{ secrets.DEVID_P12_B64 }}" ]  || missing="$missing DEVID_P12_B64"
+          [ -n "${{ secrets.DEVID_P12_PASS }}" ] || missing="$missing DEVID_P12_PASS"
+          [ -n "${{ secrets.NOTARY_API_KEY }}" ] || missing="$missing NOTARY_API_KEY"
+          [ -n "${{ secrets.NOTARY_KEY_ID }}" ]  || missing="$missing NOTARY_KEY_ID"
+          [ -n "${{ secrets.NOTARY_ISSUER }}" ]  || missing="$missing NOTARY_ISSUER"
+          if [ -n "$missing" ]; then
+            echo "missing secrets:$missing" >&2
+            echo "Stage 2 is blocked until Barnstorm LLC's Developer ID certificate and notary API key exist." >&2
+            echo "See docs/release-runbook.md. Refusing to publish an unsigned bundle." >&2
+            exit 1
+          fi
+
+      - name: Gates (same as the build job)
+        run: |
+          cargo fmt --all -- --check
+          cargo build --locked --target aarch64-apple-darwin
+          cargo test --locked --target aarch64-apple-darwin
+          scripts/gen-notices.sh check
+
+      # Secrets reach the signing step as STEP env vars, not $GITHUB_ENV: a
+      # notary `.p8` is multi-line, which GITHUB_ENV cannot carry without
+      # delimiter syntax. Step env avoids that, and no value is ever echoed.
+      - name: Build bundle, sign, notarize, staple, re-archive
+        env:
+          DEVID_P12_B64: ${{ secrets.DEVID_P12_B64 }}
+          DEVID_P12_PASS: ${{ secrets.DEVID_P12_PASS }}
+          NOTARY_API_KEY: ${{ secrets.NOTARY_API_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          umask 077
+          printf '%s' "$DEVID_P12_B64" | base64 --decode > "$RUNNER_TEMP/devID.p12"
+          # base64 --decode fails loudly on corrupt input — the usual copy-paste
+          # mistake with DEVID_P12_B64.
+          [ -s "$RUNNER_TEMP/devID.p12" ] \
+            || { echo "DEVID_P12_B64 decoded to an empty file" >&2; exit 1; }
+          # notarytool wants the key as a file, so stage it at 0600 and pass the
+          # path; the key contents never land in a variable the script echoes.
+          printf '%s\n' "$NOTARY_API_KEY" > "$RUNNER_TEMP/notary.p8"
+
+          scripts/build-bundle.sh release
+          NQ_P12="$RUNNER_TEMP/devID.p12" \
+          NQ_P12_PASS="$DEVID_P12_PASS" \
+          NQ_NOTARY_API_KEY="$RUNNER_TEMP/notary.p8" \
+          NQ_NOTARY_KEY_ID="$NOTARY_KEY_ID" \
+          NQ_NOTARY_ISSUER="$NOTARY_ISSUER" \
+            scripts/sign-notarize.sh
+
+      - name: Verify the signed, stapled bundle
+        run: |
+          codesign --verify --strict --verbose=2 NotchQuake.app
+          codesign -dvv NotchQuake.app 2>&1 | grep -q 'Authority=Developer ID Application:' || {
+            echo "not a Developer ID authority chain" >&2; exit 1; }
+          xcrun stapler validate NotchQuake.app
+          # Gatekeeper must report the notarized ticket. Do not treat `|| true`
+          # semantics as acceptable here: a rejection means the release is not done.
+          spctl -a -vv -t exec NotchQuake.app
+
+      - name: Release notes from CHANGELOG
+        run: |
+          awk -v t="${{ inputs.tag }}" '
+            $0 ~ "^## " t {p=1; next}
+            p && /^## /   {p=0}
+            p            {print}
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || echo "See CHANGELOG.md for ${{ inputs.tag }}." > "$RUNNER_TEMP/notes.md"
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ inputs.tag }}"; v="${v#v}"
+          # --target is the commit the signed tag points at, captured after
+          # verification in the tag-verify step — NOT $GITHUB_SHA, which is the
+          # commit that dispatched the workflow. The uploaded bytes were built
+          # from $TAG_COMMIT, so the release must point at $TAG_COMMIT too.
+          [ -n "$TAG_COMMIT" ] || { echo "TAG_COMMIT was not set by the tag-verify step" >&2; exit 1; }
+          gh release create "${{ inputs.tag }}" \
+            --target "$TAG_COMMIT" \
+            --title "NotchQuake ${{ inputs.tag }}" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "dist/NotchQuake-$v.tar.gz#NotchQuake-$v.tar.gz" \
+            "dist/NotchQuake-$v.zip#NotchQuake-$v.zip" \
+            "dist/SHA256SUMS#SHA256SUMS" \
+            "NOTICE.md#NOTICE.md" \
+            "THIRD-PARTY-NOTICES.md#THIRD-PARTY-NOTICES.md" \
+            "LICENSE#LICENSE"
+
+      - name: Keychain and temp cleanup
+        if: always()
+        run: |
+          # scripts/sign-notarize.sh removes its own ephemeral keychain on exit;
+          # this is the sweep for the runner's credential files and for any
+          # keychain left in the search list.
+          rm -f "$RUNNER_TEMP/devID.p12" "$RUNNER_TEMP/notary.p8"
+          security list-keychains -d user -s ~/Library/Keychains/login.keychain-db 2>/dev/null || true

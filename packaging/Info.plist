@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Tracked bundle metadata TEMPLATE. The built `NotchQuake.app/Contents/Info.plist`
+  is generated from this file by `scripts/build-bundle.sh`, which substitutes
+  @VERSION@ (from Cargo.toml) and @BUILD@ (a build counter derived from the
+  version, deterministic per commit). Never edit the plist inside the bundle by
+  hand — it is gitignored along with the bundle itself.
+
+  Release-safe by construction: no team ID, no certificate name, no secrets, no
+  absolute paths. Everything Gatekeeper/notarization needs about identity comes
+  from the signature, not from this file.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+
+  <key>CFBundleExecutable</key>
+  <string>notchquake</string>
+
+  <key>CFBundleIdentifier</key>
+  <string>local.notchquake</string>
+
+  <key>CFBundleName</key>
+  <string>NotchQuake</string>
+
+  <key>CFBundleDisplayName</key>
+  <string>NotchQuake</string>
+
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+
+  <!-- Version plumbing: CFBundleShortVersionString is the marketing version,
+       taken from Cargo.toml `[package] version`; CFBundleVersion is the build
+       number, deterministic so a re-build of the same commit is reproducible. -->
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+
+  <key>CFBundleVersion</key>
+  <string>@BUILD@</string>
+
+  <!-- Gatekeeper reads this before anything else. The binary is compiled with
+       MACOSX_DEPLOYMENT_TARGET=13.0 (verified: LC_BUILD_VERSION minos 13.0),
+       and this key must agree with it or a too-old machine gets a cryptic
+       "damaged" refusal instead of a clean version error. NotchQuake needs
+       13.0+ because the notch geometry uses NSScreen.safeAreaInsets and
+       auxiliaryTopLeftArea/auxiliaryTopRightArea. -->
+  <key>LSMinimumSystemVersion</key>
+  <string>@MINOS@</string>
+
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2026 Barnstorm LLC. NotchQuake source is MIT-licensed; see NOTICE.md and THIRD-PARTY-NOTICES.md.</string>
+
+  <!-- The app sets NSApplicationActivationPolicy::Accessory itself in
+       main.rs; LSUIElement states the same intent to LaunchServices so a
+       release build never flashes a Dock tile. No behavioral change versus the
+       explicit setActivationPolicy call. -->
+  <key>LSUIElement</key>
+  <true/>
+
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+
+  <!-- No entitlements and no sandbox: the Carbon hotkey and the PTY need
+       neither, and adding an entitlement plist here would require the
+       `com.apple.security.*` grants this app deliberately avoids. Hardened
+       runtime is a codesign option (--options runtime), not a plist key. -->
+</dict>
+</plist>

@@ -1190,8 +1190,11 @@ fn ansi_slot_titles() -> Vec<Retained<NSString>> {
 /// key monitor works while it is key); what is limited is that a chord only
 /// reaches the app once Carbon has registered it.
 fn about_rows(settings: &Settings) -> Vec<String> {
+    // Version comes from Cargo.toml, so the About row can never drift from the
+    // bundle metadata that scripts/build-bundle.sh generates.
+    let version = env!("CARGO_PKG_VERSION");
     vec![
-        "NotchQuake — notch terminal, v0.1-alpha".to_string(),
+        format!("NotchQuake — notch terminal, v{version}"),
         format!("Toggle chord: {0}", chord_name(settings.toggle_chord)),
         format!("New tab chord: {0}", chord_name(settings.new_tab_chord)),
         "Saved in ~/Library/Preferences/local.notchquake.plist".to_string(),

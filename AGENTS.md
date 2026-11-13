@@ -16,13 +16,18 @@ See `README.md` and `docs/project-state.md` for the current project baseline.
 
 ```bash
 cargo build                                    # the gate — there is no LSP
-./scripts/launch.sh                            # build + kill stale + relaunch NotchQuake.app
-# NotchQuake.app is a signed bundle at ./NotchQuake.app; launch it with `open -n NotchQuake.app`
+./scripts/launch.sh                            # build + assemble bundle + kill stale + relaunch
+scripts/build-bundle.sh release                # bundle only (release build)
+NQ_APP=/tmp/nq/NotchQuake.app scripts/build-bundle.sh release
+# NotchQuake.app is a bundle at ./NotchQuake.app; launch it with `open -n NotchQuake.app`
 ```
 
-`launch.sh` kills any running instance first (a stale binary reuses the
-running process via `open`), rebuilds, copies the binary into `NotchQuake.app`,
-and relaunches. **Always kill before relaunch** or you test a stale binary.
+`launch.sh` delegates bundle provenance to `scripts/build-bundle.sh` (fresh binary
++ tracked `packaging/Info.plist`), then kills any running instance before
+relaunching (a stale binary reuses the running process via `open`). **Always kill
+before relaunch** or you test a stale binary. The bundle it produces is
+**ad-hoc signed only** — fine to run locally, not distributable; see lesson 58 and
+`docs/release-runbook.md`.
 
 The app writes debug files to `/tmp/bnt-*.txt` (notch geometry, shape, grid,
 key/click/any event dumps). Remove these before shipping. `launch.sh` does
@@ -618,8 +623,19 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     killed `BNT.app/Contents/MacOS/BNT`, so a `/tmp/bnt-rt` left over from the
     lesson-41c cross-process test kept running for HOURS and ate the chord
     (symptom: the hotkey "stopped working", Option+Space just typed a space).
-    Fix: `launch.sh` now also `pkill -f bnt-rt`. Check for strays with
-    `ps ax | grep -iE 'BNT|bnt-rt'` whenever the hotkey goes dead.
+    Fix at the time: `launch.sh` also killed the renamed test copy.
+    CURRENT launch.sh cleanup (post-rename, lesson 56): it runs
+    `pkill -f "NotchQuake.app/Contents/MacOS/notchquake"` and
+    `pkill -f "notchquake-rt"`, both patterns chosen so they cannot match the
+    pkill line itself. What that DOES NOT cover: a genuinely stale LEGACY binary
+    (`BNT.app/Contents/MacOS/BNT`) or an old `/tmp/bnt-rt` from before the rename
+    still runs and still steals the chord, because neither name is in the pattern
+    any more. So when the hotkey goes dead, inspect rather than assume:
+    `ps ax | grep -iE 'macos/(bnt|notchquake)$|bnt-rt|notchquake-rt'` and kill
+    the pid explicitly (AGENTS.md lesson 56: inspect with grep, act with
+    `kill <pid>`). Legacy strays are rare — they only survive from pre-rename
+    test runs — so this is a diagnostic step, not a broader pkill pattern that
+    could match an unrelated process.
 
 54. **Open width is a canvas problem, not a slider problem.** `WIDTH_MAX` was
     `PANEL_WIDTH` AND the panel window was created once at 640×620 and never
@@ -650,11 +666,51 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     `xcrun --find notarytool` locates Xcode's CLI; notarization is automatable.
     `security import -T /usr/bin/codesign` is supported, and certificate/key
     deletion commands exist. A self-signed certificate is not an ad-hoc signature,
-    but neither provides Apple Developer ID distribution trust. The existing
-    signing scripts are unverified scaffolding with incorrect identity checks
-    and must not publish releases yet. See `docs/project-state.md` for the
-    authoritative current status and release blockers. The release workflow
-    is manual/build-only until these are resolved.
+    but neither provides Apple Developer ID distribution trust. The signing scripts
+    were rewritten on 2026-11-12 to check the Authority chain +
+    `security find-identity -v` instead of `Signature=Developer`, and to refuse
+    loudly when credentials are absent — but stage 2 remains UNVERIFIED and
+    BLOCKED: no Developer ID certificate, no notary API key, nothing notarized,
+    no release published. See `docs/release-runbook.md` for the staged process and
+    `docs/project-state.md` for the authoritative blocker list.
+
+58. **Release foundation: assemble, don't reuse; ad-hoc ≠ signed.** Stage 1 of the
+    release pipeline (CI runner label, bundle assembly, deterministic artifact,
+    fail-closed publish) landed 2026-11-12; stage 2 (Developer ID sign, notarize,
+    staple, publish) is STILL BLOCKED on credentials and must stay that way.
+    Verified findings that changed the scripts:
+    (a) A bundle with `Contents/Resources` and no `Contents/_CodeSignature` fails
+        `codesign --verify --strict` with "code has no resources but signature
+        indicates they must be present" — the linker's implicit ad-hoc signature
+        seals the Mach-O only. The old bundle's plist had 4 keys and its signature
+        sealed **0** files, so every `codesign`/`spctl` check against it was
+        vacuous. `build-bundle.sh` therefore populates Resources first, then
+        re-seals ad-hoc (`--sign -`), then `codesign --verify --strict`.
+    (b) `spctl -a -t exec` **rejects** an ad-hoc bundle even when `--verify
+        --strict` passes. "valid on disk" is not "distributable".
+    (c) Archive reproducibility needs `bsdtar --format ustar`: the default pax
+        format writes atime/ctime as extended records, so merely READING a file
+        between two archive runs changed the tar.gz sha256 (measured). Pin mtimes
+        and atimes, uid/gid 0, `COPYFILE_DISABLE=1`, `gzip -n`, and clear xattrs
+        (`com.apple.provenance` gets added by the OS on access).
+    (d) A git TAG object's signature is a `-----BEGIN PGP SIGNATURE-----` block
+        AFTER the message — NOT a `gpgsig` header (that is only how signed COMMIT
+        objects store it), and `git for-each-ref %(signature)` is empty for tags.
+        Check with `git verify-tag` or
+        `git cat-file tag X | grep -E '^-----BEGIN (PGP|SSH) SIGNATURE-----'`.
+    (e) `security` has `set-key-partition-list` (singular, needs the keychain
+        password); without it `codesign` blocks on an ACL prompt a CI runner cannot
+        answer. macOS `base64` has no `-A` — use `base64 -i` (one line) /
+        `base64 --decode`.
+    (f) `open -n` failing with launchd spawn 162/163 is a regular FILE at the
+        `.app` path, not a bad signature — which is what the old launch.sh message
+        misattributed.
+    Secrets the publish job needs (none exist yet; never commit, never echo):
+    `DEVID_P12_B64`, `DEVID_P12_PASS`, `NOTARY_API_KEY`, `NOTARY_KEY_ID`,
+    `NOTARY_ISSUER`; optional repository variable `NQ_SIGNING_IDENTITY`.
+    `scripts/sign-notarize.sh` has never been run end to end. Runner label is
+    `macos-26` (arm64) — `macos-14` was retired 2026-11-02 and Intel labels are
+    wrong for this project.
 
 56. **Renaming the bundle broke execution in three ways** (v0.1-alpha rename
     BNT.app→NotchQuake.app, id `local.bnt`→`local.notchquake`, binary `BNT`→
@@ -699,7 +755,12 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
 ## Repo / process rules
 
 - macOS-only, arm64. `cargo build` is the gate; no LSP.
-- `BNT.app/` is gitignored (built binary bundle — never commit). `/tmp/bnt-*.txt`
-  debug writes were all stripped at ship time; none remain in `src/`.
+- `BNT.app/` and `NotchQuake.app/` are gitignored (assembled build products —
+  never commit). `scripts/build-bundle.sh` re-assembles the bundle from
+  `packaging/Info.plist` + a fresh binary, so a stale bundle is never tested or
+  shipped. `/tmp/bnt-*.txt` debug writes were all stripped at ship time; none
+  remain in `src/`.
+- `dist/` and `.signing/` are gitignored: release artifacts are reproducible
+  build products, and certificates/keys/passphrases never enter the repo.
 - Keep project documentation in this repository, not in external worktrees.
   `docs/project-state.md` records the baseline; this file is the machine-specific how-to.

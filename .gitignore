@@ -1,8 +1,12 @@
 /target
 BNT.app/
 NotchQuake.app/
+# Release artifacts are build products: reproducible, checksummed, never committed.
+/dist/
 
 /.crew/
 bench/
 docs/perf/
+# Never commit a certificate, .p12, .p8, or passphrase. CI uses an ephemeral
+# keychain; see docs/release-runbook.md.
 .signing/

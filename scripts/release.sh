@@ -1,58 +1,115 @@
 #!/bin/bash
-# Cut a public release: build release, Developer-ID-sign the .app bundle,
-# attach the notarization ticket if one was obtained (setup-developer-id.sh
-# explains the one manual Apple step), zip, and publish as a GH Release.
-# Usage: scripts/release.sh v0.2-alpha
+# Release PREP for NotchQuake: gates -> release bundle -> deterministic archive
+# -> checksums -> signed tag. Publication (Developer ID signing, notarization,
+# GitHub Release upload) is NOT performed here yet, because signing credentials
+# do not exist (docs/project-state.md). This script refuses to publish and says
+# exactly which stage it stopped at.
+#
+# Usage:
+#   scripts/release.sh v0.2.0          # gates + bundle + archive + checksums, no tag (default)
+#   scripts/release.sh v0.2.0 --tag    # the above, plus a SIGNED annotated tag (no push)
+#
+# Stage 2 (Developer ID signing + notarization, requires credentials) lives in
+# scripts/sign-notarize.sh and is deliberately NOT invoked from here.
 set -eu
 cd "$(dirname "$0")/.."
-TAG="${1:?usage: scripts/release.sh v0.2-alpha}"
-CN="Barnstorm LLC"
 
-cargo build --release
-[ -f target/release/notchquake ] || { echo "BUILD FAILED"; exit 1; }
+TAG="${1:?usage: scripts/release.sh v0.2.0 [--tag]}"
+MODE="${2:-gates}"
+case "$TAG" in
+  v[0-9]*.*) ;;
+  *) echo "tag must look like v0.2.0 (got $TAG)" >&2; exit 2 ;;
+esac
+case "$MODE" in
+  gates|--tag) ;;
+  *) echo "usage: scripts/release.sh <tag> [--tag]" >&2; exit 2 ;;
+esac
 
-# rebuild the bundle fresh (never sign a stale tree)
-mkdir -p NotchQuake.app/Contents/MacOS
-cp target/release/notchquake NotchQuake.app/Contents/MacOS/notchquake
-[ -f NotchQuake.app/Contents/Info.plist ] || {
-  cat > NotchQuake.app/Contents/Info.plist <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>CFBundleIdentifier</key><string>local.notchquake</string>
-<key>CFBundleExecutable</key><string>notchquake</string>
-<key>CFBundleName</key><string>NotchQuake</string>
-<key>CFBundlePackageType</key><string>APPL</string>
-</dict></plist>
-PLIST
+VERSION="${TAG#v}"
+CARGO_VERSION=$(python3 - <<'PY'
+import tomllib
+print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])
+PY
+)
+[ "$VERSION" = "$CARGO_VERSION" ] || {
+  echo "tag version $VERSION does not match Cargo.toml version $CARGO_VERSION — bump Cargo.toml first" >&2
+  exit 1
 }
 
-# the signing gate: sign the inner binary FIRST (Developer ID; adhoc is not
-# distributable — syspolicy says so), then the bundle itself. codesign on a
-# .app directory does NOT re-sign the inner executable, so both steps matter.
-codesign -s "$CN" NotchQuake.app/Contents/MacOS/notchquake \
-  || { echo "no Developer ID identity '$CN' in keychain — run scripts/setup-developer-id.sh"; exit 1; }
-codesign -s "$CN" NotchQuake.app
-codesign -dv NotchQuake.app/Contents/MacOS/notchquake 2>&1 | grep -qE "^Signature=Developer" \
-  || { echo "inner binary not Developer-signed — abort"; exit 1; }
-syspolicy_check notary-submission NotchQuake.app --json 2>/dev/null | grep -q '"Fatal"' \
-  && { echo "syspolicy says the bundle is not notarization-ready — inspect output and fix before publishing"; exit 1; }
-echo "syspolicy: notarization-ready"
+# --- gates -------------------------------------------------------------------
+# cargo-deny is optional (not on every machine); the notice check is mandatory
+# and offline.
+cargo fmt --all -- --check
+cargo build --locked
+cargo test --locked
+scripts/gen-notices.sh check
+if command -v cargo-deny >/dev/null 2>&1; then cargo deny check; else echo "note: cargo-deny not installed, skipping license/advisory check"; fi
 
-# notarization ticket (optional, but the zip must contain it if you notarized):
-# after https://developer.apple.com/submit-binary/ returns the notarized copy,
-# staple then validate before publishing.
-if stapler validate NotchQuake.app >/dev/null 2>&1; then
-  echo "notarization ticket present"
-else
-  echo "no notarization ticket — first launch needs Smart-X bypass on user machines (fine for an alpha; notarize via submit-binary to avoid it)"
+# --- CHANGELOG section --------------------------------------------------------
+# The release workflow builds its notes from `## <tag>`, so a release without a
+# matching CHANGELOG section would ship with "See CHANGELOG.md" as the notes.
+# Warn rather than fail: the section can be added in the same commit as the bump.
+if ! grep -q "^## $TAG" CHANGELOG.md 2>/dev/null; then
+  echo "warning: CHANGELOG.md has no '## $TAG' section; the release notes would fall back to a stub" >&2
 fi
 
-rm -f "/tmp/notchquake-$TAG.zip"
-zip -qr "/tmp/notchquake-$TAG.zip" NotchQuake.app
+# --- bundle + archive --------------------------------------------------------
+scripts/build-bundle.sh release
+NQ_APP=NotchQuake.app scripts/package-artifact.sh dist
 
-NOTES=$(sed -n '/## '"$TAG"'/,/./p' CHANGELOG.md 2>/dev/null || true)
-gh release create "$TAG" --title "NotchQuake $TAG" --notes "${NOTES:-See CHANGELOG.md}" --target "$(git rev-parse HEAD)" "/tmp/notchquake-$TAG.zip#NotchQuake-$TAG.zip"
-git tag -S "$TAG" 2>/dev/null || git tag "$TAG"  # -S per repo signing rules; plain tag if signing agent refuses
-git push -u origin "refs/tags/$TAG" 2>/dev/null || git push origin master
-echo "published: $TAG"
+# The archive must carry the licence artefacts, or the release is not
+# distributable. Verified against the archive itself, not the working tree.
+for f in NOTICE.md THIRD-PARTY-NOTICES.md LICENSE; do
+  bsdtar -tf "dist/NotchQuake-$VERSION.tar.gz" "NotchQuake.app/Contents/Resources/$f" >/dev/null \
+    || { echo "release archive is missing Contents/Resources/$f" >&2; exit 1; }
+done
+bsdtar -tf "dist/NotchQuake-$VERSION.tar.gz" 'NotchQuake.app/Contents/Resources/licenses/*' >/dev/null \
+  || { echo "release archive is missing Contents/Resources/licenses/" >&2; exit 1; }
+
+# --- signature status (informational, no Developer ID signing) ---------------
+# Honest check, not the old `grep -qE "^Signature=Developer"`, which an ad-hoc or
+# self-signed identity can also satisfy. What distinguishes a distributable
+# signature is the Authority chain (`Authority=Developer ID Application: …`) and
+# TeamIdentifier, plus `security find-identity -v -p codesigning`.
+if codesign -dvv NotchQuake.app 2>&1 | grep -qE '^Authority=Developer ID Application:'; then
+  echo "bundle carries a Developer ID Application authority — stage 2 (notarize + publish) applies"
+else
+  echo "bundle carries only the local ad-hoc signature from build-bundle.sh: NOT distributable."
+  echo "Stage 2 (Developer ID sign + notarize + staple) is blocked until Barnstorm LLC credentials exist."
+fi
+
+if [ "$MODE" != "--tag" ]; then
+  echo "no tag created (pass --tag to create a signed annotated tag)"
+  echo
+  echo "STOPPED BEFORE PUBLICATION. Remaining stages (docs/release-runbook.md):"
+  echo "  1. scripts/release.sh $TAG --tag   # signed annotated tag, then push it deliberately"
+  echo "  2. scripts/sign-notarize.sh        # Developer ID sign, notarize, staple, verify"
+  echo "  3. upload dist/ artifacts to a GitHub Release with SHA256SUMS"
+  echo "  4. clean-Mac Gatekeeper validation of the downloaded artifact"
+  exit 0
+fi
+# Signed annotated tag ONLY. No unsigned fallback: an unsigned tag cannot be
+# attributed to a key, which is the whole point of tagging a release.
+# A tag must point at a COMMITTED state, otherwise the release ships bytes that
+# exist nowhere in history.
+if [ -n "$(git status --porcelain)" ]; then
+  echo "working tree is dirty — commit the release changes before tagging" >&2
+  git status --short >&2
+  exit 1
+fi
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+  echo "tag $TAG already exists — not touching it (delete it deliberately if you meant to re-cut)" >&2
+  exit 1
+fi
+git tag -s "$TAG" -m "NotchQuake $TAG"
+# Verify what was actually created. A tag object's signature is a `-----BEGIN PGP
+# SIGNATURE-----` block after the message, NOT a `gpgsig` header (that form is
+# only how signed *commit* objects store it).
+git cat-file tag "$TAG" | grep -qE '^-----BEGIN (PGP|SSH) SIGNATURE-----' \
+  || { echo "$TAG has no signature block — signing was silently skipped; delete it and retry" >&2; exit 1; }
+echo "signed tag $TAG created locally. Push it deliberately: git push origin refs/tags/$TAG"
+echo
+echo "STOPPED BEFORE PUBLICATION. Remaining stages (docs/release-runbook.md):"
+echo "  1. scripts/sign-notarize.sh        # Developer ID sign, notarize, staple, verify"
+echo "  2. upload dist/ artifacts to a GitHub Release with SHA256SUMS"
+echo "  3. clean-Mac Gatekeeper validation of the downloaded artifact"
