@@ -16,8 +16,12 @@ name: release-build
 #
 # Both jobs check out the tag's commit (detached) instead of whatever head
 # dispatched the workflow, so the bytes built, verified, and published belong to
-# the verified signed tag. Nothing here ever launches the app, and no secret
-# value is ever echoed.
+# the verified signed tag. The tag name reaches the shell as the env var `TAG`,
+# NOT interpolated inline into `run:` script text, so a tag string can never
+# become shell code. The BUILD job uploads the CI artifact by glob (dist/*.tar.gz,
+# dist/*.zip, dist/SHA256SUMS); the PUBLISH job uploads the named dist/ files plus
+# the top-level notices to the GitHub Release. Nothing here ever launches the app,
+# and no secret value is ever echoed.
 #
 # Runner: `macos-26` is the supported arm64 label (`macos-14` was retired
 # 2026-11-02). arm64 only — there is no Intel build.
@@ -63,8 +67,11 @@ jobs:
       # detach, the signature check would attest one commit while the artifact
       # came from another.
       - name: Verify the signed tag, then build THAT commit (detached)
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          tag="${{ inputs.tag }}"
+          tag="$TAG"
+          [ -n "$tag" ] || { echo "inputs.tag is empty" >&2; exit 1; }
           git fetch --tags --force origin "refs/tags/${tag}" || true
           # `-t` on a missing ref errors, so swallow stderr and let the guard
           # below report it (steps run under `bash -e`).
@@ -90,11 +97,13 @@ jobs:
             || { echo "working tree is not clean after checking out $tag" >&2; exit 1; }
 
       - name: Tag version matches Cargo.toml
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           # Runs AFTER the detach on purpose: the Cargo.toml read here is the
           # tagged tree's, so version agreement is an assertion about the bytes
           # that actually get built.
-          v="${{ inputs.tag }}"; v="${v#v}"
+          v="${TAG#v}"
           cargo_v=$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
           [ "$v" = "$cargo_v" ] || { echo "tag $v != Cargo.toml $cargo_v" >&2; exit 1; }
 
@@ -111,18 +120,43 @@ jobs:
           NQ_APP=NotchQuake.app scripts/package-artifact.sh dist
 
       - name: Licence artefacts are inside the archive
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          v="${{ inputs.tag }}"; v="${v#v}"
+          v="${TAG#v}"
+          archive="dist/NotchQuake-$v.tar.gz"
+          [ -f "$archive" ] || { echo "no archive at $archive" >&2; exit 1; }
           for f in NOTICE.md THIRD-PARTY-NOTICES.md LICENSE; do
-            bsdtar -tf "dist/NotchQuake-$v.tar.gz" "NotchQuake.app/Contents/Resources/$f" >/dev/null \
+            bsdtar -tf "$archive" "NotchQuake.app/Contents/Resources/$f" >/dev/null \
               || { echo "archive missing Contents/Resources/$f" >&2; exit 1; }
           done
-          bsdtar -tf "dist/NotchQuake-$v.tar.gz" 'NotchQuake.app/Contents/Resources/licenses/' >/dev/null
+          # licenses/ is an explicit obligation, not a courtesy: notices without the
+          # pinned licence texts do not satisfy attribution. The old line was
+          #   bsdtar -tf "$archive" 'NotchQuake.app/Contents/Resources/licenses/' >/dev/null
+          # with no `|| exit 1`. That was NOT silent: workflow steps run under
+          # `bash -e`, so an absent licenses/ directory already failed the job —
+          # but with no obligation message, and it ACCEPTED an EMPTY licenses/
+          # directory because a tar carries a directory entry even when it holds
+          # no files. That empty-directory acceptance is the real hole. Require at
+          # least one FILE below licenses/ and name the obligation when it fails.
+          lic_files=$(bsdtar -tf "$archive" 2>/dev/null \
+            | grep -E '^NotchQuake\.app/Contents/Resources/licenses/.+$' \
+            | grep -v '/$' \
+            | head -5) || lic_files=""
+          [ -n "$lic_files" ] || {
+            echo "archive carries no licence-text FILE under Contents/Resources/licenses/" >&2
+            echo "(notices without the pinned licence texts do not satisfy attribution)" >&2
+            exit 1; }
 
       - name: Upload CI build artifact (ad-hoc signed, not distributable)
         uses: actions/upload-artifact@v4
+        env:
+          TAG: ${{ inputs.tag }}
         with:
-          name: notchquake-${{ inputs.tag }}-arm64-ci
+          # `env.TAG` rather than inline `${{ inputs.tag }}`: the tag string never
+          # lands in a template slot that could be interpreted as code. Only the
+          # name field uses it; the paths are version-independent globs.
+          name: notchquake-${{ env.TAG }}-arm64-ci
           path: |
             dist/*.tar.gz
             dist/*.zip
@@ -139,11 +173,14 @@ jobs:
     # `release` with required reviewers configured under
     # Settings → Actions → Environments. GitHub silently CREATES the environment
     # on first run if it is absent, so this declaration alone gates nothing —
-    # the reviewers must be added in the repository settings, and until stage 2
-    # is verified the correct configuration is a reviewer set that cannot
-    # approve itself, or no environment at all combined with never dispatching
-    # `publish: true`. See docs/release-runbook.md; do not pretend the gate
-    # exists.
+    # the reviewers must be added in the repository settings. ORDER MATTERS: a
+    # run only waits for approval when the environment ALREADY has required
+    # reviewers at dispatch time, so configure the reviewers BEFORE adding any
+    # signing/notary secrets. Secrets plus an unreviewed environment means the
+    # first `publish: true` dispatch signs and publishes with no human gate.
+    # Until stage 2 is verified the correct configuration is a reviewer set that
+    # cannot approve itself. See docs/release-runbook.md; do not pretend the
+    # gate exists.
     environment: release
     # The release asset upload needs write access to contents (GitHub Releases).
     permissions:
@@ -162,8 +199,11 @@ jobs:
           fetch-tags: true
 
       - name: Verify the signed tag, then build THAT commit (detached)
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          tag="${{ inputs.tag }}"
+          tag="$TAG"
+          [ -n "$tag" ] || { echo "inputs.tag is empty" >&2; exit 1; }
           git fetch --tags --force origin "refs/tags/${tag}" || true
           git cat-file -t "refs/tags/${tag}" 2>/dev/null | grep -q '^tag$' \
             || { echo "$tag is not an annotated tag (lightweight tags are not releases)" >&2; exit 1; }
@@ -231,6 +271,11 @@ jobs:
           NQ_NOTARY_KEY_ID="$NOTARY_KEY_ID" \
           NQ_NOTARY_ISSUER="$NOTARY_ISSUER" \
             scripts/sign-notarize.sh
+          # sign-notarize.sh stages the notarization UPLOAD zip under
+          # $RUNNER_TEMP, never dist/, so a rejected submission cannot leave a
+          # stray zip in dist/ for the BUILD job's artifact glob (dist/*.tar.gz,
+          # dist/*.zip, dist/SHA256SUMS) or for this job's `gh release create` to
+          # pick up.
 
       - name: Verify the signed, stapled bundle
         run: |
@@ -243,27 +288,30 @@ jobs:
           spctl -a -vv -t exec NotchQuake.app
 
       - name: Release notes from CHANGELOG
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          awk -v t="${{ inputs.tag }}" '
+          awk -v t="$TAG" '
             $0 ~ "^## " t {p=1; next}
             p && /^## /   {p=0}
             p            {print}
           ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
-          [ -s "$RUNNER_TEMP/notes.md" ] || echo "See CHANGELOG.md for ${{ inputs.tag }}." > "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || echo "See CHANGELOG.md for $TAG." > "$RUNNER_TEMP/notes.md"
 
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
         run: |
-          v="${{ inputs.tag }}"; v="${v#v}"
+          v="${TAG#v}"
           # --target is the commit the signed tag points at, captured after
           # verification in the tag-verify step — NOT $GITHUB_SHA, which is the
           # commit that dispatched the workflow. The uploaded bytes were built
           # from $TAG_COMMIT, so the release must point at $TAG_COMMIT too.
           [ -n "$TAG_COMMIT" ] || { echo "TAG_COMMIT was not set by the tag-verify step" >&2; exit 1; }
-          gh release create "${{ inputs.tag }}" \
+          gh release create "$TAG" \
             --target "$TAG_COMMIT" \
-            --title "NotchQuake ${{ inputs.tag }}" \
+            --title "NotchQuake $TAG" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             "dist/NotchQuake-$v.tar.gz#NotchQuake-$v.tar.gz" \
             "dist/NotchQuake-$v.zip#NotchQuake-$v.zip" \

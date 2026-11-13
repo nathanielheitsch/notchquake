@@ -662,6 +662,46 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     alpha capture shows tab titles out to ~1746pt, closed pill unchanged at
     189pt/33pt. Live x-gate click test NOT run (see notes).
 
+55. **Slider max ≠ canvas had TWO sources, and the open grid never reflowed.**
+    (a) `settings.rs::display_width()` took a MAX over every `NSScreen`
+    (secondary display 1920) while the canvas is the NOTCH display
+    (`window.rs::canvas_size` via `notch_screen`) — so the Open width rail could
+    exceed the canvas and the silhouette got clipped at the screen edge. Fix:
+    `display_width()` delegates to `crate::window::canvas_size(mtm)` — ONE
+    source of truth feeding the slider rail, the `apply_knob_value` clamp AND
+    the `load` clamp. The notch display can even CHANGE between launches
+    (canvas measured 1710 one session, 1920 the next) so no constant is valid.
+    (b) An OPEN panel did not reflow when the size knobs changed: `grid_dims`
+    bakes rows/cols at spawn. Fix at `apply_settings` (`notch_view.rs`):
+    while the spring TARGET is open, call `Session::resize(rows, cols, cell)`
+    per live session with dims from the SAME `grid_dims` formula; `Session::
+    resize` locks the `FairMutex<Term>` and calls alacritty's public
+    `Term::resize(NotchSize{…})` (re-wraps lines, moves the vi cursor) then
+    pushes `Msg::Resize(WindowSize)` through the SAME `EventLoopSender` wire
+    `send_input` uses, so the reader thread's `EventLoop` runs `Pty::on_resize`
+    → `TIOCSWINSZ`/SIGWINCH — never touch the PTY from the main thread (lesson
+    35). Closed panel: skip (mid-collapse); it re-spawns on next open.
+    Live drag of the width slider needs a REAL user click on the gear (menu-bar
+    strip swallows synthetic clicks); verified by code audit + build gate.
+
+56. **Renaming the bundle broke execution in three ways** (v0.1-alpha rename
+    BNT.app→NotchQuake.app, id `local.bnt`→`local.notchquake`, binary `BNT`→
+    `notchquake`): (a) `codesign --remove-signature NotchQuake.app` strips
+    recursively — the INNER binary went unsigned and unsigned arm64 gets
+    SIGKILL'd (Killed: 9) at exec; fix is just re-running launch.sh, which
+    copies a fresh linker-signed (adhoc) build over. (b) `open -n` fails
+    (launchd spawn 162/163) while the bundle-level signature is inconsistent
+    with its contents — same root cause. (c) `pkill -f "MacOS/BNT"`-style
+    patterns in a shell self-match the killer command; use a pattern that
+    cannot match the pkill line (`grep -iE 'macos/(bnt|notchquake)$'` to
+    inspect, explicit `kill <pid>` to act). The renamed app launches (launch.
+    sh pid verified) and the Carbon hotkey still registers (Option+Space
+    toggles) — process-name squatting (lesson 53) stays fine because launch.
+    sh now kills `notchquake`. Old prefs under `local.bnt.plist` are orphaned
+    ONE TIME by the bundle-id change; keys keep the `BNT.` prefix so a future
+    prefs-domain migration is a simple file copy, and prefs reset is the
+    accepted v0.1 cost.
+
 57. **Signing/release correction:** the earlier pipeline claims were incorrect.
     `xcrun --find notarytool` locates Xcode's CLI; notarization is automatable.
     `security import -T /usr/bin/codesign` is supported, and certificate/key
@@ -705,52 +745,42 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
     (f) `open -n` failing with launchd spawn 162/163 is a regular FILE at the
         `.app` path, not a bad signature — which is what the old launch.sh message
         misattributed.
+    (g) `security` DOES have delete verbs — `delete-certificate` (`-c name` /
+        `-Z hash` `[-t]`) and `delete-identity`. The claim in
+        `setup-developer-id.sh` that "the security CLI has no delete verb" was
+        false; the script now prints the real commands. `security import -A` also
+        exists but is documented as "Allow any application to access the imported
+        key without warning (insecure, not recommended!)", so sign-notarize.sh
+        dropped it: `-T /usr/bin/codesign` + `set-key-partition-list` is the
+        correct pair.
+    (h) The notarization UPLOAD zip must never be written into `dist/`: the BUILD
+        job uploads `dist/*.tar.gz`, `dist/*.zip`, and `dist/SHA256SUMS` as the CI
+        artifact and the publish job reads named files from `dist/` for the GitHub
+        Release, so a rejected submission would have left the upload artifact
+        publishable as a release asset. It is staged under `$RUNNER_TEMP` (else a
+        private `mktemp -d`) and removed by the same EXIT trap; the only zip left
+        in `dist/` on success is the one `package-artifact.sh` writes after
+        stapling. In `release.yml` the tag value reaches the shell as the step env
+        var `TAG` (artifact name uses `${{ env.TAG }}`) instead of inline
+        `${{ inputs.tag }}` in `run:` text. The licence-archive check now requires
+        at least one FILE under `Contents/Resources/licenses/` with an explicit
+        failure — note the old check was NOT silent: under `bash -e` / `set -eu` an
+        absent `licenses/` already failed the job with no obligation message, but
+        its listing/glob pattern was satisfied by the DIRECTORY ENTRY ALONE, so an
+        empty `licenses/` directory passed cleanly. That empty-directory
+        acceptance was the real hole.
     Secrets the publish job needs (none exist yet; never commit, never echo):
     `DEVID_P12_B64`, `DEVID_P12_PASS`, `NOTARY_API_KEY`, `NOTARY_KEY_ID`,
     `NOTARY_ISSUER`; optional repository variable `NQ_SIGNING_IDENTITY`.
     `scripts/sign-notarize.sh` has never been run end to end. Runner label is
     `macos-26` (arm64) — `macos-14` was retired 2026-11-02 and Intel labels are
     wrong for this project.
-
-56. **Renaming the bundle broke execution in three ways** (v0.1-alpha rename
-    BNT.app→NotchQuake.app, id `local.bnt`→`local.notchquake`, binary `BNT`→
-    `notchquake`): (a) `codesign --remove-signature NotchQuake.app` strips
-    recursively — the INNER binary went unsigned and unsigned arm64 gets
-    SIGKILL'd (Killed: 9) at exec; fix is just re-running launch.sh, which
-    copies a fresh linker-signed (adhoc) build over. (b) `open -n` fails
-    (launchd spawn 162/163) while the bundle-level signature is inconsistent
-    with its contents — same root cause. (c) `pkill -f "MacOS/BNT"`-style
-    patterns in a shell self-match the killer command; use a pattern that
-    cannot match the pkill line (`grep -iE 'macos/(bnt|notchquake)$'` to
-    inspect, explicit `kill <pid>` to act). The renamed app launches (launch.
-    sh pid verified) and the Carbon hotkey still registers (Option+Space
-    toggles) — process-name squatting (lesson 53) stays fine because launch.
-    sh now kills `notchquake`. Old prefs under `local.bnt.plist` are orphaned
-    ONE TIME by the bundle-id change; keys keep the `BNT.` prefix so a future
-    prefs-domain migration is a simple file copy, and prefs reset is the
-    accepted v0.1 cost.
-
-55. **Slider max ≠ canvas had TWO sources, and the open grid never reflowed.**
-    (a) `settings.rs::display_width()` took a MAX over every `NSScreen`
-    (secondary display 1920) while the canvas is the NOTCH display
-    (`window.rs::canvas_size` via `notch_screen`) — so the Open width rail could
-    exceed the canvas and the silhouette got clipped at the screen edge. Fix:
-    `display_width()` delegates to `crate::window::canvas_size(mtm)` — ONE
-    source of truth feeding the slider rail, the `apply_knob_value` clamp AND
-    the `load` clamp. The notch display can even CHANGE between launches
-    (canvas measured 1710 one session, 1920 the next) so no constant is valid.
-    (b) An OPEN panel did not reflow when the size knobs changed: `grid_dims`
-    bakes rows/cols at spawn. Fix at `apply_settings` (`notch_view.rs`):
-    while the spring TARGET is open, call `Session::resize(rows, cols, cell)`
-    per live session with dims from the SAME `grid_dims` formula; `Session::
-    resize` locks the `FairMutex<Term>` and calls alacritty's public
-    `Term::resize(NotchSize{…})` (re-wraps lines, moves the vi cursor) then
-    pushes `Msg::Resize(WindowSize)` through the SAME `EventLoopSender` wire
-    `send_input` uses, so the reader thread's `EventLoop` runs `Pty::on_resize`
-    → `TIOCSWINSZ`/SIGWINCH — never touch the PTY from the main thread (lesson
-    35). Closed panel: skip (mid-collapse); it re-spawns on next open.
-    Live drag of the width slider needs a REAL user click on the gear (menu-bar
-    strip swallows synthetic clicks); verified by code audit + build gate.
+    ORDER MATTERS before any of that: the GitHub Environment `release` must have
+    its required reviewers configured BEFORE the secrets exist, because GitHub
+    creates a missing environment on first run and an unreviewed environment
+    auto-approves — secrets with no reviewers means the first `publish: true`
+    dispatch publishes with no human gate. No remote GitHub state has been
+    configured; stage 2 stays blocked.
 
 ## Repo / process rules
 
@@ -760,7 +790,9 @@ Vertical centering uses `CTFont::cap_height()`, not `ascent + descent`.
   `packaging/Info.plist` + a fresh binary, so a stale bundle is never tested or
   shipped. `/tmp/bnt-*.txt` debug writes were all stripped at ship time; none
   remain in `src/`.
-- `dist/` and `.signing/` are gitignored: release artifacts are reproducible
-  build products, and certificates/keys/passphrases never enter the repo.
+- `dist/` and `.signing/` are gitignored, as are `*.p12`, `*.p8`, `*.keychain`,
+  `*.keychaindb`, and `*.keychain-db`: release artifacts are reproducible build
+  products, and certificates/keys/passphrases/keychain files never enter the repo
+  wherever they happen to be written.
 - Keep project documentation in this repository, not in external worktrees.
   `docs/project-state.md` records the baseline; this file is the machine-specific how-to.

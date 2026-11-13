@@ -53,7 +53,13 @@ line=$(security find-identity -v -p codesigning | grep -F "$IDENTITY" | head -1)
 [ -n "$line" ] || {
   echo "no valid codesigning identity matching '$IDENTITY'. Check:" >&2
   security find-identity -v -p codesigning >&2
-  echo "A self-signed certificate from an earlier experiment must be deleted in Keychain.app (the security CLI has no delete verb)." >&2
+  # Correction: the security CLI DOES have delete verbs — `delete-certificate`
+  # (-c name | -Z hash [-t]) and `delete-identity`. Keychain.app works too, but
+  # the CLI is not the dead end the earlier comment claimed. Deleting an
+  # identity also needs the keychain that holds it unlocked.
+  echo "To remove a stale self-signed identity from an earlier experiment:" >&2
+  echo "  security delete-certificate -c '<common name>' ~/Library/Keychains/login.keychain-db" >&2
+  echo "  security delete-identity  -c '<common name>' ~/Library/Keychains/login.keychain-db" >&2
   exit 1
 }
 SHA=$(printf '%s' "$line" | awk '{print $2}')

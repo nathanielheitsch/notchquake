@@ -102,7 +102,17 @@ Done (stage 1, verified locally 2026-11-12):
   requires `publish: true` AND all five secrets, fails closed otherwise, checks the
   tag is a **signed annotated** tag (a `-----BEGIN PGP SIGNATURE-----` block in the
   tag object — not a `gpgsig` header, which only signed *commit* objects carry),
-  and runs in an ephemeral keychain with an `if: always()` cleanup sweep.
+  and runs in an ephemeral keychain with an `if: always()` cleanup sweep. The tag
+  name reaches the shell as the step env var `TAG` rather than inline
+  `${{ inputs.tag }}` inside `run:` text; the licence-archive check requires at
+  least one FILE under `Contents/Resources/licenses/` and fails with an explicit
+  message (the old pattern was satisfied by the directory entry alone, so an
+  **empty** `licenses/` directory passed — an absent one already failed under
+  `bash -e`, just with no obligation message); and the notarization upload zip is
+  staged under `RUNNER_TEMP` — never `dist/` — so a rejected submission cannot
+  leave a zip for the **build** job's `dist/*.tar.gz` / `dist/*.zip` /
+  `dist/SHA256SUMS` artifact glob, or the publish job's named `dist/` assets, to
+  pick up.
 - The About row reads `env!("CARGO_PKG_VERSION")` instead of the hardcoded
   `v0.1-alpha`, so it cannot drift from the bundle metadata.
 
@@ -115,14 +125,28 @@ Still blocked — stage 2 (do not treat any of it as working):
    `grep '^Signature=Developer'`, and refuses a blank passphrase.
 2. `scripts/sign-notarize.sh` (new) implements sign → notarize → staple →
    re-archive, but has **never been run end to end** — no certificate, no API key.
-   Read it as a plan that refuses loudly.
+   Read it as a plan that refuses loudly. It imports the `.p12` with the scoped
+   `-T /usr/bin/codesign` grant only (**no `-A`**, which `security` documents as
+   insecure), and stages the notarization upload outside `dist/`.
 3. Secrets must be created by the user: `DEVID_P12_B64`, `DEVID_P12_PASS`,
    `NOTARY_API_KEY`, `NOTARY_KEY_ID`, `NOTARY_ISSUER`. Nothing in this repo has
-   accessed or stored any of them; `.signing/` and `dist/` are gitignored.
-4. Publication requires successful gates, a signed annotated tag, `Accepted`
+   accessed or stored any of them; `.signing/`, `dist/`, `*.p12`, `*.p8`, and
+   `*.keychain*` are gitignored.
+4. **Configure the GitHub Environment `release` with required reviewers BEFORE
+   adding any signing/notary secret.** `release.yml` declares
+   `environment: release`, but GitHub creates a missing environment silently on
+   first run, and an environment with no required reviewers auto-approves — the
+   approval gate exists at dispatch time only if reviewers are already
+   configured. Secrets in place plus an unreviewed environment means the first
+   `publish: true` dispatch signs, notarizes, and publishes with no human gate.
+   That setup is a remote repository setting and has NOT been done here (no
+   remote GitHub state was touched or attempted); until it exists, stage 2
+   remains blocked and `publish: true` must never be dispatched. See
+   `docs/release-runbook.md` stage 1.
+5. Publication requires successful gates, a signed annotated tag, `Accepted`
    notarization, a stapled ticket, checksums, and a **clean-Mac** Gatekeeper check
    reporting `source=Notarized Developer ID`.
-5. A dedicated history/secret scanner is still outstanding (see below).
+6. A dedicated history/secret scanner is still outstanding (see below).
 
 There is intentionally **no tag-triggered release workflow**: publication needs an
 explicit `workflow_dispatch` with `publish: true`, so an unsigned bundle can never

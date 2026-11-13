@@ -16,7 +16,11 @@
 #
 # It never echoes a secret, writes the API key to a private temp file only when
 # it was given as contents, and always deletes both keychain and temp file
-# (trap cleanup EXIT).
+# (trap cleanup EXIT). The notarization UPLOAD zip never lands in $OUT either: it
+# is staged under $RUNNER_TEMP (or a private mktemp dir locally) and removed by
+# the same trap, so a failed notarization cannot leave a stray zip in dist/ for
+# the BUILD job's artifact glob (dist/*.tar.gz, dist/*.zip, dist/SHA256SUMS) or
+# for the publish job's `gh release create` to pick up.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -29,7 +33,7 @@ OUT="${NQ_OUT:-dist}"
 EPHEMERAL=""      # ephemeral keychain path, if we created one
 OLD_KEYCHAINS=""  # user keychain list to restore on exit
 KEYFILE=""        # temp .p8 when the API key was supplied as contents
-STAGE=""          # temp copy of the bundle used for the notarization upload
+STAGE=""          # private staging dir: bundle copy + notarization upload zip
 cleanup() {
   [ -n "$KEYFILE" ] && rm -f "$KEYFILE"
   [ -n "$STAGE" ] && rm -rf "$STAGE"
@@ -57,7 +61,11 @@ if [ -n "${NQ_P12:-}" ]; then
   security create-keychain -p "$KCPASS" "$EPHEMERAL"
   security set-keychain-settings -lut 21600 "$EPHEMERAL"
   security unlock-keychain -p "$KCPASS" "$EPHEMERAL"
-  security import "$NQ_P12" -k "$EPHEMERAL" -P "$NQ_P12_PASS" -T /usr/bin/codesign -A
+  # -A is deliberately ABSENT: security documents it as "Allow any application
+  # to access the imported key without warning (insecure, not recommended!)".
+  # -T /usr/bin/codesign is the scoped grant, and set-key-partition-list below
+  # is what actually removes the ACL prompt a CI runner cannot answer.
+  security import "$NQ_P12" -k "$EPHEMERAL" -P "$NQ_P12_PASS" -T /usr/bin/codesign
   OLD_KEYCHAINS=$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
   security list-keychains -d user -s "$EPHEMERAL" $OLD_KEYCHAINS
   # Codesign must be allowed to use the key without a GUI prompt (CI has no TTY).
@@ -119,14 +127,24 @@ else
   KEY="$KEYFILE"
 fi
 
-mkdir -p "$OUT"
-STAGE=$(mktemp -d)
+# The upload zip is staged OUTSIDE $OUT on purpose: $OUT is dist/, the directory
+# the build job uploads by glob (dist/*.tar.gz, dist/*.zip, dist/SHA256SUMS) and
+# that the publish job reads for its named release assets.
+# A failed notarization must leave nothing there, so this file lives under
+# $RUNNER_TEMP on CI (else a private mktemp dir) and the EXIT trap removes it.
+if [ -n "${RUNNER_TEMP:-}" ]; then
+  STAGE="$RUNNER_TEMP/nq-notarize-stage"
+  mkdir -p "$STAGE"
+else
+  STAGE=$(mktemp -d)
+fi
 cp -R "$APP" "$STAGE/"
 # --keepParent is required: notarization expects the .app inside a zip with its
 # own directory entry, and ditto preserves the bundle's symlinks/xattrs.
-ditto -c -k --keepParent "$STAGE/$(basename "$APP")" "$OUT/notarize-input.zip"
-
-SUBMIT_JSON=$(xcrun notarytool submit "$OUT/notarize-input.zip" \
+ZIP="$STAGE/notarize-input.zip"
+ditto -c -k --keepParent "$STAGE/$(basename "$APP")" "$ZIP"
+mkdir -p "$OUT"
+SUBMIT_JSON=$(xcrun notarytool submit "$ZIP" \
   --key "$KEY" --key-id "$NQ_NOTARY_KEY_ID" --issuer "$NQ_NOTARY_ISSUER" \
   --wait --json)
 STATUS=$(printf '%s' "$SUBMIT_JSON" | jq -r '.status')
@@ -139,7 +157,9 @@ echo "notary status: $STATUS"
 
 xcrun stapler staple "$APP"
 xcrun stapler validate "$APP"
-rm -f "$OUT/notarize-input.zip"
+# The upload zip is not part of the artifact set; drop it here as well as in the
+# trap, so a successful run leaves $OUT holding only the archives.
+rm -f "$ZIP"
 
 # --- final artifact ----------------------------------------------------------
 # Re-package AFTER stapling so the ticket is inside what users download.

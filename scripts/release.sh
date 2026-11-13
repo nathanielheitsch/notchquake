@@ -63,8 +63,27 @@ for f in NOTICE.md THIRD-PARTY-NOTICES.md LICENSE; do
   bsdtar -tf "dist/NotchQuake-$VERSION.tar.gz" "NotchQuake.app/Contents/Resources/$f" >/dev/null \
     || { echo "release archive is missing Contents/Resources/$f" >&2; exit 1; }
 done
-bsdtar -tf "dist/NotchQuake-$VERSION.tar.gz" 'NotchQuake.app/Contents/Resources/licenses/*' >/dev/null \
-  || { echo "release archive is missing Contents/Resources/licenses/" >&2; exit 1; }
+[ -f "dist/NotchQuake-$VERSION.tar.gz" ] || {
+  echo "release archive was not created" >&2
+  exit 1
+}
+# licenses/ is an obligation, not a courtesy: notices without the pinned licence
+# texts do not satisfy attribution. The old check globbed 'licenses/*', which
+# bsdtar happily satisfies with the DIRECTORY ENTRY ALONE — an empty licenses/
+# directory passed. That empty-directory acceptance is the real hole: under
+# `set -eu` a MISSING licenses/ directory already failed, but only with the
+# command's own error rather than this obligation message; an empty one passed
+# cleanly. Require at least one real FILE below licenses/ and say which obligation
+# was unmet.
+lic_files=$(bsdtar -tf "dist/NotchQuake-$VERSION.tar.gz" 2>/dev/null \
+  | grep -E '^NotchQuake\.app/Contents/Resources/licenses/.+$' \
+  | grep -v '/$' \
+  | head -5) || lic_files=""
+[ -n "$lic_files" ] || {
+  echo "release archive carries no licence-text FILE under Contents/Resources/licenses/" >&2
+  echo "(notices without the pinned licence texts do not satisfy attribution)" >&2
+  exit 1
+}
 
 # --- signature status (informational, no Developer ID signing) ---------------
 # Honest check, not the old `grep -qE "^Signature=Developer"`, which an ad-hoc or

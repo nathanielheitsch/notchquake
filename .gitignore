@@ -7,6 +7,13 @@ NotchQuake.app/
 /.crew/
 bench/
 docs/perf/
-# Never commit a certificate, .p12, .p8, or passphrase. CI uses an ephemeral
-# keychain; see docs/release-runbook.md.
+# Never commit a certificate, .p12, .p8, passphrase, or keychain file. CI uses an
+# ephemeral keychain; see docs/release-runbook.md. These patterns catch the files
+# wherever they land (repo root, scripts/, a temp dir inside the checkout), not
+# only under .signing/.
 .signing/
+*.p12
+*.p8
+*.keychain
+*.keychaindb
+*.keychain-db
